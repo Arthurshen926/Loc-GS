@@ -1,0 +1,34 @@
+# Runtime outputs and shared result symlink.
+output
+output/
+
+# Large vendored STDLoc experiment artifacts. Kept on disk, not in git.
+third_party/stdloc/map_cambridge_spgs
+third_party/stdloc/map_cambridge_smoke
+third_party/stdloc/results
+third_party/stdloc/logs
+
+# Generated model/data artifacts.
+*.log
+*.pt
+*.pth
+*.ply
+*.npy
+*.npz
+*.pkl
+
+# Python and packaging caches.
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Editor/system files.
+.DS_Store
+.idea/
+.vscode/

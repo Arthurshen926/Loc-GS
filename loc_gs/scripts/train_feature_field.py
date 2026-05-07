@@ -1,0 +1,3336 @@
+"""Train Loc-GS SuperPoint Gaussian feature fields.
+
+Supports Architecture A (Explicit per-Gaussian) and Architecture B (Hybrid
+DCFF-style), with localization-guided SuperPoint descriptor and detector reconstruction.
+
+Usage:
+    python -m loc_gs.scripts.train_feature_field \
+        --config configs/superpoint_localization_room_0_v1.yaml \
+        [--resume path/to/checkpoint.pth] \
+        [--warmstart path/to/weights.pth]
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Project imports
+# ---------------------------------------------------------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from loc_gs.artifact_paths import (
+    DEFAULT_SIGLIP2_PROJECTION_WEIGHTS,
+    DEFAULT_SIGLIP2_TEXT_EMBEDDINGS,
+    resolve_siglip_projection_path,
+    resolve_siglip_text_embeddings_path,
+)
+from loc_gs.config import LocGSConfig, load_config
+from loc_gs.geometry_utils import resolve_use_2dgs
+from loc_gs.data.benchmark_paths import (
+    extract_feature_frame_index,
+    list_feature_paths,
+    load_w2c_from_pose_dir,
+    load_w2c_from_pose_file,
+    resolve_dataset_type,
+    resolve_depth_path,
+    resolve_rgb_path,
+    resolve_scene_root,
+    resolve_semantics_path,
+    resolve_split_data_dir,
+    resolve_split_feature_dir,
+    resolve_split_frame_ids,
+    resolve_split_pose_source,
+)
+from loc_gs.heads.grounding_head import QueryGroundingAuxLoss
+from loc_gs.heads.depth_head import DepthHead, DepthLoss
+from loc_gs.heads.segmentation_head import SegmentationHead, SegmentationLoss, compute_miou
+from loc_gs.losses.distillation_loss import (
+    BoundaryAwareFeatureLoss,
+    DepthGuidedFeatureLoss,
+    DistillationLoss,
+    GeometricEdgeAlignmentLoss,
+    GradientWeightedLoss,
+    MultiViewConsistencyLoss,
+    TotalVariationLoss,
+)
+from loc_gs.losses.localization_loss import (
+    LocalizationGuidedLoss,
+    prepare_superpoint_queries,
+)
+from loc_gs.models.explicit_gaussian import ExplicitFeatureGaussian
+from loc_gs.models.featsharp_3d import FeatSharp3D
+from loc_gs.models.hcd_codec import HCDCodec
+from loc_gs.models.hybrid_gaussian import HybridFeatureGaussian, SuperPointOutputHead
+from loc_gs.models.siglip_projection import SigLIP2FeatureProjection, SigLIP2SummaryHead
+from loc_gs.models.screen_refiner import (
+    ScreenSpaceRefiner,
+    build_refiner_guide,
+    compute_refiner_extra_channels,
+)
+from loc_gs.rendering.feature_renderer import FeatureFieldRenderer
+from loc_gs.replica_constants import GROUNDING_QUERIES
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+
+    _HAS_TB = True
+except ImportError:
+    _HAS_TB = False
+
+
+# ===================================================================
+# Dataset
+# ===================================================================
+
+class SimpleFeatureDataset(Dataset):
+    """Loads pre-extracted SuperPoint features and camera poses for training."""
+
+    def __init__(
+        self,
+        feature_dir: str,
+        pose_file: Optional[str] = None,
+        pose_dir: Optional[str] = None,
+        depth_dir: Optional[str] = None,
+        semantics_dir: Optional[str] = None,
+        rgb_dir: Optional[str] = None,
+        feature_size: Optional[tuple] = None,
+        split: str = "train",
+        dataset_type: str = "replica",
+        frame_ids: Optional[List[int]] = None,
+    ):
+        super().__init__()
+        self.feature_dir = Path(feature_dir)
+        self.pose_file = Path(pose_file) if pose_file else None
+        self.pose_dir = Path(pose_dir) if pose_dir else None
+        self.depth_dir = Path(depth_dir) if depth_dir else None
+        self.semantics_dir = Path(semantics_dir) if semantics_dir else None
+        self.rgb_dir = Path(rgb_dir) if rgb_dir else None
+        self.feature_size = feature_size  # (H, W) for downsampling RGB
+        self.split = split
+        self.dataset_type = resolve_dataset_type(dataset_type)
+        self.frame_filter = {int(fid) for fid in frame_ids} if frame_ids is not None else None
+
+        # --- detect feature type (SuperPoint descriptor layout) --------------------
+        descriptor_subdir = self.feature_dir / "descriptor"
+        if descriptor_subdir.is_dir():
+            self.feature_type = "superpoint"
+            # Collect descriptor paths manually (not using list_feature_paths
+            # which expects backbone/ subdir)
+            import glob as _glob
+            desc_files = sorted(_glob.glob(str(descriptor_subdir / "rgb_*.pt")))
+            if not desc_files:
+                desc_files = sorted(_glob.glob(str(descriptor_subdir / "*.pt")))
+            if frame_ids is not None:
+                fid_set = {int(fid) for fid in frame_ids}
+                desc_files = [
+                    f for f in desc_files
+                    if extract_feature_frame_index(Path(f)) in fid_set
+                ]
+            self.feature_paths = [Path(f) for f in desc_files]
+        else:
+            self.feature_type = "radio"
+            self.feature_paths = list_feature_paths(self.feature_dir, frame_ids=frame_ids)
+
+        assert len(self.feature_paths) > 0, (
+            f"No feature files found in {self.feature_dir}"
+        )
+        self.frame_indices = [extract_feature_frame_index(path) for path in self.feature_paths]
+
+        # --- load poses (traj_w_c.txt: one 4x4 c2w per line) --------------
+        self.poses_w2c = self._load_poses()
+        assert len(self.poses_w2c) == len(self.feature_paths), (
+            f"Pose count ({len(self.poses_w2c)}) does not match features "
+            f"({len(self.feature_paths)})"
+        )
+
+    # ------------------------------------------------------------------
+    def _load_poses(self) -> np.ndarray:
+        """Load poses from a flat traj file or a per-frame pose directory."""
+        if self.pose_dir is not None:
+            return load_w2c_from_pose_dir(self.pose_dir, self.frame_indices)
+        if self.pose_file is None:
+            raise ValueError("Either pose_file or pose_dir must be provided")
+        return load_w2c_from_pose_file(self.pose_file, self.frame_indices)
+
+    # ------------------------------------------------------------------
+    def __len__(self) -> int:
+        return len(self.feature_paths)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        radio_feat = torch.load(
+            self.feature_paths[idx], map_location="cpu"
+        )  # [C, Hp, Wp]
+        if radio_feat.dim() == 4:
+            radio_feat = radio_feat.squeeze(0)
+
+        # Upsample features if target resolution exceeds native resolution
+        if self.feature_size is not None:
+            tgt_h, tgt_w = self.feature_size
+            _, cur_h, cur_w = radio_feat.shape
+            if tgt_h > cur_h or tgt_w > cur_w:
+                radio_feat = F.interpolate(
+                    radio_feat.float().unsqueeze(0),
+                    size=(tgt_h, tgt_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).half()
+
+        # Load detector features for SuperPoint
+        detector_feat = None
+        if self.feature_type == "superpoint":
+            detector_dir = self.feature_dir / "detector"
+            det_path = detector_dir / self.feature_paths[idx].name
+            if det_path.exists():
+                detector_feat = torch.load(det_path, map_location="cpu")
+                if detector_feat.dim() == 4:
+                    detector_feat = detector_feat.squeeze(0)
+                if self.feature_size is not None:
+                    tgt_h, tgt_w = self.feature_size
+                    _, cur_h, cur_w = detector_feat.shape
+                    if tgt_h > cur_h or tgt_w > cur_w:
+                        detector_feat = F.interpolate(
+                            detector_feat.float().unsqueeze(0),
+                            size=(tgt_h, tgt_w),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0).half()
+
+        frame_idx = self.frame_indices[idx]
+        pose_w2c = torch.from_numpy(self.poses_w2c[idx])  # [4, 4]
+
+        depth: Optional[torch.Tensor] = None
+        depth_path = resolve_depth_path(self.depth_dir, frame_idx, self.dataset_type)
+        if depth_path is not None and depth_path.exists():
+            import cv2
+
+            d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+            if d is not None:
+                depth = torch.from_numpy(d.astype(np.float32) / 1000.0).clone()
+
+        semantics: Optional[torch.Tensor] = None
+        sem_path = resolve_semantics_path(self.semantics_dir, frame_idx, self.dataset_type)
+        if sem_path is not None and sem_path.exists():
+            from PIL import Image
+
+            with Image.open(sem_path) as sem_img:
+                sem = np.array(sem_img, dtype=np.int64)
+            semantics = torch.from_numpy(sem).clone()
+
+        # --- optional RGB guide (downsampled to feature resolution) --------
+        rgb_guide: Optional[torch.Tensor] = None
+        if self.rgb_dir is not None:
+            import cv2
+
+            rgb_path = resolve_rgb_path(self.rgb_dir, frame_idx, self.dataset_type)
+            if rgb_path is not None and rgb_path.exists():
+                img = cv2.imread(str(rgb_path))
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    if self.feature_size is not None:
+                        img = cv2.resize(img, (self.feature_size[1], self.feature_size[0]))
+                    rgb_guide = torch.from_numpy(img.copy()).float().permute(2, 0, 1) / 255.0
+
+        out: Dict[str, torch.Tensor] = {
+            "teacher_features": radio_feat,
+            "pose_w2c": pose_w2c,
+            "frame_idx": torch.tensor(frame_idx, dtype=torch.long),
+        }
+        if self.feature_type == "superpoint":
+            out["descriptor_features"] = radio_feat  # descriptor is in radio_feat slot
+            if detector_feat is not None:
+                out["detector_features"] = detector_feat
+        if depth is not None:
+            out["depth"] = depth
+        if semantics is not None:
+            out["semantics"] = semantics
+        if rgb_guide is not None:
+            out["rgb_guide"] = rgb_guide
+        return out
+
+
+# ===================================================================
+# Trainer
+# ===================================================================
+
+class LocGSTrainer:
+    """Training loop for Loc-GS feature field distillation."""
+
+    def __init__(self, config: LocGSConfig) -> None:
+        self.cfg = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Training mode: "latent" trains in 64d space with frozen decoder,
+        # "decoded" (default/legacy) trains through decoder in 1280d space
+        self.train_mode = getattr(config, "train_mode", "decoded")
+
+        # Reproducibility
+        self._set_seed(getattr(config, "seed", 42))
+
+        # Output directories
+        self.output_dir = Path(getattr(config, "output_dir", "output/loc_gs"))
+        self.ckpt_dir = self.output_dir / "checkpoints"
+        self.log_dir = self.output_dir / "logs"
+        self.vis_dir = self.output_dir / "visualizations"
+        for d in (self.ckpt_dir, self.log_dir, self.vis_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Components
+        self.model = self.build_model(config).to(self.device)
+        self.codec = self._build_codec(config).to(self.device)
+        self.renderer = FeatureFieldRenderer(
+            image_height=getattr(config, "feature_height", 30),
+            image_width=getattr(config, "feature_width", 40),
+            fx=getattr(config, "fx", 320.0) * getattr(config, "feature_width", 40) / getattr(config, "image_width", 640),
+            fy=getattr(config, "fy", 320.0) * getattr(config, "feature_height", 30) / getattr(config, "image_height", 480),
+            cx=getattr(config, "cx", 319.5) * getattr(config, "feature_width", 40) / getattr(config, "image_width", 640),
+            cy=getattr(config, "cy", 239.5) * getattr(config, "feature_height", 30) / getattr(config, "image_height", 480),
+            max_channels_per_chunk=getattr(config, "max_channels_per_chunk", 32),
+            use_2dgs=resolve_use_2dgs(config),
+        ).to(self.device)
+        self.sharpener = FeatSharp3D(
+            mode=getattr(config, "featsharp_mode", "analytical"),
+            feature_dim=self._resolve_latent_dim(config),
+            strength=getattr(config, "featsharp_strength", 0.5),
+        ).to(self.device)
+
+        # Optional screen-space refiner (corrects alpha-blending artifacts)
+        self.use_refiner = getattr(config, "use_refiner", False)
+        self.refiner_rgb_guide = getattr(config, "refiner_rgb_guide", False)
+        self.refiner_depth_guide = getattr(config, "refiner_depth_guide", False)
+        self.refiner_alpha_guide = getattr(config, "refiner_alpha_guide", False)
+        self.refiner_boundary_guide = getattr(config, "refiner_boundary_guide", False)
+        self.self_guided = getattr(config, "self_guided", False)
+        self.train_sh = getattr(config, "train_sh", False)
+        self.rgb_loss_weight = getattr(config, "rgb_loss_weight", 0.0)
+        self._is_hybrid = getattr(config, "architecture", "explicit") == "hybrid"
+        self._is_superpoint = getattr(config, "feature_type", "superpoint") == "superpoint"
+        self.localization_loss_weight = getattr(config, "localization_loss_weight", 0.0)
+        self.sp_recon_aux_weight = getattr(config, "sp_recon_aux_weight", 1.0)
+        self.locability_sparsity_weight = getattr(config, "locability_sparsity_weight", 0.0)
+        self.geometry_unfreeze_epoch = getattr(config, "geometry_unfreeze_epoch", -1)
+        self.train_geometry_xyz = getattr(config, "train_geometry_xyz", False)
+        self.train_geometry_opacity = getattr(config, "train_geometry_opacity", False)
+        self.geometry_reg_weight = getattr(config, "geometry_reg_weight", 0.0)
+
+        # SuperPoint output head (descriptor + detector from fused features)
+        self.sp_output_head: Optional[SuperPointOutputHead] = None
+        self.sp_locability_adapter: Optional[nn.Conv2d] = None
+        if self._is_superpoint:
+            fused_dim = getattr(config, "hybrid_output_dim", 128)
+            self.sp_output_head = SuperPointOutputHead(
+                fused_dim=fused_dim,
+                descriptor_dim=getattr(config, "descriptor_dim", 256),
+                detector_dim=getattr(config, "detector_dim", 65),
+                hidden_dim=getattr(config, "sp_head_hidden_dim", 256),
+                num_res_blocks=getattr(config, "sp_head_num_res_blocks", 2),
+                use_3x3=getattr(config, "sp_head_use_3x3", True),
+            ).to(self.device)
+            sp_params = sum(p.numel() for p in self.sp_output_head.parameters())
+            self._log(f"SuperPoint output head created (fused_dim={fused_dim}, params={sp_params/1e6:.2f}M)")
+            if getattr(config, "sp_use_locability_input", False):
+                self.sp_locability_adapter = nn.Conv2d(1, fused_dim, 1).to(self.device)
+                nn.init.zeros_(self.sp_locability_adapter.weight)
+                nn.init.zeros_(self.sp_locability_adapter.bias)
+                self._log("SuperPoint head locability adapter enabled")
+
+        self.detector_loss_weight = getattr(config, "detector_loss_weight", 1.0)
+        self.detector_loss_type = getattr(config, "detector_loss_type", "kl")
+        self.hybrid_decoupled_heads = getattr(config, "hybrid_decoupled_heads", False)
+        self.hybrid_semantic_adaptor_reg_weight = getattr(
+            config, "hybrid_semantic_adaptor_reg_weight", 0.0
+        )
+
+        # Enable SH training if requested
+        if self.train_sh and hasattr(self.model, "enable_sh_training"):
+            self.model.enable_sh_training()
+            self._log("Joint RGB training: SH coefficients unfrozen")
+
+        if (
+            (self.train_geometry_xyz or self.train_geometry_opacity)
+            and hasattr(self.model, "enable_geometry_training")
+        ):
+            self.model.enable_geometry_training(
+                train_xyz=self.train_geometry_xyz,
+                train_opacity=self.train_geometry_opacity,
+            )
+            self._initial_geometry: dict[str, torch.Tensor] = {}
+            if self.train_geometry_xyz:
+                self._initial_geometry["xyz"] = self.model.get_xyz().detach().clone()
+            if self.train_geometry_opacity and hasattr(self.model, "get_opacity_logits"):
+                self._initial_geometry["opacity"] = self.model.get_opacity_logits().detach().clone()
+            self._set_geometry_requires_grad(False)
+            self._log(
+                "Geometry parameters registered for staged localization training "
+                f"(xyz={self.train_geometry_xyz}, opacity={self.train_geometry_opacity}, "
+                f"unfreeze_epoch={self.geometry_unfreeze_epoch})"
+            )
+
+        if self.use_refiner:
+            extra_ch = compute_refiner_extra_channels(
+                rgb_guide=self.refiner_rgb_guide,
+                depth_guide=self.refiner_depth_guide,
+                depth_grad=getattr(config, "refiner_depth_grad", False),
+                alpha_guide=self.refiner_alpha_guide,
+                boundary_guide=self.refiner_boundary_guide,
+            )
+            self.refiner = ScreenSpaceRefiner(
+                latent_dim=self._resolve_latent_dim(config),
+                hidden_dim=getattr(config, "refiner_hidden_dim", 128),
+                num_blocks=getattr(config, "refiner_num_blocks", 4),
+                dropout=getattr(config, "refiner_dropout", 0.1),
+                extra_channels=extra_ch,
+                norm_type=getattr(config, "refiner_norm_type", "gn"),
+            ).to(self.device)
+        else:
+            self.refiner = None
+
+        # In latent mode, freeze codec entirely
+        if self.train_mode == "latent":
+            for p in self.codec.parameters():
+                p.requires_grad = False
+            self._log("Latent mode: codec frozen, training in 64d space")
+
+        # Losses
+        self.distill_loss_fn = DistillationLoss(
+            l2_weight=getattr(config, "l2_weight", 1.0),
+            cosine_weight=getattr(config, "cosine_weight", 0.5),
+            channel_std_weight=getattr(config, "channel_std_weight", 0.0),
+        )
+        self.localization_loss_fn: Optional[LocalizationGuidedLoss] = None
+        if self._is_superpoint and self.localization_loss_weight > 0:
+            self.localization_loss_fn = LocalizationGuidedLoss(
+                temperature=getattr(config, "localization_temperature", 0.07),
+                target_sigma_px=getattr(config, "localization_target_sigma_px", 2.0),
+                min_depth=getattr(config, "localization_min_depth", 0.05),
+                max_depth=getattr(config, "localization_max_depth", 20.0),
+                locability_prior_weight=getattr(config, "locability_prior_weight", 1.0),
+            ).to(self.device)
+            self._log(
+                "Localization-guided SuperPoint loss enabled "
+                f"(weight={self.localization_loss_weight})"
+            )
+        self.mv_loss_fn = MultiViewConsistencyLoss()
+        self.tv_loss_fn = TotalVariationLoss()
+        self.gradient_loss_weight = getattr(config, "gradient_loss_weight", 0.0)
+        self.gradient_loss_fn: Optional[GradientWeightedLoss] = None
+        if self.gradient_loss_weight > 0:
+            self.gradient_loss_fn = GradientWeightedLoss(
+                base_weight=1.0, edge_multiplier=3.0,
+            ).to(self.device)
+        self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.0)
+        self.geom_depth_loss_weight = getattr(config, "geom_depth_loss_weight", 0.0)
+        self.depth_guided_feat_weight = getattr(config, "depth_guided_feature_weight", 0.0)
+        self.depth_guided_feat_loss: Optional[DepthGuidedFeatureLoss] = None
+        if self.depth_guided_feat_weight > 0:
+            self.depth_guided_feat_loss = DepthGuidedFeatureLoss().to(self.device)
+        self.geometric_edge_loss_weight = getattr(config, "geometric_edge_loss_weight", 0.0)
+        self.geometric_edge_loss_fn: Optional[GeometricEdgeAlignmentLoss] = None
+        if self.geometric_edge_loss_weight > 0:
+            self.geometric_edge_loss_fn = GeometricEdgeAlignmentLoss().to(self.device)
+        self.boundary_aware_loss_weight = getattr(config, "boundary_aware_loss_weight", 0.0)
+        self.boundary_aware_loss_fn: Optional[BoundaryAwareFeatureLoss] = None
+        if self.boundary_aware_loss_weight > 0:
+            self.boundary_aware_loss_fn = BoundaryAwareFeatureLoss(
+                sharpness_weight=getattr(config, "boundary_aware_sharpness_weight", 1.0),
+                smoothness_weight=getattr(config, "boundary_aware_smoothness_weight", 1.0),
+                edge_threshold=getattr(config, "boundary_aware_edge_threshold", 0.1),
+            ).to(self.device)
+        self.hybrid_semantic_aux_weight = getattr(config, "hybrid_semantic_aux_weight", 0.0)
+        self.depth_alpha_threshold = getattr(config, "depth_alpha_threshold", 0.05)
+        self.depth_head: Optional[DepthHead] = None
+        self.depth_supervision_loss: Optional[DepthLoss] = None
+        self.geom_depth_supervision_loss: Optional[DepthLoss] = None
+        # Frozen depth head supervision (core innovation)
+        self.frozen_depth_head_weight = getattr(config, "frozen_depth_head_weight", 0.0)
+        self.frozen_depth_head_weight_target = self.frozen_depth_head_weight  # for curriculum
+        self.frozen_depth_warmup_epochs = getattr(config, "frozen_depth_warmup_epochs", 0)
+        self.frozen_depth_teacher = getattr(config, "frozen_depth_teacher", "geom_depth")
+        self.frozen_depth_head: Optional[DepthHead] = None
+        self.frozen_depth_loss_fn: Optional[DepthLoss] = None
+        self.frozen_depth_gradient_weight = getattr(config, "frozen_depth_gradient_weight", 0.0)
+        if self.frozen_depth_head_weight > 0:
+            frozen_path = getattr(config, "frozen_depth_head_path", "")
+            if not frozen_path or not Path(frozen_path).exists():
+                raise FileNotFoundError(
+                    f"frozen_depth_head_path required when frozen_depth_head_weight > 0, "
+                    f"got: '{frozen_path}'"
+                )
+            self._log(f"Loading frozen depth head from {frozen_path}")
+            ckpt = torch.load(frozen_path, map_location=self.device)
+            head_cfg = ckpt.get("config", {})
+            self.frozen_depth_head = DepthHead(
+                feature_dim=head_cfg.get("feature_dim", getattr(config, "radio_feature_dim", 1280)),
+                hidden_dim=head_cfg.get("hidden_dim", getattr(config, "frozen_depth_head_hidden_dim", 256)),
+                num_layers=head_cfg.get("num_layers", getattr(config, "frozen_depth_head_num_layers", 3)),
+                head_type=head_cfg.get("head_type", getattr(config, "frozen_depth_head_type", "mlp")),
+            ).to(self.device)
+            state = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+            self.frozen_depth_head.load_state_dict(state)
+            # Freeze all parameters — gradients flow through features only
+            for p in self.frozen_depth_head.parameters():
+                p.requires_grad = False
+            self.frozen_depth_head.eval()
+            self.frozen_depth_loss_fn = DepthLoss(
+                loss_type=getattr(config, "frozen_depth_loss_type", "scale_invariant"),
+                weight=1.0,
+            )
+            self._log(f"Frozen depth head loaded ({sum(p.numel() for p in self.frozen_depth_head.parameters()) / 1e6:.3f}M params, all frozen)")
+
+        self.frozen_seg_head_weight = getattr(config, "frozen_seg_head_weight", 0.0)
+        self.frozen_seg_loss_type = getattr(config, "frozen_seg_loss_type", "kl")
+        self.frozen_seg_temperature = float(getattr(config, "frozen_seg_temperature", 1.0))
+        self.frozen_seg_head: Optional[SegmentationHead] = None
+        if self.frozen_seg_head_weight > 0:
+            frozen_seg_path = getattr(config, "frozen_seg_head_path", "")
+            if not frozen_seg_path or not Path(frozen_seg_path).exists():
+                raise FileNotFoundError(
+                    f"frozen_seg_head_path required when frozen_seg_head_weight > 0, "
+                    f"got: '{frozen_seg_path}'"
+                )
+            self._log(f"Loading frozen segmentation head from {frozen_seg_path}")
+            ckpt = torch.load(frozen_seg_path, map_location=self.device)
+            head_cfg = ckpt.get("config", {})
+            self.frozen_seg_head = SegmentationHead(
+                feature_dim=head_cfg.get("feature_dim", getattr(config, "radio_feature_dim", 1280)),
+                num_classes=head_cfg.get(
+                    "num_classes",
+                    getattr(config, "frozen_seg_num_classes", getattr(config, "seg_num_classes", 40)),
+                ),
+                hidden_dim=head_cfg.get("hidden_dim", getattr(config, "frozen_seg_head_hidden_dim", 256)),
+                num_layers=head_cfg.get("num_layers", getattr(config, "frozen_seg_head_num_layers", 3)),
+                head_type=head_cfg.get("head_type", getattr(config, "frozen_seg_head_type", "mlp")),
+            ).to(self.device)
+            state = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+            self.frozen_seg_head.load_state_dict(state)
+            for p in self.frozen_seg_head.parameters():
+                p.requires_grad = False
+            self.frozen_seg_head.eval()
+            self._log(
+                "Frozen segmentation head loaded "
+                f"({sum(p.numel() for p in self.frozen_seg_head.parameters()) / 1e6:.3f}M params, all frozen)"
+            )
+
+        self.seg_loss_weight = getattr(config, "seg_loss_weight", 0.0)
+        self.seg_head: Optional[SegmentationHead] = None
+        self.seg_loss_fn: Optional[SegmentationLoss] = None
+        self.siglip_alignment_weight = getattr(config, "siglip_alignment_weight", 0.0)
+        self.grounding_query_loss_weight = getattr(
+            config, "grounding_query_loss_weight", 0.0
+        )
+        self.grounding_query_temperature = getattr(
+            config, "grounding_query_temperature", 1.0
+        )
+        self.grounding_query_loss_fn: Optional[QueryGroundingAuxLoss] = None
+        self.grounding_query_names: List[str] = []
+        self.grounding_query_class_ids: List[int] = []
+        self.grounding_text_embeddings: Optional[torch.Tensor] = None
+        self.siglip_projection: Optional[SigLIP2FeatureProjection] = None
+        self.siglip_summary_head: Optional[SigLIP2SummaryHead] = None
+        self.siglip_summary_alignment_weight = getattr(
+            config, "siglip_summary_alignment_weight", 0.0
+        )
+        if self.depth_loss_weight > 0 or self.geom_depth_loss_weight > 0:
+            self.depth_head = DepthHead(
+                feature_dim=getattr(config, "radio_feature_dim", 1280),
+                hidden_dim=getattr(config, "depth_head_hidden_dim", 256),
+                num_layers=getattr(config, "depth_head_num_layers", 3),
+                head_type=getattr(config, "depth_head_type", "mlp"),
+            ).to(self.device)
+            self.depth_supervision_loss = DepthLoss(
+                loss_type=getattr(config, "depth_supervision_loss_type", "scale_invariant"),
+                weight=1.0,
+            )
+            self.geom_depth_supervision_loss = DepthLoss(
+                loss_type=getattr(
+                    config,
+                    "geom_depth_supervision_loss_type",
+                    getattr(config, "depth_supervision_loss_type", "scale_invariant"),
+                ),
+                weight=1.0,
+            )
+        if self.seg_loss_weight > 0:
+            self.seg_head = SegmentationHead(
+                feature_dim=getattr(config, "radio_feature_dim", 1280),
+                num_classes=getattr(config, "seg_num_classes", 40),
+                hidden_dim=getattr(config, "seg_head_hidden_dim", 256),
+                num_layers=getattr(config, "seg_head_num_layers", 2),
+                head_type=getattr(config, "seg_head_type", "mlp"),
+            ).to(self.device)
+            self.seg_loss_fn = SegmentationLoss(
+                loss_type=getattr(config, "seg_loss_type", "ce"),
+                ignore_index=getattr(config, "seg_ignore_index", 255),
+            )
+        if self.siglip_alignment_weight > 0 or self.grounding_query_loss_weight > 0:
+            proj_path = resolve_siglip_projection_path(
+                getattr(
+                    config,
+                    "siglip_projection_weights",
+                    DEFAULT_SIGLIP2_PROJECTION_WEIGHTS,
+                )
+            )
+            if not proj_path.exists():
+                raise FileNotFoundError(
+                    f"SigLIP2 projection weights not found: {proj_path}"
+                )
+            self.siglip_projection = SigLIP2FeatureProjection().to(self.device)
+            self.siglip_projection.load_state_dict(
+                torch.load(proj_path, map_location="cpu")
+            )
+            self.siglip_projection.eval()
+            for param in self.siglip_projection.parameters():
+                param.requires_grad = False
+        if self.siglip_summary_alignment_weight > 0:
+            summary_path = Path(
+                getattr(
+                    config,
+                    "siglip_summary_head_weights",
+                    "checkpoints/siglip2_summary_head.pth",
+                )
+            )
+            if not summary_path.exists():
+                raise FileNotFoundError(
+                    f"SigLIP2 summary head weights not found: {summary_path}"
+                )
+            self.siglip_summary_head = SigLIP2SummaryHead().to(self.device)
+            self.siglip_summary_head.load_state_dict(
+                torch.load(summary_path, map_location="cpu")
+            )
+            self.siglip_summary_head.eval()
+            for param in self.siglip_summary_head.parameters():
+                param.requires_grad = False
+            self._log(
+                f"SigLIP2 summary head loaded for text-space alignment "
+                f"(weight={self.siglip_summary_alignment_weight})"
+            )
+
+        if self.grounding_query_loss_weight > 0:
+            if resolve_dataset_type(getattr(config, "dataset_type", "replica")) != "replica":
+                self._log(
+                    "grounding_query_loss_weight is currently implemented for "
+                    "Replica only; disabling grounding query aux loss"
+                )
+                self.grounding_query_loss_weight = 0.0
+            else:
+                self.grounding_query_loss_fn = QueryGroundingAuxLoss(
+                    feature_dim=1536,
+                    temperature=self.grounding_query_temperature,
+                ).to(self.device)
+                (
+                    self.grounding_query_names,
+                    self.grounding_query_class_ids,
+                    self.grounding_text_embeddings,
+                ) = self._load_grounding_text_embeddings(config)
+                self._log(
+                    "Loaded grounding query aux bank: "
+                    f"{len(self.grounding_query_names)} queries "
+                    f"from {getattr(config, 'grounding_text_embeddings', '')}"
+                )
+
+        # Feature norm regularization weight
+        self.feat_norm_weight = getattr(config, "feat_norm_weight", 0.0)
+
+        # Optimizer with separate LR groups
+        self.optimizer = self._build_optimizer(config)
+        self.scheduler = self._build_scheduler(config)
+        self.scaler = GradScaler()
+
+        # Datasets + loaders
+        self.train_dataset, self.val_dataset = self.build_dataset(config)
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=getattr(config, "batch_size", 4),
+            shuffle=True,
+            num_workers=getattr(config, "num_workers", 4),
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=self._collate_batch,
+        )
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=getattr(config, "num_workers", 4),
+            pin_memory=True,
+            collate_fn=self._collate_batch,
+        )
+
+        # Logging
+        self.writer: Optional[SummaryWriter] = None
+        if _HAS_TB:
+            self.writer = SummaryWriter(log_dir=str(self.log_dir))
+
+        # Tracking
+        self.start_epoch = 1
+        self.global_step = 0
+        self.best_cosine = -1.0
+        self.best_metric_name = getattr(config, "best_metric", "cosine")
+        self.best_metric_mode = getattr(config, "best_metric_mode", "auto")
+        self.best_selection_score = float("-inf")
+        self.best_selection_value: Optional[float] = None
+
+        self._log(f"Model params: {self._count_params(self.model):.2f}M")
+        self._log(f"Codec params: {self._count_params(self.codec):.2f}M")
+        self._log(f"Sharpener mode: {self.sharpener.mode}")
+        if self.use_refiner and self.refiner is not None:
+            self._log(f"Refiner params: {self._count_params(self.refiner):.2f}M")
+        if self.depth_head is not None:
+            self._log(f"Depth aux head params: {self._count_params(self.depth_head):.2f}M")
+        if self.frozen_depth_head is not None:
+            self._log(f"Frozen depth head params: {self._count_params(self.frozen_depth_head):.2f}M (frozen)")
+            self._log(f"Frozen depth teacher: {self.frozen_depth_teacher}")
+        if self.frozen_seg_head is not None:
+            self._log(f"Frozen seg head params: {self._count_params(self.frozen_seg_head):.2f}M (frozen)")
+        if self.seg_head is not None:
+            self._log(f"Seg aux head params: {self._count_params(self.seg_head):.2f}M")
+        self._log(
+            f"Best checkpoint metric: {self.best_metric_name} "
+            f"(mode={self.best_metric_mode})"
+        )
+
+    # ------------------------------------------------------------------
+    # Building blocks
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_latent_dim(config: LocGSConfig) -> int:
+        arch = getattr(config, "architecture", "explicit")
+        if arch == "hybrid":
+            return getattr(config, "hybrid_latent_dim", 16)
+        return getattr(config, "latent_dim", 64)
+
+    def build_model(self, config: LocGSConfig) -> nn.Module:
+        arch = getattr(config, "architecture", "explicit")
+        if arch == "explicit":
+            model = ExplicitFeatureGaussian(
+                latent_dim=getattr(config, "latent_dim", 64),
+                train_sh=getattr(config, "train_sh", False),
+            )
+        elif arch == "hybrid":
+            model = HybridFeatureGaussian(
+                latent_dim=getattr(config, "hybrid_latent_dim", 16),
+                hash_output_dim=getattr(config, "hash_output_dim", 48),
+                fine_dim=getattr(config, "fine_dim", 64),
+                coarse_dim=getattr(config, "coarse_dim", 64),
+                output_dim=getattr(config, "hybrid_output_dim", 128),
+                num_levels=getattr(config, "hash_levels", 16),
+                features_per_level=getattr(config, "hash_features_per_level", 2),
+                log2_hashmap_size=getattr(config, "hash_log2_size", 19),
+                base_resolution=getattr(config, "hash_base_resolution", 16),
+                max_resolution=getattr(config, "hash_max_resolution", 2048),
+                decoupled_heads=getattr(config, "hybrid_decoupled_heads", False),
+                use_semantic_adaptor=getattr(config, "hybrid_semantic_adaptor", False),
+                semantic_adaptor_mode=getattr(
+                    config, "hybrid_semantic_adaptor_mode", "confidence"
+                ),
+                semantic_adaptor_hidden_dim=getattr(
+                    config, "hybrid_semantic_adaptor_hidden_dim", 64
+                ),
+                semantic_adaptor_use_geometry_guidance=getattr(
+                    config, "hybrid_semantic_adaptor_use_geometry_guidance", True
+                ),
+                semantic_adaptor_use_depth_guidance=getattr(
+                    config, "hybrid_semantic_adaptor_use_depth_guidance", False
+                ),
+                semantic_adaptor_residual=getattr(
+                    config, "hybrid_semantic_adaptor_residual", True
+                ),
+            )
+        else:
+            raise ValueError(f"Unknown architecture: {arch}")
+
+        ply_path = getattr(config, "ply_path", None)
+        if ply_path:
+            self._log(f"Loading geometry from {ply_path}")
+            model.load_from_ply(ply_path)
+
+        return model
+
+    @staticmethod
+    def _build_codec(config: LocGSConfig) -> nn.Module:
+        if getattr(config, "feature_type", "superpoint") == "superpoint":
+            # SuperPoint mode: no HCD codec needed; use a dummy module
+            dummy = nn.Module()
+            dummy.encoder = nn.Identity()
+            dummy.decoder = nn.Identity()
+            return dummy
+        return HCDCodec(
+            input_dim=getattr(config, "radio_feature_dim", 1280),
+            bottleneck_dim=getattr(config, "bottleneck_dim", 64),
+            dual_stream=getattr(config, "dual_stream", True),
+            symmetric_decoder=getattr(config, "symmetric_decoder", False),
+        )
+
+    def _build_optimizer(self, config: LocGSConfig) -> optim.Optimizer:
+        arch = getattr(config, "architecture", "explicit")
+        # Feature embeddings (always trainable)
+        feature_params = [self.model._feature if arch == "explicit" else self.model._latent]
+        param_groups = [
+            {
+                "params": feature_params,
+                "lr": getattr(config, "lr_features", 1e-3),
+                "name": "features",
+            },
+        ]
+        if hasattr(self.model, "_locability_logit") and self.model._locability_logit.numel() > 0:
+            param_groups.append({
+                "params": [self.model._locability_logit],
+                "lr": getattr(config, "lr_locability", 1e-4),
+                "name": "locability",
+            })
+        if getattr(config, "train_geometry_xyz", False) and isinstance(
+            getattr(self.model, "_xyz", None), nn.Parameter
+        ):
+            param_groups.append({
+                "params": [self.model._xyz],
+                "lr": getattr(config, "lr_geometry_xyz", 1e-5),
+                "name": "geometry_xyz",
+            })
+        if getattr(config, "train_geometry_opacity", False) and isinstance(
+            getattr(self.model, "_opacity", None), nn.Parameter
+        ):
+            param_groups.append({
+                "params": [self.model._opacity],
+                "lr": getattr(config, "lr_geometry_opacity", 5e-5),
+                "name": "geometry_opacity",
+            })
+        # Hybrid architecture: hash grid + screen-space decoders
+        if arch == "hybrid":
+            param_groups.append({
+                "params": list(self.model.hash_field.parameters()),
+                "lr": getattr(config, "lr_hash", 1e-3),
+                "name": "hash_field",
+            })
+            hybrid_decoder_params = (
+                list(self.model.fine_decoder.parameters())
+                + list(self.model.coarse_decoder.parameters())
+                + list(self.model.fusion_head.parameters())
+            )
+            param_groups.append({
+                "params": hybrid_decoder_params,
+                "lr": getattr(config, "lr_decoder", 1e-4),
+                "name": "hybrid_decoders",
+            })
+        # SH params (separate group for joint RGB training)
+        if self.train_sh and hasattr(self.model, "_sh_dc_param"):
+            sh_params = [self.model._sh_dc_param]
+            if hasattr(self.model, "_sh_rest_param") and self.model._sh_rest_param is not None:
+                sh_params.append(self.model._sh_rest_param)
+            param_groups.append(
+                {
+                    "params": sh_params,
+                    "lr": getattr(config, "lr_sh", 5e-4),
+                    "name": "sh_colors",
+                }
+            )
+        # Only add decoder to optimizer if not in latent mode (decoder is frozen)
+        if self.train_mode != "latent":
+            param_groups.append(
+                {
+                    "params": self.codec.decoder.parameters(),
+                    "lr": getattr(config, "lr_decoder", 1e-4),
+                    "name": "decoder",
+                }
+            )
+        if self.sharpener.mode not in ("analytical", "none"):
+            param_groups.append(
+                {
+                    "params": self.sharpener.parameters(),
+                    "lr": getattr(config, "lr_heads", 1e-4),
+                    "name": "sharpener",
+                }
+            )
+        if self.use_refiner and self.refiner is not None:
+            param_groups.append(
+                {
+                    "params": self.refiner.parameters(),
+                    "lr": getattr(config, "lr_refiner", 5e-4),
+                    "name": "refiner",
+                }
+            )
+        if self.depth_head is not None:
+            param_groups.append(
+                {
+                    "params": self.depth_head.parameters(),
+                    "lr": getattr(config, "lr_heads", 1e-4),
+                    "name": "depth_head",
+                }
+            )
+        if self.seg_head is not None:
+            param_groups.append(
+                {
+                    "params": self.seg_head.parameters(),
+                    "lr": getattr(config, "lr_heads", 1e-4),
+                    "name": "seg_head",
+                }
+            )
+        if self.sp_output_head is not None:
+            param_groups.append(
+                {
+                    "params": self.sp_output_head.parameters(),
+                    "lr": getattr(config, "lr_output_head", 1e-4),
+                    "name": "sp_output_head",
+                }
+            )
+        if self.sp_locability_adapter is not None:
+            param_groups.append(
+                {
+                    "params": self.sp_locability_adapter.parameters(),
+                    "lr": getattr(config, "lr_output_head", 1e-4),
+                    "name": "sp_locability_adapter",
+                }
+            )
+        return optim.AdamW(
+            param_groups,
+            weight_decay=getattr(config, "weight_decay", 1e-5),
+            betas=(0.9, 0.999),
+        )
+
+    def _build_scheduler(
+        self, config: LocGSConfig
+    ) -> optim.lr_scheduler._LRScheduler:
+        warmup_epochs = getattr(config, "warmup_epochs", 5)
+        total_epochs = getattr(config, "epochs", 100)
+
+        cosine = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=max(total_epochs - warmup_epochs, 1),
+            eta_min=1e-6,
+        )
+        if warmup_epochs > 0:
+            warmup = optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=0.01,
+                total_iters=warmup_epochs,
+            )
+            return optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[warmup, cosine],
+                milestones=[warmup_epochs],
+            )
+        return cosine
+
+    @staticmethod
+    def _metric_prefers_min(metric_name: str) -> bool:
+        return metric_name in {
+            "mse",
+            "depth_gt",
+            "depth_geom",
+            "frozen_depth",
+            "siglip_align",
+            "summary_align",
+            "ground_query",
+            "seg_aux",
+            "frozen_seg",
+        }
+
+    def _resolve_best_metric(self, metrics: Dict[str, float]) -> Tuple[str, float, float]:
+        metric_name = self.best_metric_name
+        if metric_name == "proxy_depth":
+            components: list[float] = []
+            if "frozen_depth" in metrics:
+                components.append(float(metrics["frozen_depth"]))
+            if "depth_geom" in metrics:
+                components.append(0.5 * float(metrics["depth_geom"]))
+            if "depth_gt" in metrics:
+                components.append(0.25 * float(metrics["depth_gt"]))
+            if "mse" in metrics:
+                components.append(0.05 * float(metrics["mse"]))
+            if not components:
+                raise KeyError(
+                    "best_metric=proxy_depth requested, but no depth proxy metrics are available"
+                )
+            value = float(sum(components))
+            return metric_name, value, -value
+
+        if metric_name not in metrics:
+            raise KeyError(
+                f"best_metric='{metric_name}' not found in validation metrics: "
+                f"{sorted(metrics.keys())}"
+            )
+
+        value = float(metrics[metric_name])
+        mode = self.best_metric_mode
+        if mode == "auto":
+            maximize = not self._metric_prefers_min(metric_name)
+        elif mode == "max":
+            maximize = True
+        elif mode == "min":
+            maximize = False
+        else:
+            raise ValueError(f"Unknown best_metric_mode '{mode}'")
+        score = value if maximize else -value
+        return metric_name, value, score
+
+    # ------------------------------------------------------------------
+    # Dataset
+    # ------------------------------------------------------------------
+
+    def build_dataset(
+        self, config: LocGSConfig
+    ) -> Tuple[Dataset, Dataset]:
+        dataset_type = resolve_dataset_type(config)
+        scene_root = resolve_scene_root(config)
+        train_split = getattr(config, "train_split", "Sequence_1")
+        val_split = getattr(config, "val_split", "Sequence_2")
+        mixed_split = getattr(config, "mixed_split", False)
+
+        # RGB guide setup
+        feature_size = (
+            getattr(config, "feature_height", 30),
+            getattr(config, "feature_width", 40),
+        )
+        rgb_dir_train = str(resolve_split_data_dir(config, "train", "rgb")) if self.refiner_rgb_guide and resolve_split_data_dir(config, "train", "rgb") is not None else None
+        rgb_dir_val = str(resolve_split_data_dir(config, "val", "rgb")) if self.refiner_rgb_guide and resolve_split_data_dir(config, "val", "rgb") is not None else None
+
+        if dataset_type != "replica":
+            train_feature_dir = resolve_split_feature_dir(config, "train")
+            val_feature_dir = resolve_split_feature_dir(config, "val")
+            train_pose_file, train_pose_dir = resolve_split_pose_source(config, "train")
+            val_pose_file, val_pose_dir = resolve_split_pose_source(config, "val")
+            train_depth_dir = resolve_split_data_dir(config, "train", "depth")
+            val_depth_dir = resolve_split_data_dir(config, "val", "depth")
+            train_semantics_dir = resolve_split_data_dir(config, "train", "semantics")
+            val_semantics_dir = resolve_split_data_dir(config, "val", "semantics")
+            train_frame_ids = resolve_split_frame_ids(config, "train")
+            val_frame_ids = resolve_split_frame_ids(config, "val")
+
+            if train_frame_ids is not None and val_frame_ids is not None:
+                train_ds = SimpleFeatureDataset(
+                    feature_dir=str(train_feature_dir),
+                    pose_file=train_pose_file,
+                    pose_dir=train_pose_dir,
+                    depth_dir=str(train_depth_dir) if train_depth_dir else None,
+                    semantics_dir=str(train_semantics_dir) if train_semantics_dir else None,
+                    rgb_dir=rgb_dir_train,
+                    feature_size=feature_size,
+                    split="train",
+                    dataset_type=dataset_type,
+                    frame_ids=train_frame_ids,
+                )
+                val_ds = SimpleFeatureDataset(
+                    feature_dir=str(val_feature_dir),
+                    pose_file=val_pose_file,
+                    pose_dir=val_pose_dir,
+                    depth_dir=str(val_depth_dir) if val_depth_dir else None,
+                    semantics_dir=str(val_semantics_dir) if val_semantics_dir else None,
+                    rgb_dir=rgb_dir_val,
+                    feature_size=feature_size,
+                    split="val",
+                    dataset_type=dataset_type,
+                    frame_ids=val_frame_ids,
+                )
+                self._log(
+                    f"{dataset_type} split lists: Train {len(train_ds)} frames | Val {len(val_ds)} frames"
+                )
+                return train_ds, val_ds
+
+            full_ds = SimpleFeatureDataset(
+                feature_dir=str(train_feature_dir),
+                pose_file=train_pose_file,
+                pose_dir=train_pose_dir,
+                depth_dir=str(train_depth_dir) if train_depth_dir else None,
+                semantics_dir=str(train_semantics_dir) if train_semantics_dir else None,
+                rgb_dir=rgb_dir_train,
+                feature_size=feature_size,
+                split="train",
+                dataset_type=dataset_type,
+            )
+            train_ratio = getattr(config, "mixed_train_ratio", 0.8)
+            train_size = int(train_ratio * len(full_ds))
+            val_size = len(full_ds) - train_size
+            seed = getattr(config, "mixed_seed", 42)
+            gen = torch.Generator().manual_seed(seed)
+            train_ds, val_ds = torch.utils.data.random_split(
+                full_ds, [train_size, val_size], generator=gen
+            )
+            self._log(
+                f"{dataset_type} random split: {len(full_ds)} total → Train: {train_size} | "
+                f"Val: {val_size} (ratio={train_ratio}, seed={seed})"
+            )
+            return train_ds, val_ds
+
+        if mixed_split:
+            # Merge both sequences and random 80/20 split
+            ds_seq1 = SimpleFeatureDataset(
+                feature_dir=str(resolve_split_feature_dir(config, "train")),
+                pose_file=resolve_split_pose_source(config, "train")[0],
+                pose_dir=resolve_split_pose_source(config, "train")[1],
+                depth_dir=str(resolve_split_data_dir(config, "train", "depth")) if resolve_split_data_dir(config, "train", "depth") else None,
+                semantics_dir=str(resolve_split_data_dir(config, "train", "semantics")) if resolve_split_data_dir(config, "train", "semantics") else None,
+                rgb_dir=rgb_dir_train,
+                feature_size=feature_size,
+                split="train",
+                dataset_type=dataset_type,
+            )
+            ds_seq2 = SimpleFeatureDataset(
+                feature_dir=str(resolve_split_feature_dir(config, "val")),
+                pose_file=resolve_split_pose_source(config, "val")[0],
+                pose_dir=resolve_split_pose_source(config, "val")[1],
+                depth_dir=str(resolve_split_data_dir(config, "val", "depth")) if resolve_split_data_dir(config, "val", "depth") else None,
+                semantics_dir=str(resolve_split_data_dir(config, "val", "semantics")) if resolve_split_data_dir(config, "val", "semantics") else None,
+                rgb_dir=rgb_dir_val,
+                feature_size=feature_size,
+                split="train",
+                dataset_type=dataset_type,
+            )
+            combined = ConcatDataset([ds_seq1, ds_seq2])
+            total = len(combined)
+            train_ratio = getattr(config, "mixed_train_ratio", 0.8)
+            train_size = int(train_ratio * total)
+            val_size = total - train_size
+            seed = getattr(config, "mixed_seed", 42)
+            gen = torch.Generator().manual_seed(seed)
+            train_ds, val_ds = torch.utils.data.random_split(
+                combined, [train_size, val_size], generator=gen
+            )
+            self._log(
+                f"Mixed split: {total} total → Train: {train_size} | Val: {val_size} "
+                f"(ratio={train_ratio}, seed={seed})"
+            )
+            return train_ds, val_ds
+
+        train_ds = SimpleFeatureDataset(
+            feature_dir=str(resolve_split_feature_dir(config, "train")),
+            pose_file=resolve_split_pose_source(config, "train")[0],
+            pose_dir=resolve_split_pose_source(config, "train")[1],
+            depth_dir=str(resolve_split_data_dir(config, "train", "depth")) if resolve_split_data_dir(config, "train", "depth") else None,
+            semantics_dir=str(resolve_split_data_dir(config, "train", "semantics")) if resolve_split_data_dir(config, "train", "semantics") else None,
+            rgb_dir=rgb_dir_train,
+            feature_size=feature_size,
+            split="train",
+            dataset_type=dataset_type,
+        )
+        val_ds = SimpleFeatureDataset(
+            feature_dir=str(resolve_split_feature_dir(config, "val")),
+            pose_file=resolve_split_pose_source(config, "val")[0],
+            pose_dir=resolve_split_pose_source(config, "val")[1],
+            depth_dir=str(resolve_split_data_dir(config, "val", "depth")) if resolve_split_data_dir(config, "val", "depth") else None,
+            semantics_dir=str(resolve_split_data_dir(config, "val", "semantics")) if resolve_split_data_dir(config, "val", "semantics") else None,
+            rgb_dir=rgb_dir_val,
+            feature_size=feature_size,
+            split="val",
+            dataset_type=dataset_type,
+        )
+        self._log(f"Train: {len(train_ds)} frames  |  Val: {len(val_ds)} frames")
+        return train_ds, val_ds
+
+    # ------------------------------------------------------------------
+    # Localization-guided helpers
+    # ------------------------------------------------------------------
+
+    def _set_geometry_requires_grad(self, enabled: bool) -> None:
+        for name, flag in (("_xyz", self.train_geometry_xyz), ("_opacity", self.train_geometry_opacity)):
+            param = getattr(self.model, name, None)
+            if flag and isinstance(param, nn.Parameter):
+                param.requires_grad_(enabled)
+
+    def _update_geometry_training_stage(self, epoch: int) -> None:
+        if not (self.train_geometry_xyz or self.train_geometry_opacity):
+            return
+        enabled = self.geometry_unfreeze_epoch >= 0 and epoch >= self.geometry_unfreeze_epoch
+        self._set_geometry_requires_grad(enabled)
+
+    def _geometry_regularization(self) -> torch.Tensor:
+        if self.geometry_reg_weight <= 0 or not hasattr(self, "_initial_geometry"):
+            return torch.tensor(0.0, device=self.device)
+        loss = torch.tensor(0.0, device=self.device)
+        if "xyz" in self._initial_geometry and isinstance(getattr(self.model, "_xyz", None), nn.Parameter):
+            loss = loss + F.mse_loss(self.model.get_xyz(), self._initial_geometry["xyz"].to(self.device))
+        if "opacity" in self._initial_geometry and isinstance(getattr(self.model, "_opacity", None), nn.Parameter):
+            loss = loss + F.mse_loss(
+                self.model.get_opacity_logits(),
+                self._initial_geometry["opacity"].to(self.device),
+            )
+        return loss
+
+    def _perturb_pose_batch(self, pose_w2c: torch.Tensor) -> torch.Tensor:
+        trans_m = float(getattr(self.cfg, "localization_perturb_trans_m", 0.10))
+        rot_deg = float(getattr(self.cfg, "localization_perturb_rot_deg", 5.0))
+        if trans_m <= 0 and rot_deg <= 0:
+            return pose_w2c.detach().clone()
+
+        B = pose_w2c.shape[0]
+        dtype = pose_w2c.dtype
+        device = pose_w2c.device
+        R_w2c = pose_w2c[:, :3, :3]
+        t_w2c = pose_w2c[:, :3, 3]
+        R_c2w = R_w2c.transpose(1, 2)
+        t_c2w = -(R_c2w @ t_w2c.unsqueeze(-1)).squeeze(-1)
+
+        dt = (torch.rand(B, 3, device=device, dtype=dtype) * 2.0 - 1.0) * trans_m
+        axis = F.normalize(torch.randn(B, 3, device=device, dtype=dtype), p=2, dim=-1)
+        theta = (torch.rand(B, device=device, dtype=dtype) * 2.0 - 1.0) * np.deg2rad(rot_deg)
+        zeros = torch.zeros(B, device=device, dtype=dtype)
+        kx, ky, kz = axis[:, 0], axis[:, 1], axis[:, 2]
+        Kmat = torch.stack(
+            [
+                zeros, -kz, ky,
+                kz, zeros, -kx,
+                -ky, kx, zeros,
+            ],
+            dim=-1,
+        ).view(B, 3, 3)
+        eye = torch.eye(3, device=device, dtype=dtype).expand(B, -1, -1)
+        sin_t = torch.sin(theta).view(B, 1, 1)
+        cos_t = torch.cos(theta).view(B, 1, 1)
+        dR = eye + sin_t * Kmat + (1.0 - cos_t) * (Kmat @ Kmat)
+
+        R_c2w_noisy = dR @ R_c2w
+        t_c2w_noisy = t_c2w + dt
+        R_w2c_noisy = R_c2w_noisy.transpose(1, 2)
+        t_w2c_noisy = -(R_w2c_noisy @ t_c2w_noisy.unsqueeze(-1)).squeeze(-1)
+
+        perturbed = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
+        perturbed[:, :3, :3] = R_w2c_noisy
+        perturbed[:, :3, 3] = t_w2c_noisy
+        return perturbed
+
+    def _render_locability_map(self, pose_w2c: torch.Tensor) -> Optional[torch.Tensor]:
+        if not hasattr(self.model, "get_locability_logits"):
+            return None
+        logits = self.model.get_locability_logits()
+        if logits.numel() == 0:
+            return None
+        loc_result = self.renderer.render_feature_values_batch(
+            self.model,
+            logits,
+            pose_w2c,
+        )
+        return torch.sigmoid(loc_result["feature_map"].float())
+
+    def _apply_locability_to_sp_features(
+        self,
+        fused_features: torch.Tensor,
+        locability_map: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.sp_locability_adapter is None or locability_map is None:
+            return fused_features
+        if locability_map.shape[-2:] != fused_features.shape[-2:]:
+            locability_map = F.interpolate(
+                locability_map,
+                size=fused_features.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        return fused_features + self.sp_locability_adapter(locability_map.float())
+
+    def render_superpoint_outputs_for_pose(
+        self,
+        pose_w2c: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        result = self.renderer.render_features_batch(self.model, pose_w2c)
+        rendered_compact = self.sharpener(result["feature_map"])
+        if self._is_hybrid:
+            from loc_gs.models.hybrid_gaussian import unproject_depth_to_positions
+            depth_map = result["depth_map"].float()
+            position_map = unproject_depth_to_positions(
+                depth_map, pose_w2c.float(), self.renderer.K.float(),
+                depth_map.shape[1], depth_map.shape[2],
+            )
+            position_map = self._normalize_positions(position_map)
+            rendered_compact = self.model.decode_screen_space(
+                rendered_compact.float(),
+                position_map,
+            )
+        locability_map = self._render_locability_map(pose_w2c)
+        rendered_compact = self._apply_locability_to_sp_features(rendered_compact, locability_map)
+        sp_out = self.sp_output_head(rendered_compact)
+        return {
+            "descriptor": sp_out["descriptor"],
+            "detector": sp_out["detector"],
+            "depth": result["depth_map"],
+            "alpha": result["alpha_map"],
+            "locability": locability_map if locability_map is not None else torch.empty(0, device=self.device),
+            "features": rendered_compact,
+        }
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
+        self._update_geometry_training_stage(epoch)
+        self.model.train()
+        if self.train_mode != "latent":
+            self.codec.train()
+        self.sharpener.train()
+        if self.use_refiner and self.refiner is not None:
+            self.refiner.train()
+        if self.depth_head is not None:
+            self.depth_head.train()
+        if self.seg_head is not None:
+            self.seg_head.train()
+        if self.sp_output_head is not None:
+            self.sp_output_head.train()
+        if self.sp_locability_adapter is not None:
+            self.sp_locability_adapter.train()
+
+        loss_accum = {
+            "total": 0.0,
+            "distill": 0.0,
+            "compact": 0.0,
+            "tv": 0.0,
+            "gradient": 0.0,
+            "depth_feat": 0.0,
+            "geom_edge": 0.0,
+            "boundary": 0.0,
+            "sem_aux": 0.0,
+            "sem_adaptor_reg": 0.0,
+            "rgb": 0.0,
+            "depth_gt": 0.0,
+            "depth_geom": 0.0,
+            "frozen_depth": 0.0,
+            "seg_aux": 0.0,
+            "frozen_seg": 0.0,
+            "siglip_align": 0.0,
+            "summary_align": 0.0,
+            "ground_query": 0.0,
+            "ground_query_acc": 0.0,
+            "ground_query_valid": 0.0,
+            "descriptor_loss": 0.0,
+            "detector_loss": 0.0,
+            "descriptor_cosine": 0.0,
+            "localization": 0.0,
+            "loc_match": 0.0,
+            "loc_reproj": 0.0,
+            "loc_observability": 0.0,
+            "loc_entropy": 0.0,
+            "locability_sparse": 0.0,
+            "geometry_reg": 0.0,
+        }
+        cos_accum = 0.0
+        n_batches = 0
+        log_every = getattr(self.cfg, "log_every", 100)
+
+        pbar = tqdm(
+            self.train_loader,
+            desc=f"Train E{epoch:03d}",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        max_train_batches = int(getattr(self.cfg, "max_train_batches_per_epoch", 0))
+        for batch_idx, batch in enumerate(pbar):
+            if max_train_batches > 0 and batch_idx >= max_train_batches:
+                break
+            gt_features = batch["teacher_features"].to(self.device)   # [B, C, Hp, Wp]
+            pose_w2c = batch["pose_w2c"].to(self.device)         # [B, 4, 4]
+            if self._is_hybrid:
+                gt_features = gt_features.float()
+                pose_w2c = pose_w2c.float()
+
+            self.optimizer.zero_grad(set_to_none=True)
+
+            with autocast(enabled=not self._is_hybrid):
+                # Render compact features (and optionally RGB) from 3DGS
+                rendered_rgb = None
+                l_rgb = torch.tensor(0.0, device=self.device)
+                hybrid_aux = None
+
+                if self.self_guided and self.train_sh:
+                    # Joint rendering with SH training: features + RGB, backprop RGB loss
+                    result = self.renderer.render_features_and_rgb(
+                        self.model, pose_w2c
+                    )
+                    rendered_compact = result["feature_map"]
+                    rendered_rgb = result["rgb"]
+
+                    gt_rgb = batch.get("rgb_guide")
+                    if gt_rgb is not None:
+                        gt_rgb = gt_rgb.to(self.device)
+                        l_rgb = F.l1_loss(rendered_rgb.float(), gt_rgb.float())
+                elif self.self_guided:
+                    # Self-guided with frozen SH: render RGB as guide (no gradient)
+                    result = self.renderer.render_features_and_rgb(
+                        self.model, pose_w2c
+                    )
+                    rendered_compact = result["feature_map"]
+                    rendered_rgb = result["rgb"].detach()
+                else:
+                    result = self.renderer.render_features_batch(
+                        self.model, pose_w2c
+                    )
+                    rendered_compact = result["feature_map"]
+
+                # Sharpen rendered features
+                rendered_compact = self.sharpener(rendered_compact)
+
+                # Apply screen-space refiner if enabled
+                if self.use_refiner and self.refiner is not None:
+                    guide = self._build_guide(batch, result, rendered_rgb)
+                    rendered_compact = self.refiner(rendered_compact, guide=guide)
+
+                # Hybrid architecture: decode via hash grid + fusion
+                if self._is_hybrid:
+                    from loc_gs.models.hybrid_gaussian import unproject_depth_to_positions
+                    depth_map = result["depth_map"].float()
+                    position_map = unproject_depth_to_positions(
+                        depth_map, pose_w2c.float(), self.renderer.K.float(),
+                        depth_map.shape[1], depth_map.shape[2],
+                    )
+                    position_map = self._normalize_positions(position_map)
+                    decode_result = self.model.decode_screen_space(
+                        rendered_compact.float(),
+                        position_map,
+                        return_aux=self.hybrid_decoupled_heads,
+                        depth_map=depth_map,
+                    )
+                    if self.hybrid_decoupled_heads:
+                        hybrid_aux = decode_result
+                        rendered_compact = decode_result["fused"]
+                    else:
+                        rendered_compact = decode_result
+
+                # ---- SuperPoint branch: skip codec, use SP output head ----
+                if self._is_superpoint and self.sp_output_head is not None:
+                    locability_map = self._render_locability_map(pose_w2c.float())
+                    rendered_compact = self._apply_locability_to_sp_features(
+                        rendered_compact,
+                        locability_map,
+                    )
+                    sp_out = self.sp_output_head(rendered_compact)
+                    pred_desc = sp_out["descriptor"]   # [B, 256, H, W]
+                    pred_det = sp_out["detector"]      # [B, 65, H, W]
+
+                    # GT descriptor (already in gt_features / teacher_features)
+                    gt_desc = gt_features
+                    if gt_desc.shape[-2:] != pred_desc.shape[-2:]:
+                        gt_desc = F.interpolate(
+                            gt_desc, size=pred_desc.shape[-2:],
+                            mode="bilinear", align_corners=False,
+                        )
+                    gt_desc = F.normalize(gt_desc.float(), p=2, dim=1)
+
+                    # Descriptor loss: L2 + cosine (with optional focal weighting)
+                    l2_w = getattr(self.cfg, "l2_weight", 1.0)
+                    cos_w = getattr(self.cfg, "cosine_weight", 0.5)
+                    focal_gamma = getattr(self.cfg, "focal_cosine_gamma", 0.0)
+
+                    l_desc_l2 = F.mse_loss(pred_desc.float(), gt_desc.float())
+
+                    # Per-pixel cosine similarity [B, H*W]
+                    cos_per_pixel = F.cosine_similarity(
+                        pred_desc.float().flatten(2),
+                        gt_desc.float().flatten(2),
+                        dim=1,
+                    )
+                    if focal_gamma > 0:
+                        # Focal weighting: hard pixels get higher weight
+                        difficulty = (1.0 - cos_per_pixel).detach()
+                        focal_weight = difficulty ** focal_gamma
+                        focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
+                        l_desc_cos = (focal_weight * (1.0 - cos_per_pixel)).mean()
+                    else:
+                        l_desc_cos = (1.0 - cos_per_pixel).mean()
+
+                    l_descriptor = l2_w * l_desc_l2 + cos_w * l_desc_cos
+
+                    # Detector loss: KL divergence
+                    l_detector = torch.tensor(0.0, device=self.device)
+                    gt_det = batch.get("detector_features")
+                    if gt_det is not None:
+                        gt_det = gt_det.to(self.device).float()
+                        if gt_det.shape[-2:] != pred_det.shape[-2:]:
+                            gt_det = F.interpolate(
+                                gt_det, size=pred_det.shape[-2:],
+                                mode="bilinear", align_corners=False,
+                            )
+                        # KL(target || pred): target * (log(target) - log_pred)
+                        target_dist = F.softmax(gt_det, dim=1)
+                        log_pred = F.log_softmax(pred_det, dim=1)
+                        l_detector = F.kl_div(
+                            log_pred, target_dist, reduction="batchmean",
+                        )
+
+                    l_localization = torch.tensor(0.0, device=self.device)
+                    loc_parts = {
+                        "match": torch.tensor(0.0, device=self.device),
+                        "reprojection": torch.tensor(0.0, device=self.device),
+                        "observability": torch.tensor(0.0, device=self.device),
+                        "entropy": torch.tensor(0.0, device=self.device),
+                    }
+                    l_locability_sparse = torch.tensor(0.0, device=self.device)
+                    if (
+                        self.localization_loss_fn is not None
+                        and gt_det is not None
+                        and self.localization_loss_weight > 0
+                    ):
+                        query_descs, query_keypoints, query_mask = prepare_superpoint_queries(
+                            gt_desc.detach(),
+                            gt_det.detach(),
+                            max_keypoints=getattr(self.cfg, "localization_keypoints", 256),
+                            confidence_threshold=getattr(
+                                self.cfg, "localization_keypoint_threshold", 0.015
+                            ),
+                            nms_radius=getattr(self.cfg, "localization_nms_radius", 2),
+                        )
+                        loc_pose = self._perturb_pose_batch(pose_w2c.float()).detach()
+                        loc_render = self.render_superpoint_outputs_for_pose(loc_pose)
+                        locability_for_loss = loc_render["locability"]
+                        if locability_for_loss.numel() == 0:
+                            locability_for_loss = None
+                        loc_out = self.localization_loss_fn(
+                            query_descs=query_descs,
+                            query_keypoints_yx=query_keypoints,
+                            query_mask=query_mask,
+                            rendered_desc=loc_render["descriptor"],
+                            depth_map=loc_render["depth"].float(),
+                            render_pose_w2c=loc_pose,
+                            gt_pose_w2c=pose_w2c.float(),
+                            K=self.renderer.K.float(),
+                            locability_map=locability_for_loss,
+                        )
+                        loc_parts = loc_out
+                        l_localization = (
+                            getattr(self.cfg, "localization_match_weight", 1.0) * loc_out["match"]
+                            + getattr(self.cfg, "localization_reproj_weight", 0.5) * loc_out["reprojection"]
+                            + getattr(self.cfg, "localization_observability_weight", 0.02) * loc_out["observability"]
+                            + getattr(self.cfg, "localization_entropy_weight", 0.0) * loc_out["entropy"]
+                        )
+
+                    if locability_map is not None and self.locability_sparsity_weight > 0:
+                        l_locability_sparse = locability_map.float().mean()
+
+                    l_geometry_reg = self._geometry_regularization()
+
+                    # TV loss on compact features
+                    l_tv = self.tv_loss_fn(rendered_compact)
+                    tv_w = getattr(self.cfg, "tv_weight", 0.01)
+
+                    recon_weight = (
+                        self.sp_recon_aux_weight
+                        if self.localization_loss_fn is not None and self.localization_loss_weight > 0
+                        else 1.0
+                    )
+                    loss = (
+                        recon_weight * l_descriptor
+                        + recon_weight * self.detector_loss_weight * l_detector
+                        + self.localization_loss_weight * l_localization
+                        + self.locability_sparsity_weight * l_locability_sparse
+                        + self.geometry_reg_weight * l_geometry_reg
+                        + tv_w * l_tv
+                    )
+
+                    # Skip the legacy dense-feature branch below
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    grad_clip = getattr(self.cfg, "grad_clip", 10.0)
+                    nn.utils.clip_grad_norm_(
+                        self._all_trainable_params(), max_norm=grad_clip
+                    )
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+
+                    with torch.no_grad():
+                        cos_sim = F.cosine_similarity(
+                            pred_desc.detach().float().flatten(2),
+                            gt_desc.detach().float().flatten(2),
+                            dim=1,
+                        ).mean()
+
+                    loss_accum["total"] += loss.item()
+                    loss_accum["distill"] += l_descriptor.item()
+                    loss_accum["descriptor_loss"] += l_descriptor.item()
+                    loss_accum["detector_loss"] += l_detector.item()
+                    loss_accum["descriptor_cosine"] += (1.0 - l_desc_cos.item())
+                    loss_accum["localization"] += l_localization.item()
+                    loss_accum["loc_match"] += loc_parts["match"].item()
+                    loss_accum["loc_reproj"] += loc_parts["reprojection"].item()
+                    loss_accum["loc_observability"] += loc_parts["observability"].item()
+                    loss_accum["loc_entropy"] += loc_parts["entropy"].item()
+                    loss_accum["locability_sparse"] += l_locability_sparse.item()
+                    loss_accum["geometry_reg"] += l_geometry_reg.item()
+                    loss_accum["tv"] += l_tv.item()
+                    cos_accum += cos_sim.item()
+                    n_batches += 1
+                    self.global_step += 1
+
+                    pbar.set_postfix(
+                        loss=f"{loss.item():.4f}", cos=f"{cos_sim.item():.4f}"
+                    )
+                    if self.global_step % log_every == 0 and self.writer is not None:
+                        self.writer.add_scalar("train/loss", loss.item(), self.global_step)
+                        self.writer.add_scalar("train/descriptor_loss", l_descriptor.item(), self.global_step)
+                        self.writer.add_scalar("train/detector_loss", l_detector.item(), self.global_step)
+                        self.writer.add_scalar("train/localization_loss", l_localization.item(), self.global_step)
+                        self.writer.add_scalar("train/loc_match", loc_parts["match"].item(), self.global_step)
+                        self.writer.add_scalar("train/loc_reproj", loc_parts["reprojection"].item(), self.global_step)
+                        self.writer.add_scalar("train/locability_sparse", l_locability_sparse.item(), self.global_step)
+                        self.writer.add_scalar("train/geometry_reg", l_geometry_reg.item(), self.global_step)
+                        self.writer.add_scalar("train/descriptor_cosine", 1.0 - l_desc_cos.item(), self.global_step)
+                        self.writer.add_scalar("train/tv", l_tv.item(), self.global_step)
+                        lr = self.optimizer.param_groups[0]["lr"]
+                        self.writer.add_scalar("train/lr", lr, self.global_step)
+                    continue  # skip legacy feature path for this batch
+
+                if self.train_mode == "latent":
+                    # LATENT MODE: gt_features are already 64d (pre-encoded)
+                    gt_compact = gt_features
+                    if gt_compact.shape[-2:] != rendered_compact.shape[-2:]:
+                        gt_compact = F.interpolate(
+                            gt_compact,
+                            size=rendered_compact.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+
+                    # Primary loss: cosine + L2 in latent space
+                    l_cos = 1.0 - F.cosine_similarity(
+                        rendered_compact.float().flatten(2),
+                        gt_compact.float().flatten(2),
+                        dim=1,
+                    ).mean()
+                    l_l2 = F.mse_loss(rendered_compact.float(), gt_compact.float())
+                    l2_w = getattr(self.cfg, "l2_weight", 1.0)
+                    cos_w = getattr(self.cfg, "cosine_weight", 0.5)
+                    l_distill = l2_w * l_l2 + cos_w * l_cos
+
+                    l_compact = torch.tensor(0.0, device=self.device)
+                    decoded_for_depth = self.codec.decoder(rendered_compact)
+
+                    # Feature norm regularization
+                    l_feat_norm = torch.tensor(0.0, device=self.device)
+                    if self.feat_norm_weight > 0:
+                        feat_norms = rendered_compact.float().norm(dim=1).mean()
+                        gt_norms = gt_compact.float().norm(dim=1).mean()
+                        l_feat_norm = (feat_norms - gt_norms).abs()
+
+                else:
+                    # DECODED MODE (legacy V1/V2): compare in 1280d space
+                    gt_radio = gt_features
+                    with torch.no_grad():
+                        gt_compact = self.codec.encoder(gt_radio)
+
+                    decoded = self.codec.decoder(rendered_compact)
+
+                    if decoded.shape[-2:] != gt_radio.shape[-2:]:
+                        gt_radio_rs = F.interpolate(
+                            gt_radio,
+                            size=decoded.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    else:
+                        gt_radio_rs = gt_radio
+
+                    distill_dict = self.distill_loss_fn(decoded, gt_radio_rs)
+                    l_distill = distill_dict["total"]
+
+                    if gt_compact.shape[-2:] != rendered_compact.shape[-2:]:
+                        gt_compact_rs = F.interpolate(
+                            gt_compact,
+                            size=rendered_compact.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    else:
+                        gt_compact_rs = gt_compact
+                    l_compact = F.mse_loss(rendered_compact, gt_compact_rs)
+                    l_feat_norm = torch.tensor(0.0, device=self.device)
+                    decoded_for_depth = decoded
+
+                depth_losses = self._compute_depth_aux_losses(
+                    batch=batch,
+                    render_result=result,
+                    decoded=decoded_for_depth,
+                )
+                frozen_depth_losses = self._compute_frozen_depth_loss(
+                    render_result=result,
+                    decoded=decoded_for_depth,
+                    teacher_features=gt_radio_rs if self.train_mode != "latent" else None,
+                )
+                seg_losses = self._compute_seg_aux_losses(
+                    batch=batch,
+                    decoded=decoded_for_depth if self.train_mode != "latent" else None,
+                )
+                frozen_seg_losses = self._compute_frozen_seg_loss(
+                    decoded=decoded_for_depth if self.train_mode != "latent" else None,
+                    teacher_features=gt_radio_rs if self.train_mode != "latent" else None,
+                )
+                l_siglip = self._compute_siglip_alignment_loss(
+                    decoded=decoded_for_depth if self.train_mode != "latent" else None,
+                    target=gt_radio_rs if self.train_mode != "latent" else None,
+                )
+                l_summary = self._compute_summary_alignment_loss(
+                    decoded=decoded_for_depth if self.train_mode != "latent" else None,
+                    target=gt_radio_rs if self.train_mode != "latent" else None,
+                )
+
+                l_tv = self.tv_loss_fn(rendered_compact)
+
+                # Gradient-weighted loss for sharper boundaries
+                l_gradient = torch.tensor(0.0, device=self.device)
+                if self.gradient_loss_fn is not None and decoded_for_depth is not None:
+                    gt_for_grad = gt_radio_rs if self.train_mode != "latent" else gt_compact
+                    pred_for_grad = decoded_for_depth if self.train_mode != "latent" else rendered_compact
+                    l_gradient = self.gradient_loss_fn(pred_for_grad, gt_for_grad)
+
+                # Depth-guided feature smoothness loss
+                l_depth_feat = torch.tensor(0.0, device=self.device)
+                geom_depth = result.get("depth_map")
+                alpha_for_edges = result.get("alpha_map")
+                if self.depth_guided_feat_loss is not None and geom_depth is not None:
+                    feat_for_smooth = (
+                        hybrid_aux["geometry"]
+                        if hybrid_aux is not None and "geometry" in hybrid_aux
+                        else rendered_compact
+                    )
+                    gd = geom_depth.unsqueeze(0).unsqueeze(0) if geom_depth.dim() == 2 else geom_depth
+                    if gd.dim() == 3:
+                        gd = gd.unsqueeze(1)
+                    if gd.shape[-2:] != feat_for_smooth.shape[-2:]:
+                        gd = F.interpolate(gd, size=feat_for_smooth.shape[-2:], mode='bilinear', align_corners=False)
+                    l_depth_feat = self.depth_guided_feat_loss(feat_for_smooth, gd)
+
+                # Boundary-aware feature loss
+                l_boundary = torch.tensor(0.0, device=self.device)
+                if self.boundary_aware_loss_fn is not None and geom_depth is not None:
+                    pred_feat = decoded_for_depth if self.train_mode != "latent" else rendered_compact
+                    gt_feat = gt_radio_rs if self.train_mode != "latent" else gt_compact
+                    gd_ba = geom_depth.unsqueeze(0).unsqueeze(0) if geom_depth.dim() == 2 else geom_depth
+                    if gd_ba.dim() == 3:
+                        gd_ba = gd_ba.unsqueeze(1)
+                    alpha_ba = None
+                    if alpha_for_edges is not None:
+                        alpha_ba = alpha_for_edges.unsqueeze(0).unsqueeze(0) if alpha_for_edges.dim() == 2 else alpha_for_edges
+                        if alpha_ba.dim() == 3:
+                            alpha_ba = alpha_ba.unsqueeze(1)
+                    if gd_ba.shape[-2:] != pred_feat.shape[-2:]:
+                        gd_ba = F.interpolate(gd_ba, size=pred_feat.shape[-2:], mode='bilinear', align_corners=False)
+                    if alpha_ba is not None and alpha_ba.shape[-2:] != pred_feat.shape[-2:]:
+                        alpha_ba = F.interpolate(alpha_ba.float(), size=pred_feat.shape[-2:], mode='bilinear', align_corners=False)
+                    l_boundary = self.boundary_aware_loss_fn(pred_feat, gt_feat, gd_ba, alpha_ba)
+
+                l_geom_edge = torch.tensor(0.0, device=self.device)
+                l_semantic_aux = torch.tensor(0.0, device=self.device)
+                l_semantic_adaptor_reg = torch.tensor(0.0, device=self.device)
+                l_ground_query = torch.tensor(0.0, device=self.device)
+                ground_query_acc = torch.tensor(0.0, device=self.device)
+                ground_query_valid = torch.tensor(0.0, device=self.device)
+                sem_decoded = None
+                if hybrid_aux is not None and self.train_mode != "latent":
+                    sem_decoded = self.codec.decoder(hybrid_aux["semantic"])
+                    if sem_decoded.shape[-2:] != gt_radio_rs.shape[-2:]:
+                        sem_target = F.interpolate(
+                            gt_radio_rs,
+                            size=sem_decoded.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    else:
+                        sem_target = gt_radio_rs
+                    if self.hybrid_semantic_aux_weight > 0:
+                        l_semantic_aux = self.distill_loss_fn(
+                            sem_decoded, sem_target
+                        )["total"]
+                    if self.grounding_query_loss_weight > 0:
+                        ground_query_stats = self._compute_grounding_query_loss(
+                            batch=batch,
+                            decoded=sem_decoded,
+                        )
+                        l_ground_query = ground_query_stats["loss"]
+                        ground_query_acc = ground_query_stats["accuracy"]
+                        ground_query_valid = ground_query_stats["valid_ratio"]
+                if hybrid_aux is not None and geom_depth is not None:
+                    if self.geometric_edge_loss_fn is not None:
+                        gd = geom_depth.unsqueeze(0).unsqueeze(0) if geom_depth.dim() == 2 else geom_depth
+                        if gd.dim() == 3:
+                            gd = gd.unsqueeze(1)
+                        alpha_map = None
+                        if alpha_for_edges is not None:
+                            alpha_map = (
+                                alpha_for_edges.unsqueeze(0).unsqueeze(0)
+                                if alpha_for_edges.dim() == 2 else alpha_for_edges
+                            )
+                            if alpha_map.dim() == 3:
+                                alpha_map = alpha_map.unsqueeze(1)
+                        if gd.shape[-2:] != hybrid_aux["geometry"].shape[-2:]:
+                            gd = F.interpolate(
+                                gd, size=hybrid_aux["geometry"].shape[-2:],
+                                mode="bilinear", align_corners=False,
+                            )
+                        if alpha_map is not None and alpha_map.shape[-2:] != hybrid_aux["geometry"].shape[-2:]:
+                            alpha_map = F.interpolate(
+                                alpha_map.float(), size=hybrid_aux["geometry"].shape[-2:],
+                                mode="bilinear", align_corners=False,
+                            )
+                        l_geom_edge = self.geometric_edge_loss_fn(
+                            hybrid_aux["geometry"], gd, alpha_map,
+                        )
+                if (
+                    hybrid_aux is not None
+                    and "semantic_confidence" in hybrid_aux
+                    and self.hybrid_semantic_adaptor_reg_weight > 0
+                ):
+                    l_semantic_adaptor_reg = (
+                        hybrid_aux["semantic_confidence"].float() - 1.0
+                    ).pow(2).mean()
+
+                adaptor_w = getattr(self.cfg, "adaptor_weight", 0.1)
+                tv_w = getattr(self.cfg, "tv_weight", 0.01)
+                loss = l_distill + adaptor_w * l_compact + tv_w * l_tv
+                if self.gradient_loss_weight > 0:
+                    loss = loss + self.gradient_loss_weight * l_gradient
+                if self.depth_guided_feat_weight > 0:
+                    loss = loss + self.depth_guided_feat_weight * l_depth_feat
+                if self.geometric_edge_loss_weight > 0:
+                    loss = loss + self.geometric_edge_loss_weight * l_geom_edge
+                if self.boundary_aware_loss_weight > 0:
+                    loss = loss + self.boundary_aware_loss_weight * l_boundary
+                if self.hybrid_semantic_aux_weight > 0:
+                    loss = loss + self.hybrid_semantic_aux_weight * l_semantic_aux
+                if self.hybrid_semantic_adaptor_reg_weight > 0:
+                    loss = loss + self.hybrid_semantic_adaptor_reg_weight * l_semantic_adaptor_reg
+                if self.grounding_query_loss_weight > 0:
+                    loss = loss + self.grounding_query_loss_weight * l_ground_query
+                if self.feat_norm_weight > 0:
+                    loss = loss + self.feat_norm_weight * l_feat_norm
+                if self.rgb_loss_weight > 0:
+                    loss = loss + self.rgb_loss_weight * l_rgb
+                loss = (
+                    loss
+                    + depth_losses["total"]
+                    + frozen_depth_losses["total"]
+                    + seg_losses["total"]
+                    + frozen_seg_losses["total"]
+                    + l_siglip
+                    + l_summary
+                )
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            grad_clip = getattr(self.cfg, "grad_clip", 10.0)
+            nn.utils.clip_grad_norm_(
+                self._all_trainable_params(), max_norm=grad_clip
+            )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            # Compute monitoring cosine in appropriate space
+            with torch.no_grad():
+                if self.train_mode == "latent":
+                    cos_sim = F.cosine_similarity(
+                        rendered_compact.detach().float().flatten(2),
+                        gt_compact.detach().float().flatten(2),
+                        dim=1,
+                    ).mean()
+                else:
+                    cos_sim = F.cosine_similarity(
+                        decoded.detach().float().flatten(2),
+                        gt_radio_rs.detach().float().flatten(2),
+                        dim=1,
+                    ).mean()
+
+            loss_accum["total"] += loss.item()
+            loss_accum["distill"] += l_distill.item()
+            loss_accum["compact"] += l_compact.item()
+            loss_accum["tv"] += l_tv.item()
+            loss_accum["gradient"] += l_gradient.item()
+            loss_accum["depth_feat"] += l_depth_feat.item()
+            loss_accum["geom_edge"] += l_geom_edge.item()
+            loss_accum["boundary"] += l_boundary.item()
+            loss_accum["sem_aux"] += l_semantic_aux.item()
+            loss_accum["sem_adaptor_reg"] += l_semantic_adaptor_reg.item()
+            loss_accum["rgb"] += l_rgb.item()
+            loss_accum["depth_gt"] += depth_losses["depth_gt"].item()
+            loss_accum["depth_geom"] += depth_losses["depth_geom"].item()
+            loss_accum["frozen_depth"] += frozen_depth_losses["total"].item()
+            loss_accum["seg_aux"] += seg_losses["total"].item()
+            loss_accum["frozen_seg"] += frozen_seg_losses["total"].item()
+            loss_accum["siglip_align"] += l_siglip.item()
+            loss_accum["summary_align"] += l_summary.item()
+            loss_accum["ground_query"] += l_ground_query.item()
+            loss_accum["ground_query_acc"] += ground_query_acc.item()
+            loss_accum["ground_query_valid"] += ground_query_valid.item()
+            cos_accum += cos_sim.item()
+            n_batches += 1
+            self.global_step += 1
+
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}", cos=f"{cos_sim.item():.4f}"
+            )
+
+            # Periodic logging
+            if self.global_step % log_every == 0 and self.writer is not None:
+                self.writer.add_scalar(
+                    "train/loss", loss.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/distill", l_distill.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/compact", l_compact.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/tv", l_tv.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/gradient", l_gradient.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/geom_edge", l_geom_edge.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/boundary", l_boundary.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/sem_aux", l_semantic_aux.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/sem_adaptor_reg",
+                    l_semantic_adaptor_reg.item(),
+                    self.global_step,
+                )
+                self.writer.add_scalar(
+                    "train/cosine", cos_sim.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/depth_gt", depth_losses["depth_gt"].item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/depth_geom", depth_losses["depth_geom"].item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/frozen_depth", frozen_depth_losses["total"].item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/seg_aux", seg_losses["total"].item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/frozen_seg", frozen_seg_losses["total"].item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/siglip_align", l_siglip.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/summary_align", l_summary.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/ground_query", l_ground_query.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/ground_query_acc", ground_query_acc.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/ground_query_valid",
+                    ground_query_valid.item(),
+                    self.global_step,
+                )
+                if hybrid_aux is not None and "semantic_confidence" in hybrid_aux:
+                    conf = hybrid_aux["semantic_confidence"].float()
+                    self.writer.add_scalar(
+                        "train/sem_conf_mean", conf.mean().item(), self.global_step
+                    )
+                    self.writer.add_scalar(
+                        "train/sem_conf_std", conf.std().item(), self.global_step
+                    )
+                lr = self.optimizer.param_groups[0]["lr"]
+                self.writer.add_scalar("train/lr", lr, self.global_step)
+
+        # Epoch averages
+        if n_batches == 0:
+            return {}
+        metrics = {k: v / n_batches for k, v in loss_accum.items()}
+        metrics["cosine"] = cos_accum / n_batches
+        lr = self.optimizer.param_groups[0]["lr"]
+        if self._is_superpoint:
+            self._log(
+                f"[Train E{epoch:03d}] loss={metrics['total']:.4f} "
+                f"desc={metrics['descriptor_loss']:.4f} det={metrics['detector_loss']:.4f} "
+                f"loc={metrics['localization']:.4f} reproj={metrics['loc_reproj']:.4f} "
+                f"tv={metrics['tv']:.4f} cosine={metrics['cosine']:.4f} lr={lr:.2e}"
+            )
+        else:
+            self._log(
+                f"[Train E{epoch:03d}] loss={metrics['total']:.4f} "
+                f"cosine={metrics['cosine']:.4f} lr={lr:.2e}"
+            )
+        return metrics
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def validate(self, epoch: int) -> Dict[str, float]:
+        self.model.eval()
+        self.codec.eval()
+        self.sharpener.eval()
+        if self.use_refiner and self.refiner is not None:
+            self.refiner.eval()
+        if self.depth_head is not None:
+            self.depth_head.eval()
+        if self.seg_head is not None:
+            self.seg_head.eval()
+        if self.sp_output_head is not None:
+            self.sp_output_head.eval()
+        if self.sp_locability_adapter is not None:
+            self.sp_locability_adapter.eval()
+
+        cos_latent_accum = 0.0
+        cos_decoded_accum = 0.0
+        mse_accum = 0.0
+        depth_gt_accum = 0.0
+        depth_geom_accum = 0.0
+        frozen_depth_accum = 0.0
+        seg_aux_accum = 0.0
+        seg_aux_miou_accum = 0.0
+        frozen_seg_accum = 0.0
+        siglip_align_accum = 0.0
+        summary_align_accum = 0.0
+        ground_query_accum = 0.0
+        ground_query_acc_metric = 0.0
+        ground_query_valid_accum = 0.0
+        localization_accum = 0.0
+        loc_match_accum = 0.0
+        loc_reproj_accum = 0.0
+        loc_valid_queries_accum = 0.0
+        loc_n = 0
+        n = 0
+
+        max_val_batches = int(getattr(self.cfg, "max_val_batches_per_epoch", 0))
+        for batch_idx, batch in enumerate(
+            tqdm(
+                self.val_loader,
+                desc=f"Val   E{epoch:03d}",
+                leave=False,
+                dynamic_ncols=True,
+            )
+        ):
+            if max_val_batches > 0 and batch_idx >= max_val_batches:
+                break
+            gt_features = batch["teacher_features"].to(self.device)
+            pose_w2c = batch["pose_w2c"].to(self.device)
+
+            rendered_rgb = None
+            if self.self_guided:
+                val_result = self.renderer.render_features_and_rgb(self.model, pose_w2c)
+                rendered_rgb = val_result["rgb"]
+            else:
+                val_result = self.renderer.render_features_batch(self.model, pose_w2c)
+            rendered_compact = val_result["feature_map"]
+            rendered_compact = self.sharpener(rendered_compact)
+            if self.use_refiner and self.refiner is not None:
+                guide = self._build_guide(batch, val_result, rendered_rgb=rendered_rgb)
+                rendered_compact = self.refiner(rendered_compact, guide=guide)
+
+            # Hybrid decode: latent + hash grid → fused output
+            hybrid_aux = None
+            if self._is_hybrid:
+                from loc_gs.models.hybrid_gaussian import unproject_depth_to_positions
+                depth_map = val_result["depth_map"].float()
+                position_map = unproject_depth_to_positions(
+                    depth_map, pose_w2c.float(), self.renderer.K.float(),
+                    depth_map.shape[1], depth_map.shape[2],
+                )
+                position_map = self._normalize_positions(position_map)
+                decode_result = self.model.decode_screen_space(
+                    rendered_compact.float(),
+                    position_map,
+                    return_aux=self.hybrid_decoupled_heads,
+                    depth_map=depth_map,
+                )
+                if self.hybrid_decoupled_heads:
+                    hybrid_aux = decode_result
+                    rendered_compact = decode_result["fused"]
+                else:
+                    rendered_compact = decode_result
+
+            # ---- SuperPoint validation branch ----
+            if self._is_superpoint and self.sp_output_head is not None:
+                locability_map = self._render_locability_map(pose_w2c.float())
+                rendered_compact = self._apply_locability_to_sp_features(
+                    rendered_compact,
+                    locability_map,
+                )
+                sp_out = self.sp_output_head(rendered_compact)
+                pred_desc = sp_out["descriptor"]
+                pred_det = sp_out["detector"]
+
+                gt_desc = gt_features
+                if gt_desc.shape[-2:] != pred_desc.shape[-2:]:
+                    gt_desc = F.interpolate(
+                        gt_desc, size=pred_desc.shape[-2:],
+                        mode="bilinear", align_corners=False,
+                    )
+                gt_desc = F.normalize(gt_desc.float(), p=2, dim=1)
+
+                cos_desc = F.cosine_similarity(
+                    pred_desc.float().flatten(2),
+                    gt_desc.float().flatten(2),
+                    dim=1,
+                ).mean()
+
+                # Detector cross-entropy metric
+                det_ce = torch.tensor(0.0, device=self.device)
+                gt_det = batch.get("detector_features")
+                if gt_det is not None:
+                    gt_det = gt_det.to(self.device).float()
+                    if gt_det.shape[-2:] != pred_det.shape[-2:]:
+                        gt_det = F.interpolate(
+                            gt_det, size=pred_det.shape[-2:],
+                            mode="bilinear", align_corners=False,
+                        )
+                    target_dist = F.softmax(gt_det, dim=1)
+                    log_pred = F.log_softmax(pred_det, dim=1)
+                    det_ce = F.kl_div(log_pred, target_dist, reduction="batchmean")
+
+                if (
+                    self.localization_loss_fn is not None
+                    and gt_det is not None
+                    and self.localization_loss_weight > 0
+                ):
+                    query_descs, query_keypoints, query_mask = prepare_superpoint_queries(
+                        gt_desc.detach(),
+                        gt_det.detach(),
+                        max_keypoints=getattr(self.cfg, "localization_keypoints", 256),
+                        confidence_threshold=getattr(
+                            self.cfg, "localization_keypoint_threshold", 0.015
+                        ),
+                        nms_radius=getattr(self.cfg, "localization_nms_radius", 2),
+                    )
+                    loc_pose = self._perturb_pose_batch(pose_w2c.float())
+                    loc_render = self.render_superpoint_outputs_for_pose(loc_pose)
+                    locability_for_loss = loc_render["locability"]
+                    if locability_for_loss.numel() == 0:
+                        locability_for_loss = None
+                    loc_out = self.localization_loss_fn(
+                        query_descs=query_descs,
+                        query_keypoints_yx=query_keypoints,
+                        query_mask=query_mask,
+                        rendered_desc=loc_render["descriptor"],
+                        depth_map=loc_render["depth"].float(),
+                        render_pose_w2c=loc_pose,
+                        gt_pose_w2c=pose_w2c.float(),
+                        K=self.renderer.K.float(),
+                        locability_map=locability_for_loss,
+                    )
+                    l_val_localization = (
+                        getattr(self.cfg, "localization_match_weight", 1.0) * loc_out["match"]
+                        + getattr(self.cfg, "localization_reproj_weight", 0.5) * loc_out["reprojection"]
+                        + getattr(self.cfg, "localization_observability_weight", 0.02) * loc_out["observability"]
+                        + getattr(self.cfg, "localization_entropy_weight", 0.0) * loc_out["entropy"]
+                    )
+                    localization_accum += l_val_localization.item()
+                    loc_match_accum += loc_out["match"].item()
+                    loc_reproj_accum += loc_out["reprojection"].item()
+                    loc_valid_queries_accum += loc_out["valid_queries"].item()
+                    loc_n += 1
+
+                cos_decoded_accum += cos_desc.item()
+                cos_latent_accum += cos_desc.item()
+                mse_accum += F.mse_loss(pred_desc.float(), gt_desc.float()).item()
+                n += 1
+                continue
+
+            if self.train_mode == "latent":
+                # gt_features are 64d
+                gt_compact = gt_features
+                if gt_compact.shape[-2:] != rendered_compact.shape[-2:]:
+                    gt_compact = F.interpolate(
+                        gt_compact, size=rendered_compact.shape[-2:],
+                        mode="bilinear", align_corners=False,
+                    )
+                cos_latent = F.cosine_similarity(
+                    rendered_compact.float().flatten(2),
+                    gt_compact.float().flatten(2),
+                    dim=1,
+                ).mean()
+                cos_latent_accum += cos_latent.item()
+
+                # Also decode and compare to 1280d GT for monitoring
+                decoded = self.codec.decoder(rendered_compact)
+                # Load 1280d GT for this frame
+                gt_1280_path = self._get_1280d_val_path(batch)
+                if gt_1280_path is not None:
+                    gt_1280 = torch.load(gt_1280_path).float().unsqueeze(0).to(self.device)
+                    if gt_1280.shape[-2:] != decoded.shape[-2:]:
+                        gt_1280 = F.interpolate(
+                            gt_1280, size=decoded.shape[-2:],
+                            mode="bilinear", align_corners=False,
+                        )
+                    cos_dec = F.cosine_similarity(
+                        decoded.float().flatten(2),
+                        gt_1280.float().flatten(2),
+                        dim=1,
+                    ).mean()
+                    mse = F.mse_loss(decoded.float(), gt_1280.float())
+                    cos_decoded_accum += cos_dec.item()
+                    mse_accum += mse.item()
+                else:
+                    cos_decoded_accum += cos_latent.item()
+                    mse_accum += F.mse_loss(rendered_compact.float(), gt_compact.float()).item()
+                decoded_for_depth = decoded
+            else:
+                # Decoded mode: gt_features are 1280d
+                gt_radio = gt_features
+                decoded = self.codec.decoder(rendered_compact)
+                if decoded.shape[-2:] != gt_radio.shape[-2:]:
+                    gt_radio = F.interpolate(
+                        gt_radio, size=decoded.shape[-2:],
+                        mode="bilinear", align_corners=False,
+                    )
+                cos_dec = F.cosine_similarity(
+                    decoded.float().flatten(2),
+                    gt_radio.float().flatten(2),
+                    dim=1,
+                ).mean()
+                mse = F.mse_loss(decoded.float(), gt_radio.float())
+                cos_decoded_accum += cos_dec.item()
+                cos_latent_accum += cos_dec.item()
+                mse_accum += mse.item()
+                decoded_for_depth = decoded
+
+            depth_losses = self._compute_depth_aux_losses(
+                batch=batch,
+                render_result=val_result,
+                decoded=decoded_for_depth,
+            )
+            frozen_depth_losses = self._compute_frozen_depth_loss(
+                render_result=val_result,
+                decoded=decoded_for_depth,
+                teacher_features=gt_radio if self.train_mode != "latent" else None,
+            )
+            seg_losses = self._compute_seg_aux_losses(
+                batch=batch,
+                decoded=decoded_for_depth if self.train_mode != "latent" else None,
+            )
+            frozen_seg_losses = self._compute_frozen_seg_loss(
+                decoded=decoded_for_depth if self.train_mode != "latent" else None,
+                teacher_features=gt_radio if self.train_mode != "latent" else None,
+            )
+            depth_gt_accum += depth_losses["depth_gt"].item()
+            depth_geom_accum += depth_losses["depth_geom"].item()
+            frozen_depth_accum += frozen_depth_losses["total"].item()
+            seg_aux_accum += seg_losses["total"].item()
+            seg_aux_miou_accum += seg_losses["miou"]
+            frozen_seg_accum += frozen_seg_losses["total"].item()
+            siglip_align_accum += self._compute_siglip_alignment_loss(
+                decoded=decoded_for_depth if self.train_mode != "latent" else None,
+                target=gt_radio if self.train_mode != "latent" else None,
+            ).item()
+            summary_align_accum += self._compute_summary_alignment_loss(
+                decoded=decoded_for_depth if self.train_mode != "latent" else None,
+                target=gt_radio if self.train_mode != "latent" else None,
+            ).item()
+            semantic_decoded = None
+            if (
+                hybrid_aux is not None
+                and "semantic" in hybrid_aux
+                and self.train_mode != "latent"
+            ):
+                semantic_decoded = self.codec.decoder(hybrid_aux["semantic"])
+            ground_query_stats = self._compute_grounding_query_loss(
+                batch=batch,
+                decoded=semantic_decoded if semantic_decoded is not None else decoded_for_depth,
+            )
+            ground_query_accum += ground_query_stats["loss"].item()
+            ground_query_acc_metric += ground_query_stats["accuracy"].item()
+            ground_query_valid_accum += ground_query_stats["valid_ratio"].item()
+
+            n += 1
+
+        if n == 0:
+            return {}
+
+        avg_cos_latent = cos_latent_accum / n
+        avg_cos_decoded = cos_decoded_accum / n
+        avg_mse = mse_accum / n
+        psnr = -10.0 * np.log10(avg_mse + 1e-8)
+
+        # Primary metric for best model selection: latent cosine in latent mode
+        primary_cos = avg_cos_latent if self.train_mode == "latent" else avg_cos_decoded
+
+        metrics = {
+            "cosine": primary_cos,
+            "cosine_latent": avg_cos_latent,
+            "cosine_decoded": avg_cos_decoded,
+            "mse": avg_mse,
+            "psnr": psnr,
+            "localization": localization_accum / max(loc_n, 1),
+            "loc_match": loc_match_accum / max(loc_n, 1),
+            "loc_reprojection": loc_reproj_accum / max(loc_n, 1),
+            "loc_valid_queries": loc_valid_queries_accum / max(loc_n, 1),
+            "depth_gt": depth_gt_accum / n,
+            "depth_geom": depth_geom_accum / n,
+            "frozen_depth": frozen_depth_accum / n,
+            "seg_aux": seg_aux_accum / n,
+            "seg_aux_miou": seg_aux_miou_accum / n,
+            "frozen_seg": frozen_seg_accum / n,
+            "siglip_align": siglip_align_accum / n,
+            "summary_align": summary_align_accum / n,
+            "ground_query": ground_query_accum / n,
+            "ground_query_acc": ground_query_acc_metric / n,
+            "ground_query_valid": ground_query_valid_accum / n,
+        }
+
+        if self.writer is not None:
+            self.writer.add_scalar("val/cosine_latent", avg_cos_latent, epoch)
+            self.writer.add_scalar("val/cosine_decoded", avg_cos_decoded, epoch)
+            self.writer.add_scalar("val/psnr", psnr, epoch)
+            self.writer.add_scalar("val/localization", metrics["localization"], epoch)
+            self.writer.add_scalar("val/loc_match", metrics["loc_match"], epoch)
+            self.writer.add_scalar("val/loc_reprojection", metrics["loc_reprojection"], epoch)
+            self.writer.add_scalar("val/depth_gt", metrics["depth_gt"], epoch)
+            self.writer.add_scalar("val/depth_geom", metrics["depth_geom"], epoch)
+            self.writer.add_scalar("val/frozen_depth", metrics["frozen_depth"], epoch)
+            self.writer.add_scalar("val/seg_aux", metrics["seg_aux"], epoch)
+            self.writer.add_scalar("val/seg_aux_miou", metrics["seg_aux_miou"], epoch)
+            self.writer.add_scalar("val/frozen_seg", metrics["frozen_seg"], epoch)
+            self.writer.add_scalar("val/siglip_align", metrics["siglip_align"], epoch)
+            self.writer.add_scalar("val/summary_align", metrics["summary_align"], epoch)
+            self.writer.add_scalar("val/ground_query", metrics["ground_query"], epoch)
+            self.writer.add_scalar("val/ground_query_acc", metrics["ground_query_acc"], epoch)
+            self.writer.add_scalar("val/ground_query_valid", metrics["ground_query_valid"], epoch)
+
+        self._save_vis(epoch)
+
+        self._log(
+            f"[Val E{epoch:03d}] cos_latent={avg_cos_latent:.4f} "
+            f"cos_decoded={avg_cos_decoded:.4f} psnr={psnr:.2f} "
+            f"loc={metrics['localization']:.4f}"
+        )
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Checkpoint
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(
+        self,
+        epoch: int,
+        metrics: Dict[str, float],
+        is_best: bool = False,
+    ) -> None:
+        state = {
+            "epoch": epoch,
+            "global_step": self.global_step,
+            "model_state_dict": self.model.state_dict(),
+            "codec_state_dict": self.codec.state_dict(),
+            "sharpener_state_dict": self.sharpener.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
+            "best_cosine": self.best_cosine,
+            "best_metric_name": self.best_metric_name,
+            "best_metric_mode": self.best_metric_mode,
+            "best_selection_score": self.best_selection_score,
+            "best_selection_value": self.best_selection_value,
+            "metrics": metrics,
+        }
+        if self.use_refiner and self.refiner is not None:
+            state["refiner_state_dict"] = self.refiner.state_dict()
+        if self.depth_head is not None:
+            state["depth_head_state_dict"] = self.depth_head.state_dict()
+        if self.seg_head is not None:
+            state["seg_head_state_dict"] = self.seg_head.state_dict()
+        if self.sp_output_head is not None:
+            state["sp_output_head_state_dict"] = self.sp_output_head.state_dict()
+        if self.sp_locability_adapter is not None:
+            state["sp_locability_adapter_state_dict"] = self.sp_locability_adapter.state_dict()
+        if not getattr(self.cfg, "skip_latest_checkpoint", False):
+            torch.save(state, self.ckpt_dir / "latest.pth")
+        if is_best:
+            torch.save(state, self.ckpt_dir / "best.pth")
+        # Save periodic epoch checkpoint if configured
+        periodic = getattr(self.cfg, "save_periodic_every", 0)
+        if periodic > 0 and epoch % periodic == 0:
+            torch.save(state, self.ckpt_dir / f"epoch_{epoch:03d}.pth")
+
+    def _warmstart_refiner_state(
+        self, refiner_state_dict: Dict[str, torch.Tensor]
+    ) -> None:
+        """Warmstart refiner weights when guide-channel count changes.
+
+        V9->V10 style upgrades expand the first refiner conv from
+        latent+RGB to latent+RGB+depth-guide channels. We preserve the learned
+        V9 mapping for overlapping channels and zero-init only the newly added
+        guide channels instead of restarting the full refiner.
+        """
+        if self.refiner is None:
+            return
+
+        current_state = self.refiner.state_dict()
+        exact_loaded = 0
+        partial_loaded = 0
+        skipped: list[str] = []
+
+        for key, source in refiner_state_dict.items():
+            if key not in current_state:
+                skipped.append(f"{key}:missing")
+                continue
+
+            target = current_state[key]
+            if source.shape == target.shape:
+                current_state[key] = source
+                exact_loaded += 1
+                continue
+
+            if (
+                key == "net.0.weight"
+                and source.ndim == 4
+                and target.ndim == 4
+                and source.shape[0] == target.shape[0]
+                and source.shape[2:] == target.shape[2:]
+            ):
+                copy_channels = min(source.shape[1], target.shape[1])
+                patched = target.clone()
+                patched.zero_()
+                patched[:, :copy_channels] = source[:, :copy_channels]
+                current_state[key] = patched
+                partial_loaded += 1
+                skipped.append(
+                    f"{key}:partial {tuple(source.shape)} -> {tuple(target.shape)}"
+                )
+                continue
+
+            skipped.append(f"{key}:{tuple(source.shape)} -> {tuple(target.shape)}")
+
+        self.refiner.load_state_dict(current_state, strict=False)
+        self._log(
+            f"Warmstarted refiner with {exact_loaded} exact tensors and "
+            f"{partial_loaded} partial tensor(s)"
+        )
+        if skipped:
+            preview = ", ".join(skipped[:4])
+            if len(skipped) > 4:
+                preview += ", ..."
+            self._log(f"Refiner warmstart skipped/mismatched: {preview}")
+
+    def _warmstart_module_state(
+        self,
+        module: nn.Module,
+        module_state_dict: Dict[str, torch.Tensor],
+        module_name: str,
+    ) -> None:
+        """Warmstart only the exact-shape tensors for an upgraded module."""
+        current_state = module.state_dict()
+        exact_loaded = 0
+        remapped_loaded = 0
+        skipped: list[str] = []
+
+        for key, source in module_state_dict.items():
+            if key not in current_state:
+                skipped.append(f"{key}:missing")
+                continue
+
+            target = current_state[key]
+            if source.shape == target.shape:
+                current_state[key] = source
+                exact_loaded += 1
+            else:
+                skipped.append(f"{key}:{tuple(source.shape)} -> {tuple(target.shape)}")
+
+        if module_name == "model" and getattr(self.cfg, "hybrid_decoupled_heads", False):
+            old_fuse_prefix = "fusion_head.fuse."
+            for suffix in ("0.weight", "0.bias", "2.weight", "2.bias", "4.weight", "4.bias"):
+                source_key = old_fuse_prefix + suffix
+                if source_key not in module_state_dict:
+                    continue
+                source = module_state_dict[source_key]
+                for branch in ("geometry_head", "semantic_head"):
+                    target_key = f"fusion_head.{branch}.{suffix}"
+                    target = current_state.get(target_key)
+                    if target is not None and source.shape == target.shape:
+                        current_state[target_key] = source
+                        remapped_loaded += 1
+
+            gate_stem = "fusion_head.gate.0"
+            for suffix in ("weight", "bias"):
+                source_key = f"{gate_stem}.{suffix}"
+                source = module_state_dict.get(source_key)
+                if source is None:
+                    continue
+                for branch in ("geometry_gate", "semantic_gate"):
+                    target_key = f"fusion_head.{branch}.0.{suffix}"
+                    target = current_state.get(target_key)
+                    if target is not None and source.shape == target.shape:
+                        current_state[target_key] = source
+                        remapped_loaded += 1
+
+            for suffix in ("weight", "bias"):
+                source_key = f"fusion_head.gate.2.{suffix}"
+                source = module_state_dict.get(source_key)
+                if source is None:
+                    continue
+                if suffix == "weight" and source.ndim == 4:
+                    source_reduced = source.mean(dim=0, keepdim=True)
+                elif suffix == "bias" and source.ndim == 1:
+                    source_reduced = source.mean(dim=0, keepdim=True)
+                else:
+                    source_reduced = source
+                for branch in ("geometry_gate", "semantic_gate"):
+                    target_key = f"fusion_head.{branch}.2.{suffix}"
+                    target = current_state.get(target_key)
+                    if target is not None and source_reduced.shape == target.shape:
+                        current_state[target_key] = source_reduced
+                        remapped_loaded += 1
+
+            source_key = "fusion_head.fuse.0.weight"
+            target_key = "fusion_head.fuse.0.weight"
+            source = module_state_dict.get(source_key)
+            target = current_state.get(target_key)
+            if (
+                source is not None
+                and target is not None
+                and source.ndim == 4
+                and target.ndim == 4
+                and source.shape[0] == target.shape[0]
+                and source.shape[2:] == target.shape[2:]
+                and target.shape[1] == source.shape[1] * 2
+            ):
+                patched = target.clone()
+                patched.zero_()
+                patched[:, :source.shape[1]] = source * 0.5
+                patched[:, source.shape[1]: source.shape[1] * 2] = source * 0.5
+                current_state[target_key] = patched
+                remapped_loaded += 1
+
+        module.load_state_dict(current_state, strict=False)
+        self._log(
+            f"Warmstarted {module_name} with {exact_loaded} exact tensors"
+            + (f" and {remapped_loaded} remapped tensor(s)" if remapped_loaded else "")
+        )
+        if skipped:
+            preview = ", ".join(skipped[:4])
+            if len(skipped) > 4:
+                preview += ", ..."
+            self._log(f"{module_name} warmstart skipped/mismatched: {preview}")
+
+    def load_checkpoint(self, path: str, resume: bool = True) -> None:
+        ckpt = torch.load(path, map_location=self.device)
+        try:
+            self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        except RuntimeError as e:
+            self._log(
+                f"Model state_dict size mismatch, attempting partial warmstart: {e}"
+            )
+            self._warmstart_module_state(
+                self.model, ckpt["model_state_dict"], "model"
+            )
+        if "codec_state_dict" in ckpt:
+            try:
+                self.codec.load_state_dict(ckpt["codec_state_dict"], strict=False)
+            except RuntimeError as e:
+                self._log(
+                    f"Codec state_dict size mismatch, attempting partial warmstart: {e}"
+                )
+                self._warmstart_module_state(
+                    self.codec, ckpt["codec_state_dict"], "codec"
+                )
+        if "sharpener_state_dict" in ckpt:
+            try:
+                self.sharpener.load_state_dict(
+                    ckpt["sharpener_state_dict"], strict=False
+                )
+            except RuntimeError as e:
+                self._log(
+                    f"Sharpener state_dict size mismatch, attempting partial warmstart: {e}"
+                )
+                self._warmstart_module_state(
+                    self.sharpener, ckpt["sharpener_state_dict"], "sharpener"
+                )
+        if "refiner_state_dict" in ckpt and self.use_refiner and self.refiner is not None:
+            try:
+                self.refiner.load_state_dict(
+                    ckpt["refiner_state_dict"], strict=False
+                )
+            except RuntimeError as e:
+                self._log(
+                    f"Refiner state_dict size mismatch, attempting partial warmstart: {e}"
+                )
+                self._warmstart_refiner_state(ckpt["refiner_state_dict"])
+        if "depth_head_state_dict" in ckpt and self.depth_head is not None:
+            try:
+                self.depth_head.load_state_dict(
+                    ckpt["depth_head_state_dict"], strict=False
+                )
+            except RuntimeError as e:
+                self._log(
+                    f"Depth head state_dict size mismatch, starting depth head from scratch: {e}"
+                )
+        if "seg_head_state_dict" in ckpt and self.seg_head is not None:
+            try:
+                self.seg_head.load_state_dict(
+                    ckpt["seg_head_state_dict"], strict=False
+                )
+            except RuntimeError as e:
+                self._log(
+                    f"Seg head state_dict size mismatch, starting seg head from scratch: {e}"
+                )
+        if "sp_output_head_state_dict" in ckpt and self.sp_output_head is not None:
+            try:
+                self.sp_output_head.load_state_dict(
+                    ckpt["sp_output_head_state_dict"], strict=False
+                )
+            except RuntimeError as e:
+                self._log(
+                    f"SP output head state_dict size mismatch, starting from scratch: {e}"
+                )
+        if (
+            "sp_locability_adapter_state_dict" in ckpt
+            and self.sp_locability_adapter is not None
+        ):
+            self.sp_locability_adapter.load_state_dict(
+                ckpt["sp_locability_adapter_state_dict"], strict=False
+            )
+
+        if resume:
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except (ValueError, KeyError) as e:
+                self._log(f"Optimizer state mismatch (new param groups?), "
+                          f"re-initializing optimizer: {e}")
+            try:
+                self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except (ValueError, KeyError) as e:
+                self._log(f"Scheduler state mismatch, re-initializing: {e}")
+            if "scaler_state_dict" in ckpt:
+                self.scaler.load_state_dict(ckpt["scaler_state_dict"])
+            self.start_epoch = ckpt.get("epoch", 0) + 1
+            self.global_step = ckpt.get("global_step", 0)
+            self.best_cosine = ckpt.get("best_cosine", -1.0)
+            self.best_metric_name = ckpt.get("best_metric_name", self.best_metric_name)
+            self.best_metric_mode = ckpt.get("best_metric_mode", self.best_metric_mode)
+            if "best_selection_score" in ckpt:
+                self.best_selection_score = ckpt["best_selection_score"]
+            elif self.best_metric_name == "cosine":
+                self.best_selection_score = self.best_cosine
+            self.best_selection_value = ckpt.get("best_selection_value")
+            self._log(f"Resumed from epoch {self.start_epoch - 1}")
+        else:
+            self._log(f"Warmstart: loaded model weights from {path}")
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def train(self) -> None:
+        total_epochs = getattr(self.cfg, "epochs", 100)
+        eval_every = getattr(self.cfg, "eval_every", 5)
+        save_every = getattr(self.cfg, "save_every", 10)
+
+        self._log(
+            f"Starting training: epochs {self.start_epoch}→{total_epochs}, "
+            f"eval_every={eval_every}, save_every={save_every}"
+        )
+
+        for epoch in range(self.start_epoch, total_epochs + 1):
+            # Curriculum FDH: ramp weight from 0 → target over warmup epochs
+            if self.frozen_depth_warmup_epochs > 0 and self.frozen_depth_head_weight_target > 0:
+                ramp = min(1.0, epoch / self.frozen_depth_warmup_epochs)
+                self.frozen_depth_head_weight = ramp * self.frozen_depth_head_weight_target
+            train_metrics = self.train_epoch(epoch)
+
+            if epoch % eval_every == 0 or epoch == total_epochs:
+                val_metrics = self.validate(epoch)
+                metric_name, metric_value, metric_score = self._resolve_best_metric(
+                    val_metrics
+                )
+                self.best_cosine = max(self.best_cosine, val_metrics.get("cosine", -1.0))
+                is_best = metric_score > self.best_selection_score
+                if is_best:
+                    self.best_selection_score = metric_score
+                    self.best_selection_value = metric_value
+                    self._log(
+                        f"  ★ New best! {metric_name}={metric_value:.4f} "
+                        f"cosine={val_metrics.get('cosine', 0):.4f} "
+                        f"psnr={val_metrics.get('psnr', 0):.2f}"
+                    )
+                self.save_checkpoint(epoch, val_metrics, is_best=is_best)
+            elif epoch % save_every == 0:
+                self.save_checkpoint(epoch, train_metrics)
+
+            self.scheduler.step()
+
+        self._log("Training complete.")
+        if self.writer is not None:
+            self.writer.close()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _all_trainable_params(self):
+        """Gather all trainable parameters for gradient clipping."""
+        params = list(self.model.trainable_parameters())
+        if self.train_mode != "latent":
+            params += list(self.codec.decoder.parameters())
+        if self.sharpener.mode not in ("analytical", "none"):
+            params += list(self.sharpener.parameters())
+        if self.use_refiner and self.refiner is not None:
+            params += list(self.refiner.parameters())
+        if self.depth_head is not None:
+            params += list(self.depth_head.parameters())
+        if self.seg_head is not None:
+            params += list(self.seg_head.parameters())
+        if self.sp_output_head is not None:
+            params += list(self.sp_output_head.parameters())
+        if self.sp_locability_adapter is not None:
+            params += list(self.sp_locability_adapter.parameters())
+        for name, enabled in (("_xyz", self.train_geometry_xyz), ("_opacity", self.train_geometry_opacity)):
+            param = getattr(self.model, name, None)
+            if enabled and isinstance(param, nn.Parameter):
+                params.append(param)
+        return params
+
+    @staticmethod
+    def _collate_batch(batch):
+        elem = batch[0]
+        if isinstance(elem, torch.Tensor):
+            return torch.stack([item.clone() for item in batch], dim=0)
+        if isinstance(elem, dict):
+            return {
+                key: LocGSTrainer._collate_batch([item[key] for item in batch])
+                for key in elem
+            }
+        if isinstance(elem, (int, float)):
+            return torch.tensor(batch)
+        return batch
+
+    @staticmethod
+    def _resize_map(
+        x: torch.Tensor,
+        size: Tuple[int, int],
+        is_mask: bool = False,
+    ) -> torch.Tensor:
+        """Resize a dense [B,H,W] or [B,1,H,W] map to the target spatial size."""
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        if x.shape[-2:] == size:
+            return x.float()
+        if is_mask:
+            return F.interpolate(x.float(), size=size, mode="nearest")
+        if x.shape[-2] >= size[0] and x.shape[-1] >= size[1]:
+            return F.interpolate(x.float(), size=size, mode="area")
+        return F.interpolate(x.float(), size=size, mode="bilinear", align_corners=False)
+
+    def _compute_depth_aux_losses(
+        self,
+        batch: Dict[str, torch.Tensor],
+        render_result: Dict[str, torch.Tensor],
+        decoded: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        zero = decoded.sum() * 0.0
+        losses = {
+            "total": zero,
+            "depth_gt": zero,
+            "depth_geom": zero,
+        }
+        if self.depth_head is None:
+            return losses
+
+        gt_depth = batch.get("depth")
+        if gt_depth is None:
+            return losses
+
+        pred_depth = self.depth_head(decoded.float())
+        target_size = pred_depth.shape[-2:]
+        gt_depth = self._resize_map(gt_depth.to(self.device).float(), target_size)
+        alpha = self._resize_map(
+            render_result["alpha_map"].to(self.device).float(),
+            target_size,
+        )
+        valid_mask = (gt_depth > 0) & (alpha > self.depth_alpha_threshold)
+
+        if self.depth_loss_weight > 0 and valid_mask.any():
+            assert self.depth_supervision_loss is not None
+            losses["depth_gt"] = self.depth_supervision_loss(pred_depth, gt_depth, valid_mask)
+
+        if self.geom_depth_loss_weight > 0:
+            geom_key = "geom_depth" if "geom_depth" in render_result else "depth_map"
+            geom_raw = render_result[geom_key].to(self.device).float()
+            if getattr(self.cfg, "geom_depth_detach", True):
+                geom_raw = geom_raw.detach()
+            geom_depth = self._resize_map(geom_raw, target_size)
+            geom_mask = (geom_depth > 0) & (alpha > self.depth_alpha_threshold)
+            geom_mask = geom_mask & valid_mask
+            if geom_mask.any():
+                assert self.geom_depth_supervision_loss is not None
+                losses["depth_geom"] = self.geom_depth_supervision_loss(
+                    pred_depth, geom_depth, geom_mask
+                )
+
+        losses["total"] = (
+            self.depth_loss_weight * losses["depth_gt"]
+            + self.geom_depth_loss_weight * losses["depth_geom"]
+        )
+        return losses
+
+    def _compute_frozen_depth_loss(
+        self,
+        render_result: Dict[str, torch.Tensor],
+        decoded: torch.Tensor,
+        teacher_features: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute frozen depth head regularization loss.
+
+        Mechanism:
+        - geom_depth mode: decoded features → frozen head → predicted depth
+          vs geometric depth from 3DGS.
+        - gt_features mode: decoded features → frozen head vs frozen head on GT teacher features.
+
+        Gradients flow to decoded features only.
+        """
+        zero = decoded.sum() * 0.0
+        losses = {"frozen_depth": zero, "frozen_depth_grad": zero, "total": zero}
+
+        if self.frozen_depth_head is None or self.frozen_depth_head_weight <= 0:
+            return losses
+
+        # Predict depth from decoded features via frozen head
+        # NOTE: no torch.no_grad() — we need gradients through features
+        frozen_pred = self.frozen_depth_head(decoded.float())  # [B, 1, H, W]
+        target_size = frozen_pred.shape[-2:]
+
+        if self.frozen_depth_teacher == "gt_features":
+            if teacher_features is None:
+                return losses
+            teacher_input = teacher_features.to(self.device).float()
+            if teacher_input.shape[-2:] != target_size:
+                teacher_input = F.interpolate(
+                    teacher_input,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            with torch.no_grad():
+                teacher_depth = self.frozen_depth_head(teacher_input)
+            valid_mask = torch.isfinite(teacher_depth) & torch.isfinite(frozen_pred)
+            valid_mask = valid_mask & (teacher_depth > 0)
+            if valid_mask.any():
+                assert self.frozen_depth_loss_fn is not None
+                losses["frozen_depth"] = self.frozen_depth_loss_fn(
+                    frozen_pred,
+                    teacher_depth,
+                    valid_mask,
+                )
+                if self.frozen_depth_gradient_weight > 0:
+                    losses["frozen_depth_grad"] = self._depth_gradient_loss(
+                        frozen_pred,
+                        teacher_depth,
+                        valid_mask,
+                    )
+            losses["total"] = (
+                self.frozen_depth_head_weight * losses["frozen_depth"]
+                + self.frozen_depth_gradient_weight * losses["frozen_depth_grad"]
+            )
+            return losses
+
+        # Default teacher: geometric depth from 3DGS (high quality, detached)
+        geom_key = "geom_depth" if "geom_depth" in render_result else "depth_map"
+        geom_raw = render_result[geom_key].to(self.device).float().detach()
+        alpha = render_result.get("alpha_map")
+
+        geom_depth = self._resize_map(geom_raw, target_size)
+        geom_mask = geom_depth > 0.01
+
+        if alpha is not None:
+            alpha_rs = self._resize_map(
+                alpha.to(self.device).float().detach(), target_size
+            )
+            geom_mask = geom_mask & (alpha_rs > self.depth_alpha_threshold)
+
+        if not geom_mask.any():
+            return losses
+
+        # Per-image scale-shift alignment (detached — gradients only through features)
+        aligned_pred = self._align_depth_scale_shift(
+            frozen_pred, geom_depth, geom_mask
+        )
+
+        # Primary loss: scale-invariant comparison
+        assert self.frozen_depth_loss_fn is not None
+        losses["frozen_depth"] = self.frozen_depth_loss_fn(
+            aligned_pred, geom_depth, geom_mask
+        )
+
+        # Optional gradient matching loss (edge alignment)
+        if self.frozen_depth_gradient_weight > 0:
+            losses["frozen_depth_grad"] = self._depth_gradient_loss(
+                aligned_pred, geom_depth, geom_mask
+            )
+
+        losses["total"] = (
+            self.frozen_depth_head_weight * losses["frozen_depth"]
+            + self.frozen_depth_gradient_weight * losses["frozen_depth_grad"]
+        )
+        return losses
+
+    def _compute_frozen_seg_loss(
+        self,
+        decoded: Optional[torch.Tensor],
+        teacher_features: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        zero = (
+            decoded.sum() * 0.0
+            if decoded is not None
+            else torch.tensor(0.0, device=self.device)
+        )
+        losses = {"frozen_seg": zero, "total": zero}
+        if (
+            self.frozen_seg_head is None
+            or self.frozen_seg_head_weight <= 0
+            or decoded is None
+            or teacher_features is None
+        ):
+            return losses
+
+        pred_logits = self.frozen_seg_head(decoded.float())
+        teacher_input = teacher_features.to(self.device).float()
+        if teacher_input.shape[-2:] != pred_logits.shape[-2:]:
+            teacher_input = F.interpolate(
+                teacher_input,
+                size=pred_logits.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        with torch.no_grad():
+            teacher_logits = self.frozen_seg_head(teacher_input)
+
+        temp = max(self.frozen_seg_temperature, 1e-6)
+        if self.frozen_seg_loss_type == "mse":
+            seg_loss = F.mse_loss(pred_logits, teacher_logits)
+        else:
+            log_probs = F.log_softmax(pred_logits / temp, dim=1)
+            teacher_probs = F.softmax(teacher_logits / temp, dim=1)
+            seg_loss = F.kl_div(log_probs, teacher_probs, reduction="batchmean") * (temp ** 2)
+
+        losses["frozen_seg"] = seg_loss
+        losses["total"] = self.frozen_seg_head_weight * seg_loss
+        return losses
+
+    @staticmethod
+    def _align_depth_scale_shift(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-image least-squares scale-shift alignment.
+
+        Solves: target ≈ scale * pred + shift  (on masked pixels)
+        Returns aligned pred. Scale/shift are detached so gradients
+        flow only through the original pred values.
+        """
+        B = pred.shape[0]
+        aligned = pred.clone()
+        for b in range(B):
+            m = mask[b].bool() if mask.dim() == 4 else mask.bool()
+            if m.dim() > 2:
+                m = m.squeeze(0)
+            p_vals = pred[b].squeeze()[m.squeeze()].detach()
+            t_vals = target[b].squeeze()[m.squeeze()].detach()
+            if p_vals.numel() < 10:
+                continue
+            # Least-squares: [scale, shift] = (A^T A)^-1 A^T t
+            A = torch.stack([p_vals, torch.ones_like(p_vals)], dim=1)
+            try:
+                params = torch.linalg.lstsq(A, t_vals.unsqueeze(1)).solution.squeeze()
+                scale, shift = params[0].detach(), params[1].detach()
+                # Clamp scale to avoid degenerate solutions
+                scale = scale.clamp(min=0.1, max=10.0)
+                aligned[b] = pred[b] * scale + shift
+            except Exception:
+                pass  # Fall back to unaligned if lstsq fails
+        return aligned
+
+    @staticmethod
+    def _depth_gradient_loss(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Loss on spatial depth gradients for edge alignment."""
+        pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+        pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+        tgt_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+        tgt_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+
+        mask_dx = mask[:, :, :, 1:] & mask[:, :, :, :-1] if mask.dim() == 4 else None
+        mask_dy = mask[:, :, 1:, :] & mask[:, :, :-1, :] if mask.dim() == 4 else None
+
+        loss_dx = F.l1_loss(pred_dx[mask_dx], tgt_dx[mask_dx]) if mask_dx is not None and mask_dx.any() else pred_dx.sum() * 0.0
+        loss_dy = F.l1_loss(pred_dy[mask_dy], tgt_dy[mask_dy]) if mask_dy is not None and mask_dy.any() else pred_dy.sum() * 0.0
+
+        return (loss_dx + loss_dy) * 0.5
+
+    def _project_siglip_features(self, features: torch.Tensor) -> torch.Tensor:
+        assert self.siglip_projection is not None
+        B, C, H, W = features.shape
+        feat_flat = features.permute(0, 2, 3, 1).reshape(B, H * W, C).float()
+        projected = self.siglip_projection(feat_flat)
+        projected = projected.permute(0, 2, 1).reshape(B, -1, H, W)
+        return F.normalize(projected, dim=1)
+
+    def _compute_siglip_alignment_loss(
+        self,
+        decoded: Optional[torch.Tensor],
+        target: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if (
+            self.siglip_projection is None
+            or self.siglip_alignment_weight <= 0
+            or decoded is None
+            or target is None
+        ):
+            return torch.tensor(0.0, device=self.device)
+        if decoded.shape[-2:] != target.shape[-2:]:
+            target = self._resize_map(target, decoded.shape[-2:])
+        pred_siglip = self._project_siglip_features(decoded)
+        with torch.no_grad():
+            target_siglip = self._project_siglip_features(target)
+        return self.siglip_alignment_weight * F.mse_loss(pred_siglip, target_siglip)
+
+    def _project_summary_head_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Project [B, C, H, W] features through frozen SigLIP2SummaryHead to text-aligned space."""
+        assert self.siglip_summary_head is not None
+        B, C, H, W = features.shape
+        feat_flat = features.permute(0, 2, 3, 1).reshape(B, H * W, C).float()
+        projected = self.siglip_summary_head(feat_flat)
+        projected = projected.permute(0, 2, 1).reshape(B, -1, H, W)
+        return F.normalize(projected, dim=1)
+
+    def _compute_summary_alignment_loss(
+        self,
+        decoded: Optional[torch.Tensor],
+        target: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Cosine distance loss in the text-aligned SigLIP2 summary head space.
+
+        Uses 1 - cos_sim (averaged over spatial locations) instead of MSE
+        to avoid the loss being diluted by the high dimensionality (1536-d).
+        """
+        if (
+            self.siglip_summary_head is None
+            or self.siglip_summary_alignment_weight <= 0
+            or decoded is None
+            or target is None
+        ):
+            return torch.tensor(0.0, device=self.device)
+        if decoded.shape[-2:] != target.shape[-2:]:
+            target = self._resize_map(target, decoded.shape[-2:])
+        pred_summary = self._project_summary_head_features(decoded)  # [B, C, H, W] L2-normed
+        with torch.no_grad():
+            target_summary = self._project_summary_head_features(target)
+        # Cosine similarity per spatial location, then mean cosine distance
+        cos_sim = (pred_summary * target_summary).sum(dim=1).mean()  # dot product of unit vecs
+        return self.siglip_summary_alignment_weight * (1.0 - cos_sim)
+
+    def _load_grounding_text_embeddings(
+        self,
+        config: LocGSConfig,
+    ) -> Tuple[List[str], List[int], torch.Tensor]:
+        text_path = resolve_siglip_text_embeddings_path(
+            getattr(
+                config,
+                "grounding_text_embeddings",
+                DEFAULT_SIGLIP2_TEXT_EMBEDDINGS,
+            )
+        )
+        if not text_path.exists():
+            raise FileNotFoundError(f"Grounding text embeddings not found: {text_path}")
+        data = torch.load(text_path, map_location="cpu")
+        bank = {
+            query: F.normalize(embedding.float(), dim=0)
+            for query, embedding in zip(data["queries"], data["embeddings"])
+        }
+        selected = [
+            (query, class_id)
+            for query, class_id in sorted(GROUNDING_QUERIES.items(), key=lambda x: x[1])
+            if query in bank
+        ]
+        if not selected:
+            raise ValueError(
+                f"No Replica grounding queries from {list(GROUNDING_QUERIES)} found in {text_path}"
+            )
+        query_names = [query for query, _ in selected]
+        query_class_ids = [class_id for _, class_id in selected]
+        text_embeddings = torch.stack([bank[query] for query in query_names]).to(self.device)
+        return query_names, query_class_ids, text_embeddings
+
+    def _compute_grounding_query_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        decoded: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        zero = torch.tensor(0.0, device=self.device)
+        stats = {
+            "loss": zero,
+            "accuracy": zero.detach(),
+            "valid_ratio": zero.detach(),
+        }
+        if (
+            self.grounding_query_loss_fn is None
+            or self.grounding_query_loss_weight <= 0
+            or self.grounding_text_embeddings is None
+            or decoded is None
+        ):
+            return stats
+        gt_sem = batch.get("semantics")
+        if gt_sem is None:
+            return stats
+        gt_sem = gt_sem.to(self.device).long()
+        target_size = decoded.shape[-2:]
+        downsample = max(1, int(getattr(self.cfg, "grounding_query_loss_downsample", 1)))
+        decoded_for_loss = decoded
+        if downsample > 1:
+            target_size = (
+                max(1, target_size[0] // downsample),
+                max(1, target_size[1] // downsample),
+            )
+            decoded_for_loss = F.interpolate(
+                decoded.float(),
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        if gt_sem.shape[-2:] != target_size:
+            gt_sem = self._resize_map(
+                gt_sem.unsqueeze(1).float(),
+                target_size,
+                is_mask=True,
+            ).squeeze(1).long()
+        pred_siglip = self._project_siglip_features(decoded_for_loss)
+        return self.grounding_query_loss_fn(
+            pred_siglip,
+            self.grounding_text_embeddings,
+            gt_sem,
+            self.grounding_query_class_ids,
+        )
+
+    def _compute_seg_aux_losses(
+        self,
+        batch: Dict[str, torch.Tensor],
+        decoded: Optional[torch.Tensor],
+    ) -> Dict[str, float | torch.Tensor]:
+        zero = torch.tensor(0.0, device=self.device)
+        losses: Dict[str, float | torch.Tensor] = {
+            "total": zero,
+            "miou": 0.0,
+        }
+        if self.seg_head is None or self.seg_loss_fn is None or decoded is None:
+            return losses
+        gt_sem = batch.get("semantics")
+        if gt_sem is None:
+            return losses
+        gt_sem = gt_sem.to(self.device).long()
+        if gt_sem.shape[-2:] != decoded.shape[-2:]:
+            gt_sem = self._resize_map(
+                gt_sem.unsqueeze(1).float(), decoded.shape[-2:], is_mask=True
+            ).squeeze(1).long()
+        seg_logits = self.seg_head(decoded.float())
+        seg_loss = self.seg_loss_fn(seg_logits, gt_sem)
+        losses["total"] = self.seg_loss_weight * seg_loss
+        with torch.no_grad():
+            pred = seg_logits.argmax(dim=1)
+            losses["miou"] = compute_miou(
+                pred,
+                gt_sem,
+                num_classes=getattr(self.cfg, "seg_num_classes", 40),
+                ignore_index=getattr(self.cfg, "seg_ignore_index", 255),
+            )
+        return losses
+
+    def _normalize_positions(self, position_map: torch.Tensor) -> torch.Tensor:
+        """Normalize world-space positions to [0, 1] using scene bounds from Gaussians."""
+        if not hasattr(self, "_scene_bounds"):
+            xyz = self.model.get_xyz()
+            margin = 0.1
+            self._scene_bounds = (
+                xyz.min(dim=0).values - margin,
+                xyz.max(dim=0).values + margin,
+            )
+        lo, hi = self._scene_bounds
+        extent = (hi - lo).clamp(min=1e-6)
+        # position_map: [B, 3, H, W]
+        lo_v = lo.view(1, 3, 1, 1)
+        extent_v = extent.view(1, 3, 1, 1)
+        return ((position_map - lo_v) / extent_v).clamp(0.0, 1.0)
+
+    def _build_guide(
+        self,
+        batch: dict,
+        render_result: dict,
+        rendered_rgb: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Build the guide signal for the screen-space refiner.
+
+        Supports RGB guide (GT or self-rendered), depth guide, or both.
+        Returns None if no guide is configured.
+        """
+        rgb_part = None
+        if self.refiner_rgb_guide:
+            if self.self_guided and rendered_rgb is not None:
+                rgb_part = rendered_rgb.detach()
+            else:
+                rgb = batch.get("rgb_guide")
+                if rgb is not None:
+                    rgb_part = rgb.to(self.device)
+                else:
+                    B, _, H, W = render_result["feature_map"].shape
+                    rgb_part = torch.zeros(B, 3, H, W, device=self.device)
+
+        return build_refiner_guide(
+            render_result,
+            rgb_guide=rgb_part,
+            use_depth_guide=self.refiner_depth_guide,
+            use_depth_grad=getattr(self.cfg, "refiner_depth_grad", False),
+            depth_grad_scale=getattr(self.cfg, "refiner_depth_grad_scale", 10.0),
+            use_alpha_guide=self.refiner_alpha_guide,
+            use_boundary_guide=self.refiner_boundary_guide,
+        )
+
+    def _get_1280d_val_path(self, batch) -> Optional[str]:
+        """In latent mode, try to locate the original 1280d feature for monitoring."""
+        try:
+            idx = batch["frame_idx"].item()
+            val_1280_dir = getattr(self.cfg, "val_1280d_dir", None)
+            if val_1280_dir is None:
+                # Derive from feature_dir: replace 64d with 1280d
+                feat_dir = getattr(self.cfg, "feature_dir", "")
+                val_split = getattr(self.cfg, "val_split", "Sequence_2")
+                train_split = getattr(self.cfg, "train_split", "Sequence_1")
+                val_1280_dir = feat_dir.replace("64d", "1280d").replace(train_split, val_split)
+            p = Path(val_1280_dir) / "backbone" / f"rgb_{idx}.pt"
+            if not p.exists():
+                p = Path(val_1280_dir) / f"rgb_{idx}.pt"
+            return str(p) if p.exists() else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _count_params(module: nn.Module) -> float:
+        return sum(p.numel() for p in module.parameters()) / 1e6
+
+    @staticmethod
+    def _set_seed(seed: int) -> None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    def _log(self, msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line, flush=True)
+        log_file = self.log_dir / "training.log"
+        with open(log_file, "a") as f:
+            f.write(line + "\n")
+
+    @torch.no_grad()
+    def _save_vis(self, epoch: int) -> None:
+        """Save PCA visualisation for the first validation sample."""
+        try:
+            sample = self.val_dataset[0]
+            gt = sample["teacher_features"].unsqueeze(0).to(self.device)
+            pose = sample["pose_w2c"].unsqueeze(0).to(self.device)
+
+            rendered = self.renderer.render_features_batch(self.model, pose)["feature_map"]
+            rendered = self.sharpener(rendered)
+            if self.use_refiner and self.refiner is not None:
+                rgb_guide = sample.get("rgb_guide")
+                if rgb_guide is not None:
+                    rgb_guide = rgb_guide.unsqueeze(0).to(self.device)
+                rendered = self.refiner(rendered, guide=rgb_guide)
+
+            if self._is_superpoint and self.sp_output_head is not None:
+                # Hybrid decode for SuperPoint vis
+                if self._is_hybrid:
+                    from loc_gs.models.hybrid_gaussian import unproject_depth_to_positions
+                    vis_result = self.renderer.render_features_batch(self.model, pose)
+                    rendered = vis_result["feature_map"]
+                    rendered = self.sharpener(rendered)
+                    depth_map = vis_result["depth_map"].float()
+                    position_map = unproject_depth_to_positions(
+                        depth_map, pose.float(), self.renderer.K.float(),
+                        depth_map.shape[1], depth_map.shape[2],
+                    )
+                    position_map = self._normalize_positions(position_map)
+                    rendered = self.model.decode_screen_space(
+                        rendered.float(), position_map,
+                    )
+                locability_map = self._render_locability_map(pose.float())
+                rendered = self._apply_locability_to_sp_features(rendered, locability_map)
+                sp_out = self.sp_output_head(rendered)
+                decoded = sp_out["descriptor"]  # Use descriptor for PCA vis
+            else:
+                decoded = self.codec.decoder(rendered)
+
+            if decoded.shape[-2:] != gt.shape[-2:]:
+                gt = F.interpolate(
+                    gt, size=decoded.shape[-2:], mode="bilinear", align_corners=False
+                )
+
+            # Simple 3-component PCA → RGB image
+            for tag, feat in [("gt", gt), ("decoded", decoded)]:
+                flat = feat[0].float().flatten(1)           # [C, H*W]
+                mean = flat.mean(dim=1, keepdim=True)
+                centered = flat - mean
+                U, S, _ = torch.pca_lowrank(centered.T, q=3)  # [H*W, 3]
+                rgb = U.T.reshape(3, *decoded.shape[-2:])
+                rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
+                if self.writer is not None:
+                    self.writer.add_image(f"val/{tag}", rgb, epoch)
+        except Exception:
+            pass  # visualisation is best-effort
+
+
+# ===================================================================
+# Entry point
+# ===================================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Train Loc-GS SuperPoint Gaussian feature fields."
+    )
+    parser.add_argument("--config", required=True, help="Path to YAML config")
+    parser.add_argument("--resume", default=None, help="Resume from checkpoint")
+    parser.add_argument(
+        "--warmstart", default=None, help="Load model weights only"
+    )
+    parser.add_argument(
+        "--pretrained_codec", default=None,
+        help="Legacy dense-teacher checkpoint path; unused for SuperPoint configs",
+    )
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    trainer = LocGSTrainer(config)
+
+    # Load pretrained codec first (before resume/warmstart which may override)
+    if args.pretrained_codec:
+        ckpt = torch.load(args.pretrained_codec, map_location=trainer.device)
+        trainer.codec.load_state_dict(ckpt["codec_state_dict"])
+        trainer._log(f"Loaded pretrained codec from {args.pretrained_codec}")
+
+    if args.resume:
+        trainer.load_checkpoint(args.resume, resume=True)
+    elif args.warmstart:
+        trainer.load_checkpoint(args.warmstart, resume=False)
+    else:
+        # Check config for resume_from / warmstart_from
+        resume_from = getattr(config, "resume_from", None) or None
+        warmstart_from = getattr(config, "warmstart_from", None) or None
+        if resume_from:
+            trainer.load_checkpoint(resume_from, resume=False)
+            trainer._log(f"Warmstart from config: {resume_from}")
+        elif warmstart_from:
+            trainer.load_checkpoint(warmstart_from, resume=False)
+
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()

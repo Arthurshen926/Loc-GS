@@ -1,0 +1,119 @@
+# SuperPoint Hybrid Feature Field — room_2 — v3
+# Changes from room_2 v2:
+#   - Increased model capacity: latent 32→48, hash 64→96, fine/coarse 128→192, fused 256→384
+#   - Increased hash resolution: 2048→4096
+#   - Reduced detector weight: 0.1→0.01 (further descriptor focus)
+#   - Focal cosine loss: gamma=2.0 (focus on hard pixels)
+#   - Extended training: 100→200 epochs
+#   - Periodic checkpoint saving every 25 epochs
+# Mirrors room_0 v3 config for fair comparison
+
+exp_name: "sp_gs_room2_hybrid_v3"
+output_dir: "/root/Loc-GS/output/sp_gs/room2_hybrid_v3"
+seed: 42
+
+scene: "room_2"
+scene_root: "/mnt/pool/sqy/dataset/room_2"
+ply_path: "/root/Loc-GS/output/3dgs_models/room_2/v8_fixed_poses_3dgs/point_cloud/iteration_30000/point_cloud.ply"
+
+# Feature type
+feature_type: "superpoint"
+descriptor_dim: 256
+detector_dim: 65
+detector_loss_weight: 0.01
+detector_loss_type: "kl"
+
+# Architecture: hybrid — INCREASED CAPACITY (matching room_0 v3)
+architecture: "hybrid"
+hybrid_latent_dim: 48
+hash_levels: 16
+hash_features_per_level: 2
+hash_log2_size: 19
+hash_base_resolution: 16
+hash_max_resolution: 4096
+hash_output_dim: 96
+fine_dim: 192
+coarse_dim: 192
+hybrid_output_dim: 384
+hybrid_decoupled_heads: false
+hybrid_semantic_adaptor: false
+
+# SuperPoint output head config
+sp_head_hidden_dim: 512
+sp_head_num_res_blocks: 2
+sp_head_use_3x3: true
+
+# Focal cosine loss (focus on hard pixels)
+focal_cosine_gamma: 2.0
+
+# No codec needed
+bottleneck_dim: 64
+dual_stream: false
+train_mode: "decoded"
+
+# No refiner
+use_refiner: false
+
+# FeatSharp
+featsharp_mode: "analytical"
+featsharp_strength: 0.5
+
+# Rendering resolution (H/8 × W/8)
+image_height: 480
+image_width: 640
+fx: 320.0
+fy: 320.0
+cx: 319.5
+cy: 239.5
+feature_height: 60
+feature_width: 80
+max_channels_per_chunk: 32
+use_2dgs: false
+
+# Training — extended epochs + higher LRs (matching room_0 v3)
+epochs: 200
+batch_size: 2
+lr_features: 5.0e-4
+lr_hash: 1.0e-3
+lr_decoder: 2.0e-4
+lr_heads: 2.0e-4
+lr_output_head: 2.0e-4
+weight_decay: 1.0e-5
+grad_clip: 10.0
+warmup_epochs: 5
+scheduler: "cosine"
+
+# Loss weights
+l2_weight: 1.0
+cosine_weight: 1.0
+tv_weight: 0.01
+adaptor_weight: 0.0
+gradient_loss_weight: 0.0
+depth_guided_feature_weight: 0.0
+geometric_edge_loss_weight: 0.0
+boundary_aware_loss_weight: 0.0
+
+depth_loss_weight: 0.0
+geom_depth_loss_weight: 0.0
+seg_loss_weight: 0.0
+frozen_depth_head_weight: 0.0
+frozen_seg_head_weight: 0.0
+hybrid_semantic_aux_weight: 0.0
+
+# Data: SuperPoint features
+feature_dir: "/root/Loc-GS/output/superpoint_features/room_2/Sequence_1"
+val_feature_dir: "/root/Loc-GS/output/superpoint_features/room_2/Sequence_2"
+train_split: "Sequence_1"
+val_split: "Sequence_2"
+mixed_split: true
+num_workers: 4
+
+# Best metric
+best_metric: "cosine"
+best_metric_mode: "max"
+
+# Checkpointing
+save_every: 10
+save_periodic_every: 25
+eval_every: 5
+log_every: 50

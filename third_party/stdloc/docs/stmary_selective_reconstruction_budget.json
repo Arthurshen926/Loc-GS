@@ -1,0 +1,52 @@
+{
+  "gamma": 2.0,
+  "min_weight": 0.05,
+  "num_scores": 273892,
+  "rows": [
+    {
+      "background_score_mean": 0.16967573761940002,
+      "score_mass": 0.12569041550159454,
+      "score_mass_gain": 2.5137348873722334,
+      "selected_fraction": 0.050001460429658404,
+      "selected_points": 13695,
+      "selected_score_mean": 0.4634436070919037,
+      "selected_to_background_score_ratio": 2.731348752975464,
+      "selected_to_background_weight_ratio": 5.3168864250183105,
+      "top_ratio": 0.05
+    },
+    {
+      "background_score_mean": 0.15730011463165283,
+      "score_mass": 0.23212119936943054,
+      "score_mass_gain": 2.3211441963377903,
+      "selected_fraction": 0.10000292085931681,
+      "selected_points": 27390,
+      "selected_score_mean": 0.42793670296669006,
+      "selected_to_background_score_ratio": 2.720510959625244,
+      "selected_to_background_weight_ratio": 4.700714588165283,
+      "top_ratio": 0.1
+    },
+    {
+      "background_score_mean": 0.13581997156143188,
+      "score_mass": 0.41064777970314026,
+      "score_mass_gain": 2.053216409179658,
+      "selected_fraction": 0.2000021906444876,
+      "selected_points": 54779,
+      "selected_score_mean": 0.3785403370857239,
+      "selected_to_background_score_ratio": 2.787074089050293,
+      "selected_to_background_weight_ratio": 3.938030958175659,
+      "top_ratio": 0.2
+    },
+    {
+      "background_score_mean": 0.11667855829000473,
+      "score_mass": 0.5569928884506226,
+      "score_mass_gain": 1.8566339232245874,
+      "selected_fraction": 0.3000014604296584,
+      "selected_points": 82168,
+      "selected_score_mean": 0.3422974944114685,
+      "selected_to_background_score_ratio": 2.9336795806884766,
+      "selected_to_background_weight_ratio": 3.445336103439331,
+      "top_ratio": 0.3
+    }
+  ],
+  "score_file": "map_cambridge_spgs/StMarysChurch_stream_fastsave/detector_10000/sampled_scores.pkl"
+}

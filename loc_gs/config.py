@@ -1,0 +1,339 @@
+"""
+Loc-GS configuration system.
+
+YAML-based config with dataclass schema. No Hydra — matches existing ICLPose pattern.
+
+Usage:
+    config = load_config("loc_gs/configs/my_exp.yaml")
+    config = override_from_args(config, args)
+    save_config(config, "output/loc_gs/config_snapshot.yaml")
+"""
+
+import argparse
+import os
+from dataclasses import asdict, dataclass, fields
+from typing import Any, Dict
+
+import yaml
+
+DEFAULT_UNUSED_RESOURCE = ""
+
+
+@dataclass
+class LocGSConfig:
+    """Configuration for Loc-GS training and evaluation."""
+
+    # Experiment
+    exp_name: str = "loc_gs_default"
+    output_dir: str = "output/loc_gs"
+    seed: int = 42
+
+    # Scene
+    scene: str = "room_0"
+    ply_path: str = ""
+    dataset_type: str = "replica"
+    scene_root: str = ""  # optional absolute/relative override for scene root
+
+    # Legacy dense-teacher compatibility. Loc-GS public configs use SuperPoint.
+    radio_version: str = ""
+    radio_repo: str = os.environ.get("RADIO_REPO", "")
+    radio_feature_dim: int = 1280
+
+    # Architecture
+    architecture: str = "explicit"  # "explicit" or "hybrid"
+    latent_dim: int = 64  # for explicit
+    hybrid_latent_dim: int = 16  # for hybrid
+    hash_levels: int = 16
+    hash_features_per_level: int = 2
+    hash_log2_size: int = 19
+    hash_base_resolution: int = 16
+    hash_max_resolution: int = 2048
+    hash_output_dim: int = 48
+    fine_dim: int = 64
+    coarse_dim: int = 64
+    hybrid_output_dim: int = 128
+    hybrid_decoupled_heads: bool = False
+    hybrid_semantic_adaptor: bool = False
+    hybrid_semantic_adaptor_mode: str = "confidence"  # "confidence" or "refinement"
+    hybrid_semantic_adaptor_hidden_dim: int = 64
+    hybrid_semantic_adaptor_use_geometry_guidance: bool = True
+    hybrid_semantic_adaptor_use_depth_guidance: bool = False
+    hybrid_semantic_adaptor_residual: bool = True
+    hybrid_semantic_adaptor_reg_weight: float = 0.0
+    grounding_query_loss_weight: float = 0.0
+    grounding_query_temperature: float = 1.0
+    grounding_query_loss_downsample: int = 1
+    grounding_text_embeddings: str = DEFAULT_UNUSED_RESOURCE
+
+    # HCD Codec
+    bottleneck_dim: int = 64
+    dual_stream: bool = True
+    symmetric_decoder: bool = False
+    decoder_hidden_dim: int = 512
+    decoder_num_layers: int = 3
+
+    # FeatSharp
+    featsharp_mode: str = "analytical"  # "none", "analytical", "learned", "multiview"
+    featsharp_strength: float = 0.5
+    featsharp_num_source_views: int = 2
+
+    # Screen-space refiner
+    use_refiner: bool = False
+    refiner_hidden_dim: int = 128
+    refiner_num_blocks: int = 4
+    refiner_dropout: float = 0.1
+    refiner_rgb_guide: bool = False  # Use RGB as additional input to refiner
+    refiner_depth_guide: bool = False  # Use rendered depth as guide (always available)
+    refiner_depth_grad: bool = False   # Use depth gradients (3ch: depth+dx+dy) instead of 1ch
+    refiner_alpha_guide: bool = False  # Use opacity/alpha as a guide channel
+    refiner_boundary_guide: bool = False  # Use depth/alpha boundary cue as a guide
+    refiner_depth_grad_scale: float = 10.0  # Scale factor for depth-gradient guide channels
+    refiner_norm_type: str = "gn"      # "gn" (GroupNorm, stable) or "bn" (BatchNorm, legacy)
+    self_guided: bool = False  # Use rendered RGB (not GT) as refiner guide
+    lr_refiner: float = 5e-4
+
+    # Joint RGB training (V10)
+    train_sh: bool = False  # Unfreeze SH coefficients for joint RGB training
+    rgb_loss_weight: float = 0.0  # Weight for RGB reconstruction loss
+    lr_sh: float = 5e-4  # Learning rate for SH coefficients
+
+    # Rendering
+    image_height: int = 480
+    image_width: int = 640
+    fx: float = 320.0
+    fy: float = 320.0
+    cx: float = 319.5
+    cy: float = 239.5
+    feature_height: int = 30
+    feature_width: int = 40  # W/16
+    max_channels_per_chunk: int = 32
+    use_2dgs: bool = False
+
+    # Training
+    epochs: int = 100
+    batch_size: int = 4
+    lr_features: float = 1e-3
+    lr_decoder: float = 1e-4
+    lr_hash: float = 1e-3
+    lr_heads: float = 1e-4
+    weight_decay: float = 1e-5
+    grad_clip: float = 10.0
+    warmup_epochs: int = 5
+    scheduler: str = "cosine"  # "cosine", "step", "plateau"
+    train_mode: str = "decoded"  # "decoded" (1280d) or "latent" (64d)
+
+    # Loss weights
+    l2_weight: float = 1.0
+    cosine_weight: float = 0.5
+    consistency_weight: float = 0.1
+    adaptor_weight: float = 0.1
+    siglip_alignment_weight: float = 0.0
+    siglip_summary_alignment_weight: float = 0.0
+    siglip_summary_head_weights: str = DEFAULT_UNUSED_RESOURCE
+    tv_weight: float = 0.01
+    feat_norm_weight: float = 0.0
+    gradient_loss_weight: float = 0.0
+    gradient_loss_type: str = "sobel"
+    depth_guided_feature_weight: float = 0.0
+    geometric_edge_loss_weight: float = 0.0
+    boundary_aware_loss_weight: float = 0.0
+    boundary_aware_sharpness_weight: float = 1.0
+    boundary_aware_smoothness_weight: float = 1.0
+    boundary_aware_edge_threshold: float = 0.1
+    channel_std_weight: float = 0.0
+    hybrid_semantic_aux_weight: float = 0.0
+    depth_loss_weight: float = 0.0
+    geom_depth_loss_weight: float = 0.0
+    geom_depth_detach: bool = True
+    depth_alpha_threshold: float = 0.05
+    depth_supervision_loss_type: str = "scale_invariant"
+    geom_depth_supervision_loss_type: str = "scale_invariant"
+    siglip_projection_weights: str = DEFAULT_UNUSED_RESOURCE
+
+    # Data
+    feature_dir: str = ""  # pre-extracted SuperPoint descriptors
+    val_feature_dir: str = ""
+    pose_file: str = ""
+    pose_dir: str = ""
+    val_pose_file: str = ""
+    val_pose_dir: str = ""
+    rgb_dir: str = ""
+    val_rgb_dir: str = ""
+    depth_dir: str = ""
+    val_depth_dir: str = ""
+    semantics_dir: str = ""
+    val_semantics_dir: str = ""
+    instance_dir: str = ""
+    val_instance_dir: str = ""
+    train_split: str = "Sequence_1"
+    val_split: str = "Sequence_2"
+    train_frame_ids_path: str = ""
+    val_frame_ids_path: str = ""
+    mixed_split: bool = False
+    mixed_train_ratio: float = 0.8
+    mixed_seed: int = 42
+    num_workers: int = 4
+    grounding_source: str = "replica"
+    grounding_annotations_path: str = ""
+
+    # Downstream tasks
+    depth_head_type: str = "mlp"  # "linear", "mlp", "dpt"
+    depth_head_hidden_dim: int = 256
+    depth_head_num_layers: int = 3
+    depth_num_classes: int = 1
+    seg_num_classes: int = 40
+    seg_head_type: str = "mlp"
+    seg_head_hidden_dim: int = 256
+    seg_head_num_layers: int = 2
+    seg_loss_weight: float = 0.0
+    seg_loss_type: str = "ce"
+    seg_ignore_index: int = 255
+    grounding_use_adaptor: bool = True
+
+    # Frozen depth head supervision (core innovation)
+    frozen_depth_head_weight: float = 0.0
+    frozen_depth_head_path: str = ""
+    frozen_depth_head_type: str = "mlp"
+    frozen_depth_head_hidden_dim: int = 256
+    frozen_depth_head_num_layers: int = 3
+    frozen_depth_loss_type: str = "scale_invariant"
+    frozen_depth_teacher: str = "geom_depth"  # "geom_depth" or "gt_features"
+    frozen_depth_gradient_weight: float = 0.0
+    frozen_depth_warmup_epochs: int = 0  # Curriculum: ramp FDH weight from 0→target over N epochs
+
+    # Frozen segmentation head supervision
+    frozen_seg_head_weight: float = 0.0
+    frozen_seg_head_path: str = ""
+    frozen_seg_head_type: str = "mlp"
+    frozen_seg_head_hidden_dim: int = 256
+    frozen_seg_head_num_layers: int = 3
+    frozen_seg_num_classes: int = 40
+    frozen_seg_loss_type: str = "kl"  # "kl" or "mse"
+    frozen_seg_temperature: float = 1.0
+
+    # SuperPoint feature type
+    feature_type: str = "superpoint"
+    descriptor_dim: int = 256  # SuperPoint descriptor dimension
+    detector_dim: int = 65  # SuperPoint detector logits dimension
+    detector_loss_weight: float = 1.0  # Weight for detector KL divergence loss
+    detector_loss_type: str = "kl"  # "kl" or "mse"
+    lr_output_head: float = 1e-4  # Learning rate for SuperPoint output heads
+    sp_head_hidden_dim: int = 256  # SuperPoint output head hidden dimension
+    sp_head_num_res_blocks: int = 2  # Number of residual blocks in SP output head
+    sp_head_use_3x3: bool = True  # Use 3x3 convs in SP output head
+    focal_cosine_gamma: float = 0.0  # Focal cosine loss gamma (0=disabled)
+
+    # Localization-guided SuperPoint training
+    localization_loss_weight: float = 0.0
+    localization_match_weight: float = 1.0
+    localization_reproj_weight: float = 0.5
+    localization_observability_weight: float = 0.02
+    localization_entropy_weight: float = 0.0
+    localization_keypoints: int = 256
+    localization_temperature: float = 0.07
+    localization_target_sigma_px: float = 2.0
+    localization_min_depth: float = 0.05
+    localization_max_depth: float = 20.0
+    localization_keypoint_threshold: float = 0.015
+    localization_nms_radius: int = 2
+    localization_perturb_trans_m: float = 0.10
+    localization_perturb_rot_deg: float = 5.0
+    sp_recon_aux_weight: float = 1.0
+    locability_prior_weight: float = 1.0
+    locability_sparsity_weight: float = 0.0
+    sp_use_locability_input: bool = False
+    geometry_unfreeze_epoch: int = -1
+    train_geometry_xyz: bool = False
+    train_geometry_opacity: bool = False
+    lr_geometry_xyz: float = 1e-5
+    lr_geometry_opacity: float = 5e-5
+    lr_locability: float = 1e-4
+    geometry_reg_weight: float = 0.0
+    max_train_batches_per_epoch: int = 0
+    max_val_batches_per_epoch: int = 0
+
+    # Best-checkpoint selection
+    best_metric: str = "cosine"  # cosine, localization, psnr, depth_gt, depth_geom, frozen_depth, seg_aux_miou, ground_query_acc, proxy_depth
+    best_metric_mode: str = "auto"  # auto, min, max
+
+    # Checkpointing
+    save_every: int = 10
+    save_periodic_every: int = 0  # Save epoch_XXX.pth every N epochs (0=disabled)
+    eval_every: int = 5
+    log_every: int = 100  # iterations
+    resume_from: str = ""  # Resume training from checkpoint (model + optimizer)
+    warmstart_from: str = ""  # Warmstart model weights only
+
+
+def config_to_dict(config: LocGSConfig) -> Dict[str, Any]:
+    """Convert config dataclass to a plain dict."""
+    return asdict(config)
+
+
+def _coerce_value(field_type: type, value: Any) -> Any:
+    """Coerce a parsed YAML value to the expected dataclass field type."""
+    if field_type is bool:
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes")
+        return bool(value)
+    return field_type(value)
+
+
+def load_config(yaml_path: str) -> LocGSConfig:
+    """Load a LocGSConfig from a YAML file.
+
+    Unknown keys in the YAML are silently ignored so that experiment
+    configs can carry extra metadata without breaking the loader.
+    """
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        raw: Dict[str, Any] = yaml.safe_load(f) or {}
+
+    valid_fields = {fld.name: fld for fld in fields(LocGSConfig)}
+    kwargs: Dict[str, Any] = {}
+    for key, value in raw.items():
+        if key in valid_fields:
+            kwargs[key] = _coerce_value(valid_fields[key].type, value)
+
+    return LocGSConfig(**kwargs)
+
+
+def save_config(config: LocGSConfig, path: str) -> None:
+    """Save a LocGSConfig to a YAML file."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(config_to_dict(config), f, default_flow_style=False, sort_keys=False)
+
+
+def override_from_args(
+    config: LocGSConfig, args: argparse.Namespace
+) -> LocGSConfig:
+    """Override config fields with non-None values from argparse.
+
+    Only fields that exist in both the config and the Namespace are
+    considered, so extra CLI flags (e.g. ``--config``) are harmless.
+    """
+    valid_fields = {fld.name: fld for fld in fields(LocGSConfig)}
+    updates = config_to_dict(config)
+    for key, value in vars(args).items():
+        if value is not None and key in valid_fields:
+            updates[key] = _coerce_value(valid_fields[key].type, value)
+    return LocGSConfig(**updates)
+
+
+# ---------------------------------------------------------------------------
+# Quick CLI: ``python -m loc_gs.config <yaml>`` prints the resolved config
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import json
+    import sys
+
+    parser = argparse.ArgumentParser(description="Print resolved LocGSConfig")
+    parser.add_argument("yaml", nargs="?", help="Path to YAML config file")
+    cli_args = parser.parse_args()
+
+    if cli_args.yaml:
+        cfg = load_config(cli_args.yaml)
+    else:
+        cfg = LocGSConfig()
+
+    print(json.dumps(config_to_dict(cfg), indent=2))

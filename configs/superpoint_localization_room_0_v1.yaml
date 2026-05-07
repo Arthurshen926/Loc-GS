@@ -1,0 +1,126 @@
+# SuperPoint Localization-Guided Hybrid Feature Field - room_0 - v3
+# Warmstarts from reconstruction-oriented v3, then optimizes soft matching,
+# reprojection pose proxy, locability, and staged xyz/opacity geometry updates.
+
+exp_name: "sp_gs_room0_localization_v3"
+output_dir: "/root/Loc-GS/output/sp_gs/room0_localization_v3"
+seed: 42
+warmstart_from: "/root/Loc-GS/output/sp_gs/room0_hybrid_v3/checkpoints/best.pth"
+
+scene: "room_0"
+scene_root: "/mnt/pool/sqy/dataset/room_0"
+ply_path: "/root/Loc-GS/output/3dgs_models/room_0/v8_fixed_poses_3dgs/point_cloud/iteration_30000/point_cloud.ply"
+
+feature_type: "superpoint"
+descriptor_dim: 256
+detector_dim: 65
+detector_loss_weight: 0.01
+detector_loss_type: "kl"
+
+architecture: "hybrid"
+hybrid_latent_dim: 48
+hash_levels: 16
+hash_features_per_level: 2
+hash_log2_size: 19
+hash_base_resolution: 16
+hash_max_resolution: 4096
+hash_output_dim: 96
+fine_dim: 192
+coarse_dim: 192
+hybrid_output_dim: 384
+hybrid_decoupled_heads: false
+hybrid_semantic_adaptor: false
+
+sp_head_hidden_dim: 512
+sp_head_num_res_blocks: 2
+sp_head_use_3x3: true
+sp_use_locability_input: true
+focal_cosine_gamma: 2.0
+
+bottleneck_dim: 64
+dual_stream: false
+train_mode: "decoded"
+use_refiner: false
+featsharp_mode: "analytical"
+featsharp_strength: 0.5
+
+image_height: 480
+image_width: 640
+fx: 320.0
+fy: 320.0
+cx: 319.5
+cy: 239.5
+feature_height: 60
+feature_width: 80
+max_channels_per_chunk: 32
+use_2dgs: false
+
+epochs: 8
+batch_size: 2
+lr_features: 5.0e-5
+lr_hash: 1.0e-4
+lr_decoder: 5.0e-5
+lr_heads: 5.0e-5
+lr_output_head: 5.0e-5
+lr_locability: 1.0e-4
+weight_decay: 1.0e-5
+grad_clip: 5.0
+warmup_epochs: 3
+scheduler: "cosine"
+
+l2_weight: 1.0
+cosine_weight: 1.0
+tv_weight: 0.005
+sp_recon_aux_weight: 1.0
+
+localization_loss_weight: 0.05
+localization_match_weight: 1.0
+localization_reproj_weight: 0.1
+localization_observability_weight: 0.005
+localization_entropy_weight: 0.0
+max_train_batches_per_epoch: 96
+max_val_batches_per_epoch: 120
+localization_keypoints: 64
+localization_temperature: 0.07
+localization_target_sigma_px: 2.0
+localization_min_depth: 0.05
+localization_max_depth: 20.0
+localization_keypoint_threshold: 0.015
+localization_nms_radius: 2
+localization_perturb_trans_m: 0.10
+localization_perturb_rot_deg: 5.0
+locability_prior_weight: 1.0
+locability_sparsity_weight: 0.001
+
+geometry_unfreeze_epoch: 100
+train_geometry_xyz: false
+train_geometry_opacity: false
+lr_geometry_xyz: 1.0e-5
+lr_geometry_opacity: 5.0e-5
+geometry_reg_weight: 10.0
+
+adaptor_weight: 0.0
+gradient_loss_weight: 0.0
+depth_guided_feature_weight: 0.0
+geometric_edge_loss_weight: 0.0
+boundary_aware_loss_weight: 0.0
+depth_loss_weight: 0.0
+geom_depth_loss_weight: 0.0
+seg_loss_weight: 0.0
+frozen_depth_head_weight: 0.0
+frozen_seg_head_weight: 0.0
+hybrid_semantic_aux_weight: 0.0
+
+feature_dir: "/root/Loc-GS/output/superpoint_features/room_0/Sequence_1"
+val_feature_dir: "/root/Loc-GS/output/superpoint_features/room_0/Sequence_2"
+train_split: "Sequence_1"
+val_split: "Sequence_2"
+mixed_split: true
+num_workers: 4
+
+best_metric: "localization"
+best_metric_mode: "min"
+save_every: 10
+save_periodic_every: 20
+eval_every: 2
+log_every: 50
