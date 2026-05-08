@@ -168,6 +168,7 @@ class DifferentiablePnPMatchLoss(nn.Module):
         self.min_depth = min_depth
         self.max_depth = max_depth
 
+    @torch.cuda.amp.autocast(enabled=False)
     def forward(
         self,
         query_descs: torch.Tensor,
@@ -182,13 +183,14 @@ class DifferentiablePnPMatchLoss(nn.Module):
     ) -> dict[str, torch.Tensor]:
         B, C, H, W = rendered_desc.shape
         P = H * W
-        dtype = rendered_desc.dtype
+        dtype = torch.float32
         K = K.to(device=rendered_desc.device, dtype=dtype)
         render_pose_w2c = render_pose_w2c.to(device=rendered_desc.device, dtype=dtype)
         gt_pose_w2c = gt_pose_w2c.to(device=rendered_desc.device, dtype=dtype)
 
         rendered_desc = F.normalize(rendered_desc.float(), p=2, dim=1)
         query_descs = F.normalize(query_descs.float(), p=2, dim=-1)
+        query_keypoints_yx = query_keypoints_yx.float()
         depth_map = depth_map.float()
 
         world_points, _grid_yx, valid_depth = unproject_dense_depth_to_world(

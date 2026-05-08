@@ -96,3 +96,37 @@ def test_match_target_uses_gt_pose_for_shifted_render_pose():
     )
 
     assert good["match"] < bad["match"]
+
+
+def test_differentiable_pnp_loss_handles_amp_half_inputs_on_cuda():
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda:0")
+    query_descs = F.normalize(torch.randn(1, 4, 8, device=device), dim=-1).half()
+    query_keypoints = torch.tensor(
+        [[[1.0, 1.0], [1.0, 2.0], [2.0, 1.0], [2.0, 2.0]]],
+        dtype=torch.float16,
+        device=device,
+    )
+    query_mask = torch.ones(1, 4, dtype=torch.bool, device=device)
+    rendered_desc = F.normalize(torch.randn(1, 8, 4, 4, device=device), dim=1).half().requires_grad_(True)
+    depth = torch.full((1, 4, 4), 4.0, device=device, dtype=torch.float16, requires_grad=True)
+    pose = torch.eye(4, device=device).unsqueeze(0).half()
+    K = torch.tensor(
+        [[4.0, 0.0, 1.5], [0.0, 4.0, 1.5], [0.0, 0.0, 1.0]],
+        dtype=torch.float16,
+        device=device,
+    )
+
+    out = DifferentiablePnPMatchLoss(temperature=0.2, pnp_iterations=1)(
+        query_descs=query_descs,
+        query_keypoints_yx=query_keypoints,
+        query_mask=query_mask,
+        rendered_desc=rendered_desc,
+        depth_map=depth,
+        render_pose_w2c=pose,
+        gt_pose_w2c=pose,
+        K=K,
+    )
+
+    assert torch.isfinite(out["total"])

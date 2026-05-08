@@ -110,6 +110,18 @@ def test_training_parser_exposes_sota_extension_options():
             "0.2",
             "--key_gaussian_isotropy_weight",
             "0.01",
+            "--external_match_supervision_weight",
+            "0.4",
+            "--external_match_pipeline",
+            "loftr",
+            "--external_match_cache_root",
+            "output/cache/matches",
+            "--detector_free_hard_negative_weight",
+            "0.2",
+            "--external_match_start_epoch",
+            "3",
+            "--grad_accum_steps",
+            "2",
         ]
     )
 
@@ -127,3 +139,9 @@ def test_training_parser_exposes_sota_extension_options():
     assert args.locability_ambiguity_weight == 0.3
     assert args.locability_budget_weight == 0.2
     assert args.key_gaussian_isotropy_weight == 0.01
+    assert args.external_match_supervision_weight == 0.4
+    assert args.external_match_pipeline == "loftr"
+    assert args.external_match_cache_root == "output/cache/matches"
+    assert args.detector_free_hard_negative_weight == 0.2
+    assert args.external_match_start_epoch == 3
+    assert args.grad_accum_steps == 2

@@ -26,6 +26,17 @@ from loc_gs.localization.hybrid_localizer import (
     sample_descriptors_bilinear,
     solve_pnp_ransac,
 )
+from loc_gs.localization.lightglue_matcher import (
+    lightglue_feature_name,
+    match_lightglue_descriptors,
+)
+from loc_gs.localization.matcher_registry import (
+    DENSE_MATCHERS,
+    DIM_PIPELINES,
+    SPARSE_MATCHERS,
+    resolve_sparse_dense_matchers,
+)
+from loc_gs.localization.rendered_keypoints import select_rendered_keypoints
 from loc_gs.localization.stdloc_parity import (
     apply_match_prior,
     coarse_to_fine_dense_matches,
@@ -113,10 +124,11 @@ def load_cambridge_rgb_no_resize(
 
 def resolve_matchers(args: argparse.Namespace) -> tuple[str, str]:
     """Resolve legacy --matcher into independently configurable sparse/dense matchers."""
-    legacy = getattr(args, "matcher", "topk")
-    sparse_matcher = getattr(args, "sparse_matcher", "") or legacy
-    dense_matcher = getattr(args, "dense_matcher", "") or legacy
-    return sparse_matcher, dense_matcher
+    return resolve_sparse_dense_matchers(
+        getattr(args, "matcher", "topk"),
+        getattr(args, "sparse_matcher", ""),
+        getattr(args, "dense_matcher", ""),
+    )
 
 
 @torch.no_grad()
@@ -154,6 +166,15 @@ def _load_pickle_tensor(path: Path) -> torch.Tensor:
         value = pickle.load(f)
     if isinstance(value, torch.Tensor):
         return value.detach().cpu()
+    if isinstance(value, dict):
+        for key in ("score_avg", "sampled_scores", "scores", "sampled_idx", "indices"):
+            tensor_value = value.get(key)
+            if tensor_value is None:
+                continue
+            if isinstance(tensor_value, torch.Tensor):
+                return tensor_value.detach().cpu()
+            return torch.as_tensor(tensor_value)
+        raise TypeError(f"Could not find a tensor-like entry in pickle dict: {path}")
     return torch.as_tensor(value)
 
 
@@ -494,6 +515,19 @@ def localize_one(
             use_mnn=args.mnn,
             topk=1,
         )
+    elif sparse_matcher in {"lightglue", "dim"}:
+        # LightGlue needs two 2D feature sets.  The global 3D landmark bank has no
+        # query-view 2D layout, so sparse initialization remains top-k and the
+        # learned matcher is applied in the rendered refinement stage.
+        q_ids, lm_ids, _scores = match_descriptors_topk(
+            query_desc,
+            landmark_desc,
+            topk=1,
+            threshold=args.sparse_match_threshold,
+            landmark_prior=landmark_prior,
+            prior_weight=args.locability_prior_weight,
+            second_best_margin=sparse_margin,
+        )
     else:
         q_ids, lm_ids, _scores = match_descriptors_topk(
             query_desc,
@@ -619,6 +653,85 @@ def localize_one(
             solver=args.solver,
             refine_poselib=refine_poselib,
         )
+        elif dense_matcher == "lightglue_rendered":
+            full_h = int(rgb.shape[-2])
+            full_w = int(rgb.shape[-1])
+            if full_renderer is not None:
+                full_render = render_hybrid_superpoint(
+                    model,
+                    sp_head,
+                    full_renderer,
+                    pose,
+                    descriptor_source=descriptor_source,
+                    ply_loc_feature_weight=ply_loc_feature_weight,
+                )
+                dense_desc_map = full_render["descriptor"][0]
+                dense_depth = full_render["depth"][0].float()
+                dense_loc_map = full_render["locability"]
+                rendered_detector = full_render["detector"][0]
+                dense_K = K_full
+                dense_renderer_K = full_renderer.K.float()
+                query_lg_yx = keypoints if query_keypoints_are_full_res else keypoints * 8.0
+                query_lg_map = F.normalize(upsample_feature_map(teacher_desc_raw, full_h, full_w), p=2, dim=0)
+                query_lg_desc = sample_descriptors_bilinear(query_lg_map, query_lg_yx)
+            else:
+                dense_desc_map = desc_map
+                dense_depth = render["depth"][0].float()
+                dense_loc_map = loc_map
+                rendered_detector = render["detector"][0]
+                dense_K = K_feature
+                dense_renderer_K = renderer.K.float()
+                query_lg_yx = keypoints / 8.0 if query_keypoints_are_full_res else keypoints
+                query_lg_desc = query_desc
+            try:
+                rendered_kpts = select_rendered_keypoints(
+                    dense_desc_map,
+                    source=args.rendered_keypoint_source,
+                    max_keypoints=args.lightglue_max_keypoints,
+                    threshold=args.dense_match_threshold,
+                    nms_radius=args.nms_radius,
+                    detector_logits=rendered_detector,
+                    locability=dense_loc_map,
+                )
+            except ValueError:
+                break
+            if rendered_kpts.keypoints_yx.shape[0] < 4 or query_lg_yx.shape[0] < 4:
+                break
+            q_dense, rendered_ids, _lg_scores = match_lightglue_descriptors(
+                query_lg_yx,
+                query_lg_desc,
+                rendered_kpts.keypoints_yx,
+                rendered_kpts.descriptors,
+                image_hw=tuple(int(v) for v in dense_depth.shape),
+                rendered_hw=tuple(int(v) for v in dense_depth.shape),
+                feature_name=lightglue_feature_name(args.dim_pipeline),
+                filter_threshold=args.lightglue_filter_threshold,
+            )
+            if rendered_ids.numel() < 4:
+                break
+            refined_render_yx = rendered_kpts.keypoints_yx[rendered_ids]
+            dense_points3d = unproject_positions_yx(
+                refined_render_yx,
+                dense_depth,
+                pose[0].float(),
+                dense_renderer_K,
+                pixel_center_offset=args.render_pixel_center_offset,
+            )
+            valid = torch.isfinite(dense_points3d).all(dim=-1)
+            if valid.sum() < 4:
+                break
+            dense_pose, dense_inliers = solve_pnp_ransac(
+                dense_points3d[valid].detach().cpu().numpy(),
+                (query_lg_yx[q_dense][valid] + dense_query_offset).detach().cpu().numpy(),
+                dense_K.detach().cpu().numpy(),
+                reprojection_error=dense_reprojection_error,
+                refine_reprojection_error=args.refine_reprojection_error,
+                confidence=args.pnp_confidence,
+                iterations=dense_pnp_iterations,
+                min_iterations=dense_pnp_min_iterations,
+                solver=args.solver,
+                refine_poselib=refine_poselib,
+            )
         else:
             if args.dense_full_render and full_renderer is not None:
                 full_render = render_hybrid_superpoint(
@@ -741,8 +854,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--locability_prior_weight", type=float, default=0.05)
     parser.add_argument("--dense_iters", type=int, default=2)
     parser.add_argument("--matcher", choices=["stdloc_parity", "topk"], default="topk")
-    parser.add_argument("--sparse_matcher", choices=["", "stdloc_parity", "topk"], default="")
-    parser.add_argument("--dense_matcher", choices=["", "stdloc_parity", "topk"], default="")
+    parser.add_argument("--sparse_matcher", choices=["", *SPARSE_MATCHERS], default="")
+    parser.add_argument("--dense_matcher", choices=["", *DENSE_MATCHERS], default="")
+    parser.add_argument("--dim_pipeline", choices=DIM_PIPELINES, default="superpoint+lightglue")
+    parser.add_argument("--rendered_keypoint_source", choices=["locability", "detector", "projected_gaussian"], default="locability")
+    parser.add_argument("--lightglue_max_keypoints", type=int, default=2048)
+    parser.add_argument("--lightglue_filter_threshold", type=float, default=0.1)
     parser.add_argument("--solver", choices=["poselib", "opencv"], default="opencv")
     parser.add_argument("--poselib_refine", action="store_true")
     parser.add_argument("--sparse_dual_softmax", action="store_true")
@@ -840,9 +957,9 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         cx=feature_intr["cx"],
         cy=feature_intr["cy"],
     ).to(device)
+    _, dense_matcher_name = resolve_matchers(args)
     full_renderer = None
-    if args.dense_full_render:
-        _, dense_matcher_name = resolve_matchers(args)
+    if args.dense_full_render or dense_matcher_name == "lightglue_rendered":
         use_stdloc_render = dense_matcher_name == "stdloc_parity"
         full_renderer = FeatureFieldRenderer(
             image_height=train_args["image_height"],
@@ -1035,6 +1152,10 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         "query_feature_source": args.query_feature_source,
         "descriptor_source": args.descriptor_source,
         "ply_loc_feature_weight": float(args.ply_loc_feature_weight),
+        "sparse_matcher": resolve_matchers(args)[0],
+        "dense_matcher": resolve_matchers(args)[1],
+        "dim_pipeline": args.dim_pipeline,
+        "rendered_keypoint_source": args.rendered_keypoint_source,
         "landmarks": int(landmark_xyz.shape[0]),
         "sparse": _summary(sparse_te, sparse_ae, sparse_inliers),
         "dense": _summary(dense_te, dense_ae, dense_inliers),

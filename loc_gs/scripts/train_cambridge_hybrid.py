@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from loc_gs.data.cambridge_dataset import CambridgeHybridDataset
+from loc_gs.data.external_match_cache import ExternalMatchCache
 from loc_gs.data.superpoint_cache import SuperPointTeacherCache
 from loc_gs.losses.cross_view import (
     DescriptorMemoryBank,
@@ -26,6 +27,7 @@ from loc_gs.losses.cross_view import (
     projective_view_overlap,
 )
 from loc_gs.losses.differentiable_pnp import DifferentiablePnPMatchLoss
+from loc_gs.losses.external_match import external_match_supervision_loss
 from loc_gs.losses.geometric_match import geometric_keypoint_match_loss
 from loc_gs.losses.landmark_selection import (
     descriptor_ambiguity_loss,
@@ -328,6 +330,99 @@ def select_pair_batch(
     }
 
 
+def _xy_to_feature_yx(
+    keypoints_xy: np.ndarray,
+    image_height: int,
+    image_width: int,
+    feature_height: int,
+    feature_width: int,
+) -> torch.Tensor:
+    keypoints_xy = np.asarray(keypoints_xy, dtype=np.float32)
+    if keypoints_xy.size == 0:
+        return torch.zeros(0, 2)
+    scale_y = float(feature_height) / max(float(image_height), 1.0)
+    scale_x = float(feature_width) / max(float(image_width), 1.0)
+    y = keypoints_xy[:, 1] * scale_y
+    x = keypoints_xy[:, 0] * scale_x
+    return torch.from_numpy(np.stack([y, x], axis=-1).astype(np.float32))
+
+
+def load_external_match_training_batch(
+    cache: ExternalMatchCache | None,
+    image_names: list[str],
+    pair_image_names: list[str],
+    image_height: int,
+    image_width: int,
+    feature_height: int,
+    feature_width: int,
+    max_matches: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor] | None:
+    if cache is None:
+        return None
+    positives_a: list[torch.Tensor] = []
+    positives_b: list[torch.Tensor] = []
+    positives_s: list[torch.Tensor] = []
+    negatives_b: list[torch.Tensor] = []
+    max_pos = 0
+    max_neg = 0
+    for image_a, image_b in zip(image_names, pair_image_names):
+        entry = cache.load_matches(image_a, image_b)
+        reversed_pair = False
+        if entry is None:
+            entry = cache.load_matches(image_b, image_a)
+            reversed_pair = entry is not None
+        if entry is None:
+            pos_a = torch.zeros(0, 2)
+            pos_b = torch.zeros(0, 2)
+            pos_s = torch.zeros(0)
+            neg_b = torch.zeros(0, 2)
+        else:
+            kpts_a = entry.kpts_b_xy if reversed_pair else entry.kpts_a_xy
+            kpts_b = entry.kpts_a_xy if reversed_pair else entry.kpts_b_xy
+            inliers = entry.geom_inlier_mask.astype(bool)
+            pos_a = _xy_to_feature_yx(kpts_a[inliers], image_height, image_width, feature_height, feature_width)
+            pos_b = _xy_to_feature_yx(kpts_b[inliers], image_height, image_width, feature_height, feature_width)
+            pos_s = torch.from_numpy(entry.scores[inliers].astype(np.float32))
+            neg_b = _xy_to_feature_yx(kpts_b[~inliers], image_height, image_width, feature_height, feature_width)
+            if pos_a.shape[0] > max_matches:
+                order = pos_s.argsort(descending=True)[:max_matches]
+                pos_a = pos_a[order]
+                pos_b = pos_b[order]
+                pos_s = pos_s[order]
+        positives_a.append(pos_a)
+        positives_b.append(pos_b)
+        positives_s.append(pos_s)
+        negatives_b.append(neg_b)
+        max_pos = max(max_pos, pos_a.shape[0])
+        max_neg = max(max_neg, neg_b.shape[0])
+    if max_pos == 0:
+        return None
+    B = len(image_names)
+    kpts_a = torch.zeros(B, max_pos, 2, device=device)
+    kpts_b = torch.zeros(B, max_pos, 2, device=device)
+    scores = torch.zeros(B, max_pos, device=device)
+    valid = torch.zeros(B, max_pos, device=device, dtype=torch.bool)
+    neg = torch.zeros(B, max(1, max_neg), 2, device=device)
+    for b in range(B):
+        n = positives_a[b].shape[0]
+        if n:
+            kpts_a[b, :n] = positives_a[b].to(device)
+            kpts_b[b, :n] = positives_b[b].to(device)
+            scores[b, :n] = positives_s[b].to(device)
+            valid[b, :n] = True
+        m = min(max(1, max_neg), negatives_b[b].shape[0])
+        if m:
+            neg[b, :m] = negatives_b[b][:m].to(device)
+    return {
+        "kpts_a_yx": kpts_a,
+        "kpts_b_yx": kpts_b,
+        "scores": scores,
+        "valid": valid,
+        "negative_kpts_b_yx": neg,
+    }
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train Cambridge hybrid hash+latent Loc-GS with differentiable matching/PnP")
     parser.add_argument("--scene", default="ShopFacade")
@@ -391,6 +486,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--hard_negative_exclusion_radius", type=float, default=1.0)
     parser.add_argument("--xview_depth_tolerance", type=float, default=0.2)
     parser.add_argument("--xview_depth_rel_tolerance", type=float, default=0.05)
+    parser.add_argument("--external_match_supervision_weight", type=float, default=0.0)
+    parser.add_argument("--external_match_pipeline", default="superpoint+lightglue")
+    parser.add_argument("--external_match_cache_root", default="")
+    parser.add_argument("--detector_free_hard_negative_weight", type=float, default=0.0)
+    parser.add_argument("--external_match_start_epoch", type=int, default=2)
     parser.add_argument("--landmark_budget", type=int, default=16384)
     parser.add_argument("--splatloc_saliency_prior_weight", type=float, default=0.0)
     parser.add_argument("--locability_ambiguity_weight", type=float, default=0.0)
@@ -409,6 +509,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--coarse_dim", type=int, default=128)
     parser.add_argument("--hybrid_output_dim", type=int, default=256)
     parser.add_argument("--save_every", type=int, default=1)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--amp", action="store_true")
     return parser
 
@@ -521,6 +622,14 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             scene=args.scene,
             split=cache_split,
         )
+    external_match_cache = None
+    if args.external_match_supervision_weight > 0.0:
+        external_match_cache = ExternalMatchCache(
+            args.external_match_cache_root or output_root,
+            scene=args.scene,
+            pipeline=args.external_match_pipeline,
+            split="train",
+        )
 
     pnp_loss_fn = DifferentiablePnPMatchLoss(
         temperature=args.pnp_temperature,
@@ -606,12 +715,14 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
 
         accum: dict[str, float] = {}
         pbar = tqdm(loader, desc=f"Cambridge hybrid E{epoch:03d}", dynamic_ncols=True)
+        grad_accum_steps = max(1, int(args.grad_accum_steps))
+        effective_batches = min(len(loader), args.max_train_batches or len(loader))
+        optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(pbar):
             if args.max_train_batches and step >= args.max_train_batches:
                 break
             rgb = batch["rgb"].to(device, non_blocking=True).float()
             pose = batch["pose_w2c"].to(device, non_blocking=True).float()
-            optimizer.zero_grad(set_to_none=True)
 
             with torch.no_grad():
                 image_names = [str(name) for name in batch["image_name"]]
@@ -709,6 +820,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     "hard_negative": pred_desc.new_tensor(0.0),
                     "valid_samples": pred_desc.new_tensor(0.0),
                 }
+                pair_batch = None
+                pair_render = None
                 if args.cross_view_weight > 0.0 and epoch >= args.xview_start_epoch:
                     pair_batch = select_pair_batch(
                         dataset,
@@ -771,6 +884,51 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                         depth_rel_tolerance=args.xview_depth_rel_tolerance,
                         alpha_threshold=args.same_view_alpha_threshold,
                     )
+                external_out = {
+                    "total": pred_desc.new_tensor(0.0),
+                    "positive": pred_desc.new_tensor(0.0),
+                    "hard_negative": pred_desc.new_tensor(0.0),
+                    "valid_matches": pred_desc.new_tensor(0.0),
+                }
+                if (
+                    args.external_match_supervision_weight > 0.0
+                    and epoch >= args.external_match_start_epoch
+                ):
+                    if pair_batch is None:
+                        pair_batch = select_pair_batch(
+                            dataset,
+                            batch["frame_idx"],
+                            model,
+                            renderer,
+                            args.view_pair_min_overlap,
+                            device,
+                        )
+                    if pair_render is None:
+                        pair_pose = pair_batch["pose_w2c"].to(device, non_blocking=True).float()
+                        pair_render = render_hybrid_superpoint(model, sp_head, renderer, pair_pose)
+                    match_batch = load_external_match_training_batch(
+                        external_match_cache,
+                        image_names,
+                        [str(name) for name in pair_batch["image_name"]],
+                        args.image_height,
+                        args.image_width,
+                        feature_height,
+                        feature_width,
+                        args.localization_keypoints,
+                        device,
+                    )
+                    if match_batch is not None:
+                        external_out = external_match_supervision_loss(
+                            gt_render["descriptor"],
+                            pair_render["descriptor"],
+                            kpts_a_yx=match_batch["kpts_a_yx"],
+                            kpts_b_yx=match_batch["kpts_b_yx"],
+                            scores=match_batch["scores"],
+                            valid_mask=match_batch["valid"],
+                            negative_kpts_b_yx=match_batch["negative_kpts_b_yx"],
+                            hard_negative_weight=args.detector_free_hard_negative_weight,
+                            temperature=args.pnp_temperature,
+                        )
 
                 center_ids = None
                 center_desc = None
@@ -829,6 +987,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     + args.locability_sparse_weight * locability_sparse
                     + args.geometry_reg_weight * geometry_reg
                     + args.cross_view_weight * xview_out["total"]
+                    + args.external_match_supervision_weight * external_out["total"]
                     + args.hard_negative_weight * memory_loss
                     + args.locability_budget_weight * loc_budget
                     + args.splatloc_saliency_prior_weight * saliency_loss
@@ -836,14 +995,17 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     + args.key_gaussian_isotropy_weight * isotropy_loss
                 )
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(
-                [p for group in optimizer.param_groups for p in group["params"] if p.requires_grad],
-                max_norm=10.0,
-            )
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.scale(loss / float(grad_accum_steps)).backward()
+            should_step = ((step + 1) % grad_accum_steps == 0) or ((step + 1) >= effective_batches)
+            if should_step:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(
+                    [p for group in optimizer.param_groups for p in group["params"] if p.requires_grad],
+                    max_norm=10.0,
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
             if center_desc is not None and center_ids is not None:
                 memory_bank.update(center_ids, center_desc.detach())
 
@@ -862,6 +1024,10 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "geometry_reg": float(geometry_reg.detach()),
                 "xview": float(xview_out["total"].detach()),
                 "xview_samples": float(xview_out["valid_samples"].detach()),
+                "external_match": float(external_out["total"].detach()),
+                "external_match_positive": float(external_out["positive"].detach()),
+                "external_match_hard_negative": float(external_out["hard_negative"].detach()),
+                "external_match_samples": float(external_out["valid_matches"].detach()),
                 "memory": float(memory_loss.detach()),
                 "loc_budget": float(loc_budget.detach()),
                 "saliency": float(saliency_loss.detach()),
@@ -872,7 +1038,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 accum[key] = accum.get(key, 0.0) + value
             pbar.set_postfix(loss=f"{metrics['loss']:.3f}", pose=f"{metrics['pose']:.3f}")
 
-        denom = max(1, min(len(loader), args.max_train_batches or len(loader)))
+        denom = max(1, effective_batches)
         epoch_metrics = {key: value / denom for key, value in accum.items()}
         print(f"[{time.strftime('%H:%M:%S')}] epoch {epoch}: {epoch_metrics}")
         with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as f:
