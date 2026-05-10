@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Optional
+import uuid
 
 import numpy as np
 import torch
@@ -58,7 +60,14 @@ class SuperPointTeacherCache:
         path = self.descriptor_path(image_name)
         if not path.exists():
             return None
-        payload = torch.load(path, map_location=map_location or "cpu")
+        try:
+            payload = torch.load(path, map_location=map_location or "cpu")
+        except Exception:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
         if isinstance(payload, dict):
             descriptor = payload["descriptor"]
             detector = payload["detector_logits"]
@@ -75,17 +84,43 @@ class SuperPointTeacherCache:
         keypoint_descriptors: Optional[torch.Tensor] = None,
     ) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        descriptor_path = self.descriptor_path(image_name)
+        tmp_descriptor_path = descriptor_path.with_name(
+            f"{descriptor_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         torch.save(
             {
                 "descriptor": descriptor.detach().cpu(),
                 "detector_logits": detector_logits.detach().cpu(),
             },
-            self.descriptor_path(image_name),
+            tmp_descriptor_path,
         )
-        np.save(self.score_path(image_name), superpoint_score_map_from_logits(detector_logits))
+        os.replace(tmp_descriptor_path, descriptor_path)
+
+        score_path = self.score_path(image_name)
+        tmp_score_path = score_path.with_name(f"{score_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        with tmp_score_path.open("wb") as f:
+            np.save(f, superpoint_score_map_from_logits(detector_logits))
+        os.replace(tmp_score_path, score_path)
         if keypoints is not None or keypoint_descriptors is not None:
+            self.save_metadata(image_name, keypoints, keypoint_descriptors, descriptor_dim=descriptor.shape[0])
+
+    def save_metadata(
+        self,
+        image_name: str,
+        keypoints: Optional[torch.Tensor] = None,
+        keypoint_descriptors: Optional[torch.Tensor] = None,
+        descriptor_dim: int = 256,
+    ) -> None:
+        """Write keypoint metadata without touching dense teacher cache files."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        metadata_path = self.metadata_path(image_name)
+        tmp_metadata_path = metadata_path.with_name(
+            f"{metadata_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        with tmp_metadata_path.open("wb") as f:
             np.savez(
-                self.metadata_path(image_name),
+                f,
                 keypoints=(
                     keypoints.detach().cpu().numpy()
                     if keypoints is not None
@@ -94,6 +129,7 @@ class SuperPointTeacherCache:
                 descriptors=(
                     keypoint_descriptors.detach().cpu().numpy()
                     if keypoint_descriptors is not None
-                    else np.zeros((0, descriptor.shape[0]), dtype=np.float32)
+                    else np.zeros((0, int(descriptor_dim)), dtype=np.float32)
                 ),
             )
+        os.replace(tmp_metadata_path, metadata_path)

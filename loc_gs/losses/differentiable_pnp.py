@@ -146,6 +146,7 @@ class DifferentiablePnPMatchLoss(nn.Module):
         locability_weight: float = 0.05,
         entropy_weight: float = 0.0,
         locability_prior_weight: float = 0.1,
+        locability_target_prior_weight: float = 0.0,
         target_sigma_px: float = 2.0,
         min_depth: float = 0.05,
         max_depth: float = 100.0,
@@ -164,6 +165,7 @@ class DifferentiablePnPMatchLoss(nn.Module):
         self.locability_weight = locability_weight
         self.entropy_weight = entropy_weight
         self.locability_prior_weight = locability_prior_weight
+        self.locability_target_prior_weight = locability_target_prior_weight
         self.target_sigma_px = target_sigma_px
         self.min_depth = min_depth
         self.max_depth = max_depth
@@ -180,6 +182,7 @@ class DifferentiablePnPMatchLoss(nn.Module):
         gt_pose_w2c: torch.Tensor,
         K: torch.Tensor,
         locability_map: Optional[torch.Tensor] = None,
+        locability_target_prior_map: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         B, C, H, W = rendered_desc.shape
         P = H * W
@@ -201,6 +204,36 @@ class DifferentiablePnPMatchLoss(nn.Module):
         depth_flat = depth_map.reshape(B, P)
         valid_pixels = valid_depth & (depth_flat >= self.min_depth) & (depth_flat <= self.max_depth)
 
+        target_pixels_yx, valid_target_proj = project_world_to_image_yx(world_points, gt_pose_w2c, K)
+        target_in_frame = (
+            (target_pixels_yx[..., 0] >= 0.0)
+            & (target_pixels_yx[..., 0] <= float(H - 1))
+            & (target_pixels_yx[..., 1] >= 0.0)
+            & (target_pixels_yx[..., 1] <= float(W - 1))
+        )
+        valid_target = valid_target_proj & target_in_frame
+        valid_target_pixels = valid_pixels & valid_target
+
+        image_diag = float((H * H + W * W) ** 0.5)
+        target_err = torch.linalg.norm(
+            target_pixels_yx[:, None, :, :] - query_keypoints_yx.float()[:, :, None, :],
+            dim=-1,
+        )
+        target_err = target_err.masked_fill(~valid_target_pixels[:, None, :], 1e4)
+        target_logits = -0.5 * (target_err / max(float(self.target_sigma_px), 1e-6)).square()
+        target_logits = target_logits.masked_fill(~valid_target_pixels[:, None, :], -1e4)
+        target_support_radius = max(float(self.target_sigma_px) * 3.0, 1.0)
+        has_target_pixels = (
+            (target_err <= target_support_radius) & valid_target_pixels[:, None, :]
+        ).any(dim=-1)
+        valid_queries = query_mask & has_target_pixels
+        geometry_target = F.softmax(target_logits, dim=-1)
+        geometry_target = torch.where(
+            valid_queries[:, :, None],
+            geometry_target,
+            torch.zeros_like(geometry_target),
+        )
+
         logits = torch.bmm(query_descs, rendered_desc.flatten(2))
         if locability_map is not None:
             loc = locability_map.float()
@@ -213,7 +246,7 @@ class DifferentiablePnPMatchLoss(nn.Module):
         probs = log_probs.exp()
 
         confidence = probs.max(dim=-1).values
-        pnp_weights = query_mask.float() * confidence.detach()
+        pnp_weights = valid_queries.float() * confidence.detach()
         expected_world = torch.bmm(probs, world_points)
         pose_w2c, pnp_residual = differentiable_pnp_gauss_newton(
             expected_world,
@@ -226,26 +259,6 @@ class DifferentiablePnPMatchLoss(nn.Module):
             max_translation_step=self.max_translation_step,
             max_rotation_step=self.max_rotation_step,
         )
-
-        target_pixels_yx, valid_target_proj = project_world_to_image_yx(world_points, gt_pose_w2c, K)
-        target_in_frame = (
-            (target_pixels_yx[..., 0] >= 0.0)
-            & (target_pixels_yx[..., 0] <= float(H - 1))
-            & (target_pixels_yx[..., 1] >= 0.0)
-            & (target_pixels_yx[..., 1] <= float(W - 1))
-        )
-        valid_target = valid_target_proj & target_in_frame
-        image_diag = float((H * H + W * W) ** 0.5)
-        target_err = torch.linalg.norm(
-            target_pixels_yx[:, None, :, :] - query_keypoints_yx.float()[:, :, None, :],
-            dim=-1,
-        )
-        target_err = target_err.masked_fill(~valid_target[:, None, :], 1e4)
-        target_logits = -0.5 * (target_err / max(float(self.target_sigma_px), 1e-6)).square()
-        target_logits = target_logits.masked_fill(~valid_pixels[:, None, :], -1e4)
-        geometry_target = F.softmax(target_logits, dim=-1)
-
-        valid_queries = query_mask & valid_pixels.any(dim=1, keepdim=True).expand_as(query_mask)
         denom = valid_queries.float().sum().clamp_min(1.0)
         match_loss = -((geometry_target.detach() * log_probs).sum(dim=-1) * valid_queries.float()).sum() / denom
 
@@ -257,14 +270,18 @@ class DifferentiablePnPMatchLoss(nn.Module):
 
         pred_c2w = torch.linalg.inv(pose_w2c)
         gt_c2w = torch.linalg.inv(gt_pose_w2c)
-        translation_loss = torch.linalg.norm(pred_c2w[:, :3, 3] - gt_c2w[:, :3, 3], dim=-1).mean()
+        valid_pose = valid_queries.float().sum(dim=1) >= 4
+        valid_pose_count = valid_pose.float().sum().clamp_min(1.0)
+        translation_per_batch = torch.linalg.norm(pred_c2w[:, :3, 3] - gt_c2w[:, :3, 3], dim=-1)
         rel_rot = pose_w2c[:, :3, :3] @ gt_c2w[:, :3, :3]
         cos_angle = ((rel_rot.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - 1.0) * 0.5).clamp(-1.0, 1.0)
-        rotation_loss = (1.0 - cos_angle).mean()
+        rotation_per_batch = 1.0 - cos_angle
+        translation_loss = (translation_per_batch * valid_pose.float()).sum() / valid_pose_count
+        rotation_loss = (rotation_per_batch * valid_pose.float()).sum() / valid_pose_count
         pose_loss = translation_loss + rotation_loss
 
         obs = projection_jacobian_observability(world_points, gt_pose_w2c, K, self.min_depth)
-        obs = obs.masked_fill(~(valid_pixels & valid_target), 0.0)
+        obs = obs.masked_fill(~valid_target_pixels, 0.0)
         obs = obs / obs.amax(dim=1, keepdim=True).clamp_min(1e-6)
         observability_loss = -((probs * obs[:, None, :]).sum(dim=-1) * valid_queries.float()).sum() / denom
 
@@ -277,13 +294,27 @@ class DifferentiablePnPMatchLoss(nn.Module):
                 probs.detach() * torch.exp(-target_err.detach() / max(float(self.target_sigma_px), 1e-6))
             ).sum(dim=1)
             inlier_support = inlier_support / inlier_support.amax(dim=1, keepdim=True).clamp_min(1e-6)
+            if locability_target_prior_map is not None and self.locability_target_prior_weight > 0.0:
+                target_prior = locability_target_prior_map.float()
+                if target_prior.shape[-2:] != (H, W):
+                    target_prior = F.interpolate(
+                        target_prior,
+                        size=(H, W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                target_prior = target_prior.flatten(2).squeeze(1).clamp(0.0, 1.0)
+                target_prior = target_prior / target_prior.amax(dim=1, keepdim=True).clamp_min(1e-6)
+                mix = min(max(float(self.locability_target_prior_weight), 0.0), 1.0)
+                inlier_support = inlier_support * ((1.0 - mix) + mix * target_prior)
             loc = locability_map.float()
             if loc.shape[-2:] != (H, W):
                 loc = F.interpolate(loc, size=(H, W), mode="bilinear", align_corners=False)
-            locability_loss = F.binary_cross_entropy(
-                loc.flatten(2).squeeze(1).clamp(1e-4, 1.0 - 1e-4),
-                inlier_support.clamp(0.0, 1.0),
-            )
+            with torch.cuda.amp.autocast(enabled=False):
+                locability_loss = F.binary_cross_entropy(
+                    loc.flatten(2).squeeze(1).clamp(1e-4, 1.0 - 1e-4).float(),
+                    inlier_support.clamp(0.0, 1.0).float(),
+                )
 
         total = (
             self.pose_weight * pose_loss

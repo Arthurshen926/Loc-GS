@@ -86,7 +86,11 @@ def geometric_keypoint_match_loss(
         if loc.shape[-2:] != (H, W):
             loc = F.interpolate(loc, size=(H, W), mode="bilinear", align_corners=False)
         loc = loc.flatten(2).squeeze(1).clamp(1e-4, 1.0 - 1e-4)
-        locability_loss = F.binary_cross_entropy(loc, support.clamp(0.0, 1.0))
+        with torch.cuda.amp.autocast(enabled=False):
+            locability_loss = F.binary_cross_entropy(
+                loc.float(),
+                support.clamp(0.0, 1.0).float(),
+            )
 
     total = match_loss + float(locability_weight) * locability_loss
     return {

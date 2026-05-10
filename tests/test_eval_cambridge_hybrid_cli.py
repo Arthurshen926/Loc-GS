@@ -6,7 +6,14 @@ import torch
 
 from loc_gs.localization.stdloc_parity import DenseMatchResult
 from loc_gs.scripts import eval_cambridge_hybrid
-from loc_gs.scripts.eval_cambridge_hybrid import build_argparser, select_view_landmark_indices
+from loc_gs.scripts.eval_cambridge_hybrid import (
+    build_argparser,
+    effective_eval_config,
+    prepare_query_teacher_maps,
+    select_pnp_match_indices,
+    select_view_landmark_indices,
+    sparse_matchability_metrics,
+)
 
 
 def test_load_pickle_tensor_accepts_stdloc_score_dict(tmp_path):
@@ -72,6 +79,8 @@ def test_eval_parser_exposes_stdloc_parity_options():
             "per_view_spatial",
             "--landmark_source",
             "stdloc_detector",
+            "--landmark_candidate_source",
+            "all_gaussians",
             "--stdloc_detector_dir",
             "output/stdloc/map_cambridge_spgs/ShopFacade/detector",
             "--query_detector",
@@ -86,10 +95,27 @@ def test_eval_parser_exposes_stdloc_parity_options():
             "128",
             "--landmark_view_grid_size",
             "2",
+            "--landmark_score_mode",
+            "matchability",
+            "--landmark_score_visibility_weight",
+            "0.25",
+            "--landmark_score_legacy_keep_ratio",
+            "0.75",
+            "--landmark_score_spatial_grid_size",
+            "4",
+            "--landmark_score_prior_blend",
+            "0.2",
             "--descriptor_source",
             "hybrid_ply_blend",
             "--ply_loc_feature_weight",
             "0.75",
+            "--matchability_diagnostics",
+            "--pnp_prefilter",
+            "image_xyz_grid",
+            "--sparse_pnp_max_matches",
+            "512",
+            "--dense_pnp_max_matches",
+            "4096",
         ]
     )
 
@@ -113,6 +139,7 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert args.sparse_reprojection_error == 2
     assert args.dense_reprojection_error == 12
     assert args.landmark_source == "stdloc_detector"
+    assert args.landmark_candidate_source == "all_gaussians"
     assert args.stdloc_detector_dir == "output/stdloc/map_cambridge_spgs/ShopFacade/detector"
     assert args.query_detector == "stdloc"
     assert args.query_feature_source == "original"
@@ -121,8 +148,120 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert args.landmark_selection == "per_view_spatial"
     assert args.landmark_per_view_quota == 128
     assert args.landmark_view_grid_size == 2
+    assert args.landmark_score_mode == "matchability"
+    assert args.landmark_score_visibility_weight == 0.25
+    assert args.landmark_score_legacy_keep_ratio == 0.75
+    assert args.landmark_score_spatial_grid_size == 4
+    assert args.landmark_score_prior_blend == 0.2
     assert args.descriptor_source == "hybrid_ply_blend"
     assert args.ply_loc_feature_weight == 0.75
+    assert args.matchability_diagnostics is True
+    assert args.pnp_prefilter == "image_xyz_grid"
+    assert args.sparse_pnp_max_matches == 512
+    assert args.dense_pnp_max_matches == 4096
+
+    config = effective_eval_config(args)
+    assert config["sparse_reprojection_error"] == 2.0
+    assert config["dense_reprojection_error"] == 12.0
+    assert config["solver"] == "poselib"
+    assert config["dense_full_render"] is False
+    assert config["pnp_prefilter"] == "image_xyz_grid"
+    assert config["sparse_pnp_max_matches"] == 512
+    assert config["dense_pnp_max_matches"] == 4096
+
+
+def test_effective_eval_config_uses_global_reprojection_when_specific_values_absent():
+    args = build_argparser().parse_args(
+        [
+            "--checkpoint",
+            "output/model/latest.pth",
+            "--matcher",
+            "stdloc_parity",
+            "--reprojection_error",
+            "8",
+        ]
+    )
+
+    config = effective_eval_config(args)
+
+    assert config["sparse_matcher"] == "stdloc_parity"
+    assert config["dense_matcher"] == "stdloc_parity"
+    assert config["sparse_reprojection_error"] == 8.0
+    assert config["dense_reprojection_error"] == 8.0
+
+
+def test_parser_accepts_matchability_prior_mode():
+    args = build_argparser().parse_args(
+        [
+            "--checkpoint",
+            "output/model/latest.pth",
+            "--landmark_score_mode",
+            "matchability_prior",
+        ]
+    )
+
+    assert args.landmark_score_mode == "matchability_prior"
+
+
+def test_prepare_query_teacher_maps_resizes_detector_with_descriptor():
+    desc = torch.randn(1, 4, 6, 8)
+    det = torch.randn(1, 65, 6, 8)
+
+    raw, desc_grid, det_grid = prepare_query_teacher_maps(desc, det, feature_height=3, feature_width=4)
+
+    assert raw.shape == (4, 6, 8)
+    assert desc_grid.shape == (4, 3, 4)
+    assert det_grid.shape == (65, 3, 4)
+    assert torch.allclose(desc_grid.norm(dim=0), torch.ones(3, 4), atol=1e-5)
+
+
+def test_sparse_matchability_metrics_reports_gt_reprojection_inliers():
+    K = np.eye(3, dtype=np.float64)
+    K[0, 0] = 100.0
+    K[1, 1] = 100.0
+    pose = np.eye(4, dtype=np.float64)
+    xyz = np.array([[0.0, 0.0, 10.0], [0.1, 0.0, 10.0], [1.0, 0.0, 10.0]])
+    query_yx = np.array([[0.0, 0.0], [0.0, 1.5], [0.0, 25.0]])
+
+    metrics = sparse_matchability_metrics(
+        query_yx,
+        xyz,
+        pose,
+        K,
+        scores=np.array([0.9, 0.8, 0.1]),
+        margins=np.array([0.2, 0.1, 0.01]),
+    )
+
+    assert metrics["sparse_match_count"] == 3.0
+    assert metrics["sparse_valid_match_count"] == 3.0
+    assert metrics["sparse_inlier_2px"] == 2 / 3
+    assert metrics["sparse_inlier_5px"] == 2 / 3
+    assert metrics["sparse_inlier_8px"] == 2 / 3
+    assert metrics["sparse_match_score_mean"] == np.mean([0.9, 0.8, 0.1])
+    assert metrics["sparse_top2_margin_median"] == 0.1
+
+
+def test_sparse_matchability_metrics_reports_pose_information_for_four_points():
+    K = np.eye(3, dtype=np.float64)
+    K[0, 0] = 100.0
+    K[1, 1] = 100.0
+    pose = np.eye(4, dtype=np.float64)
+    xyz = np.array(
+        [
+            [0.0, 0.0, 10.0],
+            [0.2, 0.0, 10.0],
+            [0.0, 0.2, 10.5],
+            [0.2, 0.2, 11.0],
+        ],
+        dtype=np.float64,
+    )
+    query_yx = eval_cambridge_hybrid.project_world_points_yx_np(xyz, pose, K)
+
+    metrics = sparse_matchability_metrics(query_yx, xyz, pose, K)
+
+    assert np.isfinite(metrics["sparse_xyz_cov_logdet"])
+    assert np.isfinite(metrics["sparse_all_pose_info_logdet"])
+    assert metrics["sparse_inlier8_pose_info_min_eig"] > 0.0
 
 
 def test_select_view_landmark_indices_enforces_spatial_diversity_before_topup():
@@ -140,6 +279,47 @@ def test_select_view_landmark_indices_enforces_spatial_diversity_before_topup():
     )
 
     assert selected.tolist() == [0, 2]
+
+
+def test_select_pnp_match_indices_can_keep_spatially_diverse_high_scores():
+    query_yx = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [10.0, 10.0],
+            [10.0, 11.0],
+        ],
+        dtype=torch.float32,
+    )
+    points3d = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.1, 0.0, 1.0],
+            [10.0, 0.0, 1.0],
+            [10.1, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    scores = torch.tensor([0.99, 0.98, 0.40, 0.39], dtype=torch.float32)
+
+    score_only = select_pnp_match_indices(
+        query_yx,
+        points3d,
+        scores=scores,
+        max_matches=2,
+        mode="score",
+    )
+    balanced = select_pnp_match_indices(
+        query_yx,
+        points3d,
+        scores=scores,
+        max_matches=2,
+        mode="image_grid",
+        image_grid_size=2,
+    )
+
+    assert score_only.tolist() == [0, 1]
+    assert balanced.tolist() == [0, 2]
 
 
 def test_localize_one_stdloc_dense_branch_unprojects_dense_matches(monkeypatch):

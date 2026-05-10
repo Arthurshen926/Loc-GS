@@ -30,10 +30,13 @@ from loc_gs.losses.differentiable_pnp import DifferentiablePnPMatchLoss
 from loc_gs.losses.external_match import external_match_supervision_loss
 from loc_gs.losses.geometric_match import geometric_keypoint_match_loss
 from loc_gs.losses.landmark_selection import (
+    depth_consistency_score,
     descriptor_ambiguity_loss,
+    geometric_mean_score,
     key_gaussian_isotropy_loss,
     locability_budget_loss,
     splatloc_saliency_prior,
+    superpoint_detector_saliency,
 )
 from loc_gs.losses.localization_loss import prepare_superpoint_queries
 from loc_gs.models.hybrid_gaussian import HybridFeatureGaussian, SuperPointOutputHead
@@ -159,6 +162,24 @@ def perturb_pose_batch(
     return out
 
 
+def scheduled_loss_weight(
+    epoch: int,
+    base_weight: float,
+    start_epoch: int = 1,
+    warmup_epochs: int = 1,
+) -> float:
+    """Linearly enable a loss after a start epoch."""
+    weight = float(base_weight)
+    if weight == 0.0:
+        return 0.0
+    start = max(1, int(start_epoch))
+    if int(epoch) < start:
+        return 0.0
+    warmup = max(1, int(warmup_epochs))
+    progress = (int(epoch) - start + 1) / float(warmup)
+    return weight * min(max(progress, 0.0), 1.0)
+
+
 def default_ply_path(output_root: Path, scene: str) -> Path:
     return output_root / "stdloc" / "map_cambridge_spgs" / scene / "point_cloud" / "iteration_30000" / "point_cloud.ply"
 
@@ -222,12 +243,44 @@ def render_hybrid_superpoint(
     }
 
 
+def locability_target_prior_from_render(
+    render: dict[str, torch.Tensor],
+    detector_weight: float,
+    alpha_weight: float,
+    depth_weight: float,
+    depth_window: int = 3,
+) -> torch.Tensor | None:
+    weights = {
+        "detector": float(detector_weight),
+        "alpha": float(alpha_weight),
+        "depth": float(depth_weight),
+    }
+    if max(weights.values()) <= 0.0:
+        return None
+    detector = render.get("detector")
+    depth = render.get("depth")
+    alpha = render.get("alpha")
+    if detector is None or depth is None or alpha is None:
+        return None
+    chunks = []
+    for idx in range(detector.shape[0]):
+        valid = torch.isfinite(depth[idx]) & (depth[idx] > 0.05) & (alpha[idx].float() > 0.0)
+        components = {
+            "detector": superpoint_detector_saliency(detector[idx]),
+            "alpha": alpha[idx].float().clamp(0.0, 1.0),
+            "depth": depth_consistency_score(depth[idx].float(), valid=valid, window_size=depth_window),
+        }
+        chunks.append(geometric_mean_score(components, weights))
+    return torch.stack(chunks, dim=0).unsqueeze(1)
+
+
 @torch.no_grad()
 def extract_superpoint_teacher_batch(
     teacher: SuperPointNet,
     rgb: torch.Tensor,
     image_names: list[str],
     cache: SuperPointTeacherCache | None = None,
+    expected_hw: tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[bool]]:
     loaded_desc = []
     loaded_det = []
@@ -244,7 +297,19 @@ def extract_superpoint_teacher_batch(
                 loaded_desc.append(entry.descriptor.to(rgb.device))
                 loaded_det.append(entry.detector_logits.to(rgb.device))
     if cache is not None and all(loaded_flags):
-        return torch.stack(loaded_desc, dim=0), torch.stack(loaded_det, dim=0), loaded_flags
+        desc_shape = tuple(loaded_desc[0].shape)
+        det_shape = tuple(loaded_det[0].shape)
+        shapes_match = all(
+            tuple(desc.shape) == desc_shape and tuple(det.shape) == det_shape
+            for desc, det in zip(loaded_desc, loaded_det)
+        )
+        expected_match = True
+        if expected_hw is not None:
+            expected = tuple(int(v) for v in expected_hw)
+            expected_match = desc_shape[-2:] == expected and det_shape[-2:] == expected
+        if shapes_match and expected_match:
+            return torch.stack(loaded_desc, dim=0), torch.stack(loaded_det, dim=0), loaded_flags
+        loaded_flags = [False for _ in image_names]
 
     desc, det = teacher(superpoint_gray(rgb))
     if cache is not None:
@@ -267,12 +332,11 @@ def maybe_write_superpoint_metadata(
         return
     for i, name in enumerate(image_names):
         if not cache.metadata_path(name).exists():
-            cache.save(
+            cache.save_metadata(
                 name,
-                teacher_desc[i],
-                teacher_det[i],
                 keypoints=query_keypoints[i],
                 keypoint_descriptors=query_descs[i],
+                descriptor_dim=query_descs.shape[-1],
             )
 
 
@@ -451,8 +515,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--lr_locability", type=float, default=1e-4)
     parser.add_argument("--lr_xyz", type=float, default=2e-6)
     parser.add_argument("--lr_opacity", type=float, default=1e-5)
+    parser.add_argument("--lr_scaling", type=float, default=5e-7)
     parser.add_argument("--train_xyz", action="store_true")
     parser.add_argument("--train_opacity", action="store_true")
+    parser.add_argument("--train_scaling", action="store_true")
     parser.add_argument("--freeze_feature_field", action="store_true")
     parser.add_argument("--freeze_superpoint_head", action="store_true")
     parser.add_argument("--geometry_unfreeze_epoch", type=int, default=3)
@@ -460,6 +526,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--sp_recon_weight", type=float, default=0.05)
     parser.add_argument("--detector_recon_weight", type=float, default=0.005)
     parser.add_argument("--pnp_weight", type=float, default=1.0)
+    parser.add_argument("--pnp_start_epoch", type=int, default=1)
+    parser.add_argument("--pnp_warmup_epochs", type=int, default=1)
     parser.add_argument("--pnp_temperature", type=float, default=0.07)
     parser.add_argument("--pnp_target_sigma_px", type=float, default=2.0)
     parser.add_argument("--pnp_pose_loss_weight", type=float, default=1.0)
@@ -469,6 +537,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--pnp_observability_loss_weight", type=float, default=0.02)
     parser.add_argument("--pnp_locability_loss_weight", type=float, default=0.05)
     parser.add_argument("--pnp_locability_prior_weight", type=float, default=0.1)
+    parser.add_argument("--pnp_locability_target_prior_weight", type=float, default=0.0)
+    parser.add_argument("--locability_target_detector_weight", type=float, default=1.0)
+    parser.add_argument("--locability_target_alpha_weight", type=float, default=0.25)
+    parser.add_argument("--locability_target_depth_weight", type=float, default=0.5)
+    parser.add_argument("--locability_target_depth_window", type=int, default=3)
     parser.add_argument("--same_view_match_weight", type=float, default=0.0)
     parser.add_argument("--same_view_locability_weight", type=float, default=0.0)
     parser.add_argument("--same_view_temperature", type=float, default=0.07)
@@ -578,12 +651,18 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     )
     model.load_from_ply(str(ply_path))
     model = model.to(device)
-    if args.train_xyz or args.train_opacity:
-        model.enable_geometry_training(train_xyz=args.train_xyz, train_opacity=args.train_opacity)
+    if args.train_xyz or args.train_opacity or args.train_scaling:
+        model.enable_geometry_training(
+            train_xyz=args.train_xyz,
+            train_opacity=args.train_opacity,
+            train_scaling=args.train_scaling,
+        )
         model._xyz.requires_grad_(False) if args.train_xyz else None
         model._opacity.requires_grad_(False) if args.train_opacity else None
+        model._scaling.requires_grad_(False) if args.train_scaling else None
     xyz0 = model.get_xyz().detach().clone()
     opacity0 = model.get_opacity_logits().detach().clone()
+    scaling0 = model._scaling.detach().clone()
 
     sp_head = SuperPointOutputHead(
         fused_dim=args.hybrid_output_dim,
@@ -641,6 +720,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         observability_weight=args.pnp_observability_loss_weight,
         locability_weight=args.pnp_locability_loss_weight,
         locability_prior_weight=args.pnp_locability_prior_weight,
+        locability_target_prior_weight=args.pnp_locability_target_prior_weight,
     ).to(device)
     def trainable_params(params):
         return [param for param in params if param.requires_grad]
@@ -669,6 +749,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         params.append({"params": [model._xyz], "lr": args.lr_xyz})
     if args.train_opacity:
         params.append({"params": [model._opacity], "lr": args.lr_opacity})
+    if args.train_scaling:
+        params.append({"params": [model._scaling], "lr": args.lr_scaling})
     if not params:
         raise ValueError("No trainable parameters remain after applying freeze flags")
     optimizer = torch.optim.AdamW(params, weight_decay=1e-5)
@@ -712,14 +794,21 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             model._xyz.requires_grad_(True)
         if args.train_opacity and epoch >= args.geometry_unfreeze_epoch:
             model._opacity.requires_grad_(True)
+        if args.train_scaling and epoch >= args.geometry_unfreeze_epoch:
+            model._scaling.requires_grad_(True)
 
-        accum: dict[str, float] = {}
-        pbar = tqdm(loader, desc=f"Cambridge hybrid E{epoch:03d}", dynamic_ncols=True)
         grad_accum_steps = max(1, int(args.grad_accum_steps))
         effective_batches = min(len(loader), args.max_train_batches or len(loader))
+        accum: dict[str, float] = {}
+        pbar = tqdm(
+            loader,
+            desc=f"Cambridge hybrid E{epoch:03d}",
+            total=effective_batches,
+            dynamic_ncols=True,
+        )
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(pbar):
-            if args.max_train_batches and step >= args.max_train_batches:
+            if step >= effective_batches:
                 break
             rgb = batch["rgb"].to(device, non_blocking=True).float()
             pose = batch["pose_w2c"].to(device, non_blocking=True).float()
@@ -739,6 +828,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     teacher_rgb,
                     image_names,
                     cache=sp_cache,
+                    expected_hw=(teacher_rgb.shape[-2] // 8, teacher_rgb.shape[-1] // 8),
                 )
                 teacher_desc, teacher_det = resize_teacher_outputs_to_feature_grid(
                     teacher_desc,
@@ -797,6 +887,15 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
 
                 loc_pose = perturb_pose_batch(pose, args.pose_noise_trans_m, args.pose_noise_rot_deg).detach()
                 loc_render = render_hybrid_superpoint(model, sp_head, renderer, loc_pose)
+                locability_target_prior = None
+                if args.pnp_locability_target_prior_weight > 0.0:
+                    locability_target_prior = locability_target_prior_from_render(
+                        loc_render,
+                        detector_weight=args.locability_target_detector_weight,
+                        alpha_weight=args.locability_target_alpha_weight,
+                        depth_weight=args.locability_target_depth_weight,
+                        depth_window=args.locability_target_depth_window,
+                    )
                 pnp_out = pnp_loss_fn(
                     query_descs=query_descs,
                     query_keypoints_yx=query_keypoints,
@@ -807,6 +906,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     gt_pose_w2c=pose,
                     K=renderer.K.float(),
                     locability_map=loc_render["locability"],
+                    locability_target_prior_map=locability_target_prior,
                 )
 
                 locability_sparse = (
@@ -851,6 +951,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                                 pair_teacher_rgb,
                                 pair_image_names,
                                 cache=sp_cache,
+                                expected_hw=(pair_teacher_rgb.shape[-2] // 8, pair_teacher_rgb.shape[-1] // 8),
                             )
                             pair_teacher_desc, _pair_teacher_det = resize_teacher_outputs_to_feature_grid(
                                 pair_teacher_desc,
@@ -957,7 +1058,11 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 saliency_loss = pred_desc.new_tensor(0.0)
                 if saliency_prior is not None and args.splatloc_saliency_prior_weight > 0.0:
                     loc_flat = model.get_locability().squeeze(-1).clamp(1e-4, 1.0 - 1e-4)
-                    saliency_loss = F.binary_cross_entropy(loc_flat, saliency_prior.to(loc_flat.device))
+                    with torch.cuda.amp.autocast(enabled=False):
+                        saliency_loss = F.binary_cross_entropy(
+                            loc_flat.float(),
+                            saliency_prior.to(loc_flat.device).float(),
+                        )
                 ambiguity_loss = pred_desc.new_tensor(0.0)
                 if (
                     args.locability_ambiguity_weight > 0.0
@@ -978,9 +1083,17 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     geometry_reg = geometry_reg + F.mse_loss(model.get_xyz(), xyz0)
                 if args.train_opacity:
                     geometry_reg = geometry_reg + F.mse_loss(model.get_opacity_logits(), opacity0)
+                if args.train_scaling:
+                    geometry_reg = geometry_reg + F.mse_loss(model._scaling, scaling0)
 
+                active_pnp_weight = scheduled_loss_weight(
+                    epoch,
+                    args.pnp_weight,
+                    start_epoch=args.pnp_start_epoch,
+                    warmup_epochs=args.pnp_warmup_epochs,
+                )
                 loss = (
-                    args.pnp_weight * pnp_out["total"]
+                    active_pnp_weight * pnp_out["total"]
                     + args.same_view_match_weight * same_match["total"]
                     + args.sp_recon_weight * sp_recon
                     + args.detector_recon_weight * det_recon
@@ -1011,12 +1124,15 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
 
             metrics = {
                 "loss": float(loss.detach()),
+                "pnp_weight": float(active_pnp_weight),
                 "pnp": float(pnp_out["total"].detach()),
                 "pose": float(pnp_out["pose"].detach()),
                 "match": float(pnp_out["match"].detach()),
                 "quality": float(pnp_out["quality"].detach()),
+                "pnp_valid_queries": float(pnp_out["valid_queries"].detach()),
                 "same_match": float(same_match["match"].detach()),
                 "same_top1_1px": float(same_match["top1_1px"].detach()),
+                "same_valid_queries": float(same_match["valid_queries"].detach()),
                 "same_locability": float(same_match["locability"].detach()),
                 "sp_recon": float(sp_recon.detach()),
                 "det_recon": float(det_recon.detach()),

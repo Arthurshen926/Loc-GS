@@ -47,6 +47,21 @@ def test_match_correlation_matrix_can_use_dual_softmax_mnn_and_prior():
     assert r_ids.tolist() == [1]
 
 
+def test_match_correlation_matrix_filters_ambiguous_top1_by_second_best_margin():
+    corr = torch.tensor([[[0.90, 0.89, 0.10], [0.80, 0.20, 0.10]]])
+
+    _b_ids, q_ids, r_ids, scores = match_correlation_matrix(
+        corr,
+        threshold=0.0,
+        topk=1,
+        second_best_margin=0.05,
+    )
+
+    assert q_ids.tolist() == [1]
+    assert r_ids.tolist() == [0]
+    assert torch.allclose(scores, torch.tensor([0.80]))
+
+
 def test_soft_argmax_offsets_recovers_window_expectation():
     scores = torch.full((1, 4), -4.0)
     scores[0, 3] = 4.0

@@ -32,6 +32,7 @@ def apply_match_prior(
 def mnn_match(
     corr_matrix: torch.Tensor,
     threshold: float = -1.0,
+    second_best_margin: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return mutual-nearest-neighbor matches from [B, N, M] scores."""
     if corr_matrix.dim() != 3:
@@ -39,6 +40,11 @@ def mnn_match(
     row_best = corr_matrix == corr_matrix.max(dim=-1, keepdim=True).values
     col_best = corr_matrix == corr_matrix.max(dim=-2, keepdim=True).values
     keep = row_best & col_best & (corr_matrix > float(threshold))
+    margin = max(float(second_best_margin), 0.0)
+    if margin > 0.0 and corr_matrix.shape[-1] > 1:
+        top2 = torch.topk(corr_matrix, k=2, dim=-1).values
+        row_margin = top2[..., 0] - top2[..., 1]
+        keep = keep & (row_margin[..., None] >= margin)
     b_ids, q_ids, r_ids = torch.where(keep)
     scores = corr_matrix[b_ids, q_ids, r_ids]
     return b_ids, q_ids, r_ids, scores
@@ -48,6 +54,7 @@ def topk_match(
     corr_matrix: torch.Tensor,
     topk: int = 1,
     threshold: float = -1.0,
+    second_best_margin: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return per-query top-k matches from [B, N, M] scores."""
     if corr_matrix.dim() != 3:
@@ -62,6 +69,11 @@ def topk_match(
     b_grid = torch.arange(B, device=corr_matrix.device).view(B, 1, 1).expand(B, N, k)
     q_grid = torch.arange(N, device=corr_matrix.device).view(1, N, 1).expand(B, N, k)
     keep = vals > float(threshold)
+    margin = max(float(second_best_margin), 0.0)
+    if margin > 0.0 and corr_matrix.shape[-1] > k:
+        vals_all = torch.topk(corr_matrix, k=k + 1, dim=-1).values
+        next_best = vals_all[..., k].unsqueeze(-1).expand_as(vals)
+        keep = keep & ((vals - next_best) >= margin)
     return b_grid[keep], q_grid[keep], ids[keep], vals[keep]
 
 
@@ -72,6 +84,7 @@ def match_correlation_matrix(
     use_dual_softmax: bool = False,
     use_mnn: bool = False,
     topk: int = 1,
+    second_best_margin: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     scores = (
         dual_softmax(corr_matrix, temp=dual_softmax_temp)
@@ -79,8 +92,8 @@ def match_correlation_matrix(
         else corr_matrix
     )
     if use_mnn:
-        return mnn_match(scores, threshold=threshold)
-    return topk_match(scores, topk=topk, threshold=threshold)
+        return mnn_match(scores, threshold=threshold, second_best_margin=second_best_margin)
+    return topk_match(scores, topk=topk, threshold=threshold, second_best_margin=second_best_margin)
 
 
 def soft_argmax_offsets(

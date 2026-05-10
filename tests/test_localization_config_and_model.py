@@ -57,6 +57,16 @@ def test_hybrid_gaussian_has_checkpointable_locability_parameter():
     assert torch.allclose(restored.get_locability_logits(), model.get_locability_logits())
 
 
+def test_hybrid_gaussian_can_make_scaling_trainable_for_splatloc_regularization():
+    model = HybridFeatureGaussian(latent_dim=4, output_dim=8)
+    model.register_buffer("_scaling", torch.zeros(2, 3))
+
+    model.enable_geometry_training(train_scaling=True)
+
+    assert isinstance(model._scaling, torch.nn.Parameter)
+    assert model._scaling.requires_grad is True
+
+
 def test_hybrid_gaussian_loads_stdloc_loc_features_from_ply(tmp_path):
     dtype = [
         ("x", "f4"),

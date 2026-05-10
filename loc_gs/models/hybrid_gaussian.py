@@ -943,12 +943,15 @@ class HybridFeatureGaussian(nn.Module):
         self,
         train_xyz: bool = False,
         train_opacity: bool = False,
+        train_scaling: bool = False,
     ) -> None:
         """Convert selected frozen geometry buffers into trainable parameters."""
         if train_xyz:
             self._buffer_to_parameter("_xyz")
         if train_opacity:
             self._buffer_to_parameter("_opacity")
+        if train_scaling:
+            self._buffer_to_parameter("_scaling")
 
     # -- checkpoint I/O -----------------------------------------------------
 

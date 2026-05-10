@@ -46,7 +46,21 @@ from loc_gs.localization.stdloc_detector import (
     StdlocKeypointDetector,
     extract_stdloc_detector_keypoints,
 )
-from loc_gs.losses.localization_loss import unproject_dense_depth_to_world
+from loc_gs.losses.landmark_selection import (
+    depth_consistency_score,
+    descriptor_local_distinctiveness,
+    gaussian_geometry_score,
+    geometric_mean_score,
+    normalize_score01,
+    spatially_balanced_topk,
+    splatloc_saliency_prior,
+    superpoint_detector_saliency,
+)
+from loc_gs.losses.localization_loss import (
+    project_world_to_image_yx,
+    projection_jacobian_observability,
+    unproject_dense_depth_to_world,
+)
 from loc_gs.models.hybrid_gaussian import HybridFeatureGaussian, SuperPointOutputHead
 from loc_gs.scripts.extract_superpoint_features import SuperPointNet
 from loc_gs.scripts.train_cambridge_hybrid import (
@@ -56,6 +70,7 @@ from loc_gs.scripts.train_cambridge_hybrid import (
     maybe_write_superpoint_metadata,
     normalize_position_map,
     render_hybrid_superpoint,
+    resize_teacher_outputs_to_feature_grid,
     superpoint_gray,
 )
 
@@ -122,6 +137,26 @@ def load_cambridge_rgb_no_resize(
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(device)
 
 
+def prepare_query_teacher_maps(
+    teacher_desc: torch.Tensor,
+    teacher_det: torch.Tensor,
+    feature_height: int,
+    feature_width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return raw descriptors plus descriptor/detector maps in feature-grid coordinates."""
+    teacher_desc_raw = F.normalize(teacher_desc[0].float(), dim=0)
+    teacher_det_raw = teacher_det[0].float()
+    if teacher_desc_raw.shape[-2:] == (int(feature_height), int(feature_width)):
+        return teacher_desc_raw, teacher_desc_raw, teacher_det_raw
+    teacher_desc_grid, teacher_det_grid = resize_teacher_outputs_to_feature_grid(
+        teacher_desc_raw.unsqueeze(0),
+        teacher_det_raw.unsqueeze(0),
+        int(feature_height),
+        int(feature_width),
+    )
+    return teacher_desc_raw, teacher_desc_grid[0], teacher_det_grid[0]
+
+
 def resolve_matchers(args: argparse.Namespace) -> tuple[str, str]:
     """Resolve legacy --matcher into independently configurable sparse/dense matchers."""
     return resolve_sparse_dense_matchers(
@@ -178,6 +213,481 @@ def _load_pickle_tensor(path: Path) -> torch.Tensor:
     return torch.as_tensor(value)
 
 
+def _score_stats(prefix: str, score: torch.Tensor, out: dict[str, float]) -> None:
+    if score.numel() == 0:
+        return
+    value = score.detach().float()
+    finite = value[torch.isfinite(value)]
+    if finite.numel() == 0:
+        return
+    out[f"{prefix}_mean"] = float(finite.mean().cpu())
+    out[f"{prefix}_median"] = float(finite.median().cpu())
+    out[f"{prefix}_min"] = float(finite.min().cpu())
+    out[f"{prefix}_max"] = float(finite.max().cpu())
+
+
+def _score_ref_poses(
+    dataset: CambridgeHybridDataset,
+    device: torch.device,
+    max_views: int,
+) -> torch.Tensor | None:
+    count = min(len(dataset), max(0, int(max_views)))
+    if count <= 0:
+        return None
+    if count == len(dataset):
+        ids = list(range(count))
+    else:
+        ids = torch.linspace(0, len(dataset) - 1, steps=count).long().tolist()
+    return torch.stack([dataset[int(i)]["pose_w2c"] for i in ids], dim=0).to(device=device, dtype=torch.float32)
+
+
+@torch.no_grad()
+def _splatloc_visibility_score(
+    points: torch.Tensor,
+    poses_w2c: torch.Tensor | None,
+    K: torch.Tensor,
+    height: int,
+    width: int,
+    chunk_size: int = 65536,
+) -> torch.Tensor:
+    if points.numel() == 0:
+        return points.new_empty((0,))
+    if poses_w2c is None or poses_w2c.numel() == 0:
+        return torch.ones(points.shape[0], device=points.device, dtype=torch.float32)
+    chunks = []
+    for start in range(0, points.shape[0], int(chunk_size)):
+        end = min(start + int(chunk_size), points.shape[0])
+        chunks.append(
+            splatloc_saliency_prior(
+                points[start:end].detach(),
+                poses_w2c,
+                K,
+                height=int(height),
+                width=int(width),
+            )
+        )
+    return torch.cat(chunks, dim=0)
+
+
+@torch.no_grad()
+def _splatloc_observability_score(
+    points: torch.Tensor,
+    poses_w2c: torch.Tensor | None,
+    K: torch.Tensor,
+    height: int,
+    width: int,
+    chunk_size: int = 65536,
+) -> torch.Tensor:
+    if points.numel() == 0:
+        return points.new_empty((0,))
+    if poses_w2c is None or poses_w2c.numel() == 0:
+        return torch.ones(points.shape[0], device=points.device, dtype=torch.float32)
+    K = K.to(device=points.device, dtype=torch.float32)
+    poses = poses_w2c.to(device=points.device, dtype=torch.float32)
+    chunks = []
+    for start in range(0, points.shape[0], int(chunk_size)):
+        end = min(start + int(chunk_size), points.shape[0])
+        pts = points[start:end].detach().float()
+        obs_sum = pts.new_zeros(pts.shape[0])
+        visible_count = pts.new_zeros(pts.shape[0])
+        for pose in poses:
+            proj, valid_z = project_world_to_image_yx(pts.unsqueeze(0), pose.unsqueeze(0), K)
+            proj = proj[0]
+            visible = (
+                valid_z[0]
+                & (proj[:, 0] >= 0)
+                & (proj[:, 0] <= height - 1)
+                & (proj[:, 1] >= 0)
+                & (proj[:, 1] <= width - 1)
+            )
+            obs = projection_jacobian_observability(
+                pts.unsqueeze(0),
+                pose.unsqueeze(0),
+                K,
+                min_depth=0.05,
+            )[0]
+            obs_sum += torch.where(visible, obs, torch.zeros_like(obs))
+            visible_count += visible.float()
+        chunks.append(obs_sum / visible_count.clamp_min(1.0))
+    return normalize_score01(torch.cat(chunks, dim=0))
+
+
+def _score_weights(args: argparse.Namespace, rendered: bool) -> dict[str, float]:
+    if getattr(args, "landmark_score_mode", "legacy") not in {"matchability", "matchability_prior"}:
+        return {}
+    weights = {
+        "locability": float(args.landmark_score_locability_weight),
+        "visibility": float(args.landmark_score_visibility_weight),
+        "geometry": float(args.landmark_score_geometry_weight),
+    }
+    if rendered:
+        weights.update(
+            {
+                "detector": float(args.landmark_score_detector_weight),
+                "alpha": float(args.landmark_score_alpha_weight),
+                "depth": float(args.landmark_score_depth_weight),
+                "observability": float(args.landmark_score_observability_weight),
+                "distinctiveness": float(args.landmark_score_distinctiveness_weight),
+            }
+        )
+    else:
+        weights["detector"] = float(args.landmark_score_detector_weight)
+        weights["observability"] = float(args.landmark_score_observability_weight)
+    return weights
+
+
+def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
+    """Return the effective matcher/PnP config written to evaluation summaries."""
+    sparse_matcher, dense_matcher = resolve_matchers(args)
+    sparse_reprojection_error = (
+        args.sparse_reprojection_error
+        if args.sparse_reprojection_error is not None
+        else args.reprojection_error
+    )
+    dense_reprojection_error = (
+        args.dense_reprojection_error
+        if args.dense_reprojection_error is not None
+        else args.reprojection_error
+    )
+    sparse_margin = (
+        args.sparse_match_second_best_margin
+        if args.sparse_match_second_best_margin is not None
+        else args.match_second_best_margin
+    )
+    dense_margin = (
+        args.dense_match_second_best_margin
+        if args.dense_match_second_best_margin is not None
+        else args.match_second_best_margin
+    )
+    return {
+        "matcher": args.matcher,
+        "sparse_matcher": sparse_matcher,
+        "dense_matcher": dense_matcher,
+        "solver": args.solver,
+        "poselib_refine": bool(args.poselib_refine),
+        "query_keypoints": int(args.query_keypoints),
+        "keypoint_threshold": float(args.keypoint_threshold),
+        "nms_radius": int(args.nms_radius),
+        "sparse_match_threshold": float(args.sparse_match_threshold),
+        "dense_match_threshold": float(args.dense_match_threshold),
+        "match_second_best_margin": float(args.match_second_best_margin),
+        "sparse_match_second_best_margin": float(sparse_margin),
+        "dense_match_second_best_margin": float(dense_margin),
+        "locability_prior_weight": float(args.locability_prior_weight),
+        "sparse_dual_softmax": bool(args.sparse_dual_softmax),
+        "sparse_dual_softmax_temp": float(args.sparse_dual_softmax_temp),
+        "dense_dual_softmax_temp": float(args.dense_dual_softmax_temp),
+        "fine_dual_softmax_temp": float(args.fine_dual_softmax_temp),
+        "mnn": bool(args.mnn),
+        "dense_iters": int(args.dense_iters),
+        "dense_full_render": bool(args.dense_full_render),
+        "subpixel_refine": bool(args.subpixel_refine),
+        "subpixel_temperature": float(args.subpixel_temperature),
+        "topk_refine_window": int(args.topk_refine_window),
+        "render_pixel_center_offset": float(args.render_pixel_center_offset),
+        "dense_query_pixel_center_offset": float(args.dense_query_pixel_center_offset),
+        "reprojection_error": float(args.reprojection_error),
+        "sparse_reprojection_error": float(sparse_reprojection_error),
+        "dense_reprojection_error": float(dense_reprojection_error),
+        "refine_reprojection_error": float(args.refine_reprojection_error),
+        "pnp_confidence": float(args.pnp_confidence),
+        "pnp_iterations": int(args.pnp_iterations),
+        "pnp_min_iterations": int(args.pnp_min_iterations),
+        "sparse_pnp_iterations": None
+        if args.sparse_pnp_iterations is None
+        else int(args.sparse_pnp_iterations),
+        "sparse_pnp_min_iterations": None
+        if args.sparse_pnp_min_iterations is None
+        else int(args.sparse_pnp_min_iterations),
+        "dense_pnp_iterations": None
+        if args.dense_pnp_iterations is None
+        else int(args.dense_pnp_iterations),
+        "dense_pnp_min_iterations": None
+        if args.dense_pnp_min_iterations is None
+        else int(args.dense_pnp_min_iterations),
+        "pnp_prefilter": args.pnp_prefilter,
+        "sparse_pnp_max_matches": int(args.sparse_pnp_max_matches),
+        "dense_pnp_max_matches": int(args.dense_pnp_max_matches),
+        "pnp_prefilter_image_grid_size": int(args.pnp_prefilter_image_grid_size),
+        "pnp_prefilter_xyz_grid_size": int(args.pnp_prefilter_xyz_grid_size),
+    }
+
+
+def project_world_points_yx_np(
+    points_world: np.ndarray,
+    pose_w2c: np.ndarray,
+    K: np.ndarray,
+) -> np.ndarray:
+    points = np.asarray(points_world, dtype=np.float64)
+    pose = np.asarray(pose_w2c, dtype=np.float64)
+    intr = np.asarray(K, dtype=np.float64)
+    if points.shape[0] == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    points_cam = points @ pose[:3, :3].T + pose[:3, 3][None, :]
+    z = points_cam[:, 2]
+    valid_z = np.abs(z) > 1e-9
+    yx = np.full((points.shape[0], 2), np.nan, dtype=np.float64)
+    x = intr[0, 0] * points_cam[valid_z, 0] / z[valid_z] + intr[0, 2]
+    y = intr[1, 1] * points_cam[valid_z, 1] / z[valid_z] + intr[1, 2]
+    yx[valid_z, 0] = y
+    yx[valid_z, 1] = x
+    return yx
+
+
+def _safe_cov_logdet(values: np.ndarray, eps: float = 1e-6) -> tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.shape[0] < 2:
+        return float("-inf"), 0.0
+    cov = np.cov(arr, rowvar=False)
+    cov = np.atleast_2d(cov)
+    eig = np.linalg.eigvalsh(cov + np.eye(cov.shape[0], dtype=np.float64) * float(eps))
+    eig = np.maximum(eig, float(eps))
+    return float(np.log(eig).sum()), float(eig.min())
+
+
+def _pose_fisher_metrics(
+    points_world: np.ndarray,
+    pose_w2c: np.ndarray,
+    K: np.ndarray,
+    eps: float = 1e-6,
+) -> dict[str, float]:
+    points = np.asarray(points_world, dtype=np.float64)
+    if points.shape[0] < 4:
+        return {}
+    pose = np.asarray(pose_w2c, dtype=np.float64)
+    intr = np.asarray(K, dtype=np.float64)
+    points_cam = points @ pose[:3, :3].T + pose[:3, 3][None, :]
+    z = points_cam[:, 2]
+    valid = np.isfinite(points_cam).all(axis=1) & (np.abs(z) > 1e-9)
+    points_cam = points_cam[valid]
+    if points_cam.shape[0] < 4:
+        return {}
+    fx = float(intr[0, 0])
+    fy = float(intr[1, 1])
+    rows = []
+    for x, y, z in points_cam:
+        j_proj = np.asarray(
+            [
+                [fx / z, 0.0, -fx * x / (z * z)],
+                [0.0, fy / z, -fy * y / (z * z)],
+            ],
+            dtype=np.float64,
+        )
+        skew = np.asarray(
+            [
+                [0.0, -z, y],
+                [z, 0.0, -x],
+                [-y, x, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        rows.append(j_proj @ np.concatenate([-skew, np.eye(3, dtype=np.float64)], axis=1))
+    jac = np.concatenate(rows, axis=0)
+    fisher = jac.T @ jac
+    eig = np.linalg.eigvalsh(fisher + np.eye(6, dtype=np.float64) * float(eps))
+    eig = np.maximum(eig, float(eps))
+    condition = float(eig.max() / eig.min())
+    return {
+        "pose_info_logdet": float(np.log(eig).sum()),
+        "pose_info_min_eig": float(eig.min()),
+        "pose_info_condition": condition,
+    }
+
+
+def sparse_matchability_metrics(
+    query_yx: np.ndarray,
+    points_world: np.ndarray,
+    pose_w2c: np.ndarray,
+    K: np.ndarray,
+    scores: np.ndarray | None = None,
+    margins: np.ndarray | None = None,
+) -> dict[str, float]:
+    query = np.asarray(query_yx, dtype=np.float64).reshape(-1, 2)
+    points = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+    count = min(query.shape[0], points.shape[0])
+    out: dict[str, float] = {"sparse_match_count": float(count)}
+    if count == 0:
+        return out
+    query = query[:count]
+    points = points[:count]
+    projected = project_world_points_yx_np(points, pose_w2c, K)
+    errors = np.linalg.norm(projected - query, axis=-1)
+    valid = np.isfinite(errors)
+    out["sparse_valid_match_count"] = float(valid.sum())
+    if not valid.any():
+        return out
+    valid_points = points[valid]
+    valid_query = query[valid]
+    errors = errors[valid]
+    xyz_logdet, xyz_min_eig = _safe_cov_logdet(valid_points)
+    img_logdet, img_min_eig = _safe_cov_logdet(valid_query)
+    out["sparse_xyz_cov_logdet"] = xyz_logdet
+    out["sparse_xyz_cov_min_eig"] = xyz_min_eig
+    out["sparse_image_cov_logdet"] = img_logdet
+    out["sparse_image_cov_min_eig"] = img_min_eig
+    out.update({f"sparse_all_{k}": v for k, v in _pose_fisher_metrics(valid_points, pose_w2c, K).items()})
+    inlier8 = errors <= 8.0
+    if int(inlier8.sum()) >= 4:
+        inlier_points = valid_points[inlier8]
+        inlier_query = valid_query[inlier8]
+        xyz8_logdet, xyz8_min_eig = _safe_cov_logdet(inlier_points)
+        img8_logdet, img8_min_eig = _safe_cov_logdet(inlier_query)
+        out["sparse_inlier8_xyz_cov_logdet"] = xyz8_logdet
+        out["sparse_inlier8_xyz_cov_min_eig"] = xyz8_min_eig
+        out["sparse_inlier8_image_cov_logdet"] = img8_logdet
+        out["sparse_inlier8_image_cov_min_eig"] = img8_min_eig
+        out.update({f"sparse_inlier8_{k}": v for k, v in _pose_fisher_metrics(inlier_points, pose_w2c, K).items()})
+    out.update(
+        {
+            "sparse_reproj_median_px": float(np.median(errors)),
+            "sparse_reproj_mean_px": float(np.mean(errors)),
+            "sparse_inlier_2px": float((errors <= 2.0).mean()),
+            "sparse_inlier_5px": float((errors <= 5.0).mean()),
+            "sparse_inlier_8px": float((errors <= 8.0).mean()),
+        }
+    )
+    if scores is not None:
+        score_arr = np.asarray(scores, dtype=np.float64).reshape(-1)[:count][valid]
+        if score_arr.size:
+            out["sparse_match_score_mean"] = float(np.mean(score_arr))
+            out["sparse_match_score_median"] = float(np.median(score_arr))
+    if margins is not None:
+        margin_arr = np.asarray(margins, dtype=np.float64).reshape(-1)[:count][valid]
+        if margin_arr.size:
+            out["sparse_top2_margin_mean"] = float(np.mean(margin_arr))
+            out["sparse_top2_margin_median"] = float(np.median(margin_arr))
+    return out
+
+
+def _balanced_topk_by_coords(
+    score: torch.Tensor,
+    coords: torch.Tensor,
+    k: int,
+    grid_size: int,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    score = score.float().reshape(-1)
+    coords = coords.to(device=score.device, dtype=torch.float32)
+    valid = valid.to(device=score.device, dtype=torch.bool).reshape(-1)
+    keep = min(max(int(k), 0), int(score.numel()))
+    if keep <= 0:
+        return torch.empty(0, dtype=torch.long, device=score.device)
+    valid = valid & torch.isfinite(score) & torch.isfinite(coords).all(dim=-1)
+    eligible = torch.where(valid)[0]
+    if eligible.numel() <= keep:
+        return eligible[torch.argsort(score[eligible], descending=True)]
+    grid = max(1, int(grid_size))
+    if grid <= 1:
+        return eligible[torch.topk(score[eligible], k=keep).indices]
+
+    selected_coords = coords[eligible]
+    lo = selected_coords.amin(dim=0)
+    hi = selected_coords.amax(dim=0)
+    norm = (selected_coords - lo) / (hi - lo).clamp_min(1e-6)
+    bins = torch.clamp((norm * float(grid)).long(), min=0, max=grid - 1)
+    multipliers = torch.ones(bins.shape[1], device=score.device, dtype=torch.long)
+    for dim in range(bins.shape[1] - 2, -1, -1):
+        multipliers[dim] = multipliers[dim + 1] * grid
+    cell_ids = (bins * multipliers.view(1, -1)).sum(dim=-1)
+
+    cell_best = []
+    for cell in torch.unique(cell_ids, sorted=False):
+        local = torch.where(cell_ids == cell)[0]
+        if local.numel() == 0:
+            continue
+        cell_best.append(local[torch.argmax(score[eligible[local]])])
+    if not cell_best:
+        return eligible[torch.topk(score[eligible], k=keep).indices]
+
+    first_local = torch.stack(cell_best, dim=0)
+    first_order = torch.argsort(score[eligible[first_local]], descending=True)
+    selected = eligible[first_local[first_order[:keep]]]
+    if selected.numel() < keep:
+        mask = torch.zeros(score.numel(), dtype=torch.bool, device=score.device)
+        mask[selected] = True
+        remaining = torch.where(valid & ~mask)[0]
+        topup = min(keep - int(selected.numel()), int(remaining.numel()))
+        if topup > 0:
+            selected = torch.cat([selected, remaining[torch.topk(score[remaining], k=topup).indices]], dim=0)
+    return selected[:keep]
+
+
+def _unique_keep_order(indices: list[torch.Tensor], score: torch.Tensor, k: int) -> torch.Tensor:
+    chunks = [idx.reshape(-1) for idx in indices if idx.numel() > 0]
+    if not chunks:
+        return torch.empty(0, dtype=torch.long, device=score.device)
+    merged = torch.cat(chunks, dim=0)
+    seen = torch.zeros(score.numel(), dtype=torch.bool, device=score.device)
+    ordered = []
+    for idx in merged.tolist():
+        if not bool(seen[idx]):
+            ordered.append(idx)
+            seen[idx] = True
+        if len(ordered) >= int(k):
+            break
+    selected = torch.as_tensor(ordered, dtype=torch.long, device=score.device)
+    if selected.numel() < int(k):
+        remaining = torch.where(~seen)[0]
+        topup = min(int(k) - int(selected.numel()), int(remaining.numel()))
+        if topup > 0:
+            selected = torch.cat([selected, remaining[torch.topk(score[remaining], k=topup).indices]], dim=0)
+    return selected[: int(k)]
+
+
+def select_pnp_match_indices(
+    query_yx: torch.Tensor,
+    points3d: torch.Tensor,
+    scores: torch.Tensor | None = None,
+    max_matches: int = 0,
+    mode: str = "none",
+    image_grid_size: int = 8,
+    xyz_grid_size: int = 4,
+) -> torch.Tensor:
+    """Select PnP correspondences while preserving spatial/pose conditioning."""
+    count = min(int(query_yx.shape[0]), int(points3d.shape[0]))
+    device = query_yx.device
+    if count <= 0:
+        return torch.empty(0, dtype=torch.long, device=device)
+    keep = int(max_matches)
+    if keep <= 0 or keep >= count or mode == "none":
+        return torch.arange(count, dtype=torch.long, device=device)
+
+    query = query_yx[:count].to(device=device, dtype=torch.float32)
+    xyz = points3d[:count].to(device=device, dtype=torch.float32)
+    if scores is None:
+        score = torch.zeros(count, device=device, dtype=torch.float32)
+    else:
+        score = scores[:count].to(device=device, dtype=torch.float32).reshape(-1)
+    valid = torch.isfinite(query).all(dim=-1) & torch.isfinite(xyz).all(dim=-1) & torch.isfinite(score)
+    if int(valid.sum()) <= keep:
+        eligible = torch.where(valid)[0]
+        return eligible[torch.argsort(score[eligible], descending=True)]
+    if mode == "score":
+        eligible = torch.where(valid)[0]
+        return eligible[torch.topk(score[eligible], k=keep).indices]
+    if mode == "image_grid":
+        return _balanced_topk_by_coords(score, query, keep, image_grid_size, valid)
+    if mode == "xyz_grid":
+        return _balanced_topk_by_coords(score, xyz, keep, xyz_grid_size, valid)
+    if mode == "image_xyz_grid":
+        image_keep = _balanced_topk_by_coords(score, query, keep, image_grid_size, valid)
+        xyz_keep = _balanced_topk_by_coords(score, xyz, keep, xyz_grid_size, valid)
+        return _unique_keep_order([image_keep, xyz_keep], score, keep)
+    raise ValueError(f"Unsupported PnP prefilter mode: {mode}")
+
+
+def _mean_metric_dict(rows: list[dict[str, float]]) -> dict[str, float]:
+    if not rows:
+        return {}
+    keys = sorted({key for row in rows for key in row})
+    out: dict[str, float] = {}
+    for key in keys:
+        values = [row[key] for row in rows if key in row and np.isfinite(row[key])]
+        if values:
+            out[key] = float(np.mean(values))
+    return out
+
+
 @torch.no_grad()
 def build_stdloc_detector_landmark_bank(
     model: HybridFeatureGaussian,
@@ -187,14 +697,135 @@ def build_stdloc_detector_landmark_bank(
     descriptor_source: str,
     ply_loc_feature_weight: float,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    candidate_source: str = "sampled",
+    score_weights: dict[str, float] | None = None,
+    score_ref_poses: torch.Tensor | None = None,
+    score_K: torch.Tensor | None = None,
+    score_height: int = 0,
+    score_width: int = 0,
+    legacy_keep_ratio: float = 0.0,
+    spatial_grid_size: int = 0,
+    score_prior_blend: float = 1.0,
+    select_by_score: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     idx_path = detector_dir / "sampled_idx.pkl"
     if not idx_path.exists():
         raise FileNotFoundError(f"STDLoc detector landmark indices not found: {idx_path}")
-    ids = _load_pickle_tensor(idx_path).long().view(-1)
-    if int(max_landmarks) > 0:
-        ids = ids[: min(int(max_landmarks), ids.numel())]
-    ids = ids.to(device=device)
+    sampled_ids = _load_pickle_tensor(idx_path).long().view(-1).to(device=device)
+    if sampled_ids.numel() == 0:
+        raise RuntimeError(f"STDLoc detector landmark indices are empty: {idx_path}")
+    if candidate_source == "all_gaussians":
+        ids_all = torch.arange(model.num_gaussians, device=device, dtype=torch.long)
+    else:
+        ids_all = sampled_ids
+
+    score_path = detector_dir / "sampled_scores.pkl"
+    if score_path.exists():
+        scores = _load_pickle_tensor(score_path).float().view(-1)
+        if scores.numel() == model.num_gaussians:
+            detector_prior_all = scores.to(device=device)[ids_all]
+        else:
+            detector_prior_all = scores[: ids_all.numel()].to(device=device)
+        detector_prior_all = normalize_score01(detector_prior_all)
+    else:
+        detector_prior_all = torch.ones(ids_all.shape[0], device=device)
+
+    stats: dict[str, float] = {}
+    _score_stats("detector", detector_prior_all, stats)
+    weights = score_weights or {}
+    keep = ids_all.numel() if int(max_landmarks) <= 0 else min(int(max_landmarks), ids_all.numel())
+    if weights:
+        locability_all = model.get_locability().squeeze(-1)[ids_all].detach()
+        geometry_all = gaussian_geometry_score(
+            model.get_scaling()[ids_all].detach(),
+            model.get_opacity()[ids_all].detach().squeeze(-1),
+        )
+        components = {
+            "detector": detector_prior_all,
+            "locability": locability_all,
+            "geometry": geometry_all,
+        }
+        if weights.get("visibility", 0.0) > 0.0 and score_K is not None:
+            components["visibility"] = _splatloc_visibility_score(
+                model.get_xyz()[ids_all].detach(),
+                score_ref_poses,
+                score_K.to(device=device, dtype=torch.float32),
+                height=score_height,
+                width=score_width,
+            )
+        if weights.get("observability", 0.0) > 0.0 and score_K is not None:
+            components["observability"] = _splatloc_observability_score(
+                model.get_xyz()[ids_all].detach(),
+                score_ref_poses,
+                score_K.to(device=device, dtype=torch.float32),
+                height=score_height,
+                width=score_width,
+            )
+        composite = geometric_mean_score(components, weights)
+        prior_all = normalize_score01(
+            (1.0 - min(max(float(score_prior_blend), 0.0), 1.0)) * detector_prior_all
+            + min(max(float(score_prior_blend), 0.0), 1.0) * composite
+        )
+        for name, value in components.items():
+            _score_stats(name, value, stats)
+        _score_stats("composite", composite, stats)
+        _score_stats("prior", prior_all, stats)
+        if (not select_by_score) or keep >= ids_all.numel():
+            order = torch.arange(keep, device=device)
+            stats["score_selection"] = 0.0
+        elif keep < ids_all.numel():
+            legacy_keep = int(round(float(keep) * min(max(float(legacy_keep_ratio), 0.0), 1.0)))
+            legacy_keep = min(legacy_keep, int(keep), int(sampled_ids.numel()))
+            selected_chunks = []
+            selected_mask = torch.zeros(ids_all.numel(), dtype=torch.bool, device=device)
+            if legacy_keep > 0:
+                if candidate_source == "all_gaussians":
+                    legacy_order = sampled_ids[:legacy_keep]
+                else:
+                    legacy_order = torch.arange(legacy_keep, device=device)
+                selected_chunks.append(legacy_order)
+                selected_mask[legacy_order] = True
+            fill_keep = int(keep) - legacy_keep
+            if fill_keep > 0:
+                if int(spatial_grid_size) > 1:
+                    fill_order = spatially_balanced_topk(
+                        composite,
+                        model.get_xyz()[ids_all].detach(),
+                        k=fill_keep,
+                        grid_size=int(spatial_grid_size),
+                        exclude=selected_mask,
+                    )
+                else:
+                    remaining = torch.where(~selected_mask)[0]
+                    fill_order = remaining[torch.topk(composite[remaining], k=min(fill_keep, int(remaining.numel()))).indices]
+                selected_chunks.append(fill_order)
+                selected_mask[fill_order] = True
+            order = torch.cat(selected_chunks, dim=0) if selected_chunks else torch.empty(0, dtype=torch.long, device=device)
+            if order.numel() < keep:
+                remaining = torch.where(~selected_mask)[0]
+                topup = min(int(keep) - int(order.numel()), int(remaining.numel()))
+                if topup > 0:
+                    order = torch.cat([order, remaining[torch.topk(composite[remaining], k=topup).indices]], dim=0)
+            stats["legacy_keep_ratio"] = float(legacy_keep_ratio)
+            stats["legacy_kept_count"] = float(legacy_keep)
+            stats["matchability_kept_count"] = float(max(0, int(order.numel()) - legacy_keep))
+            stats["spatial_grid_size"] = float(spatial_grid_size)
+            stats["score_selection"] = 1.0
+        else:
+            order = torch.arange(ids_all.numel(), device=device)
+            stats["score_selection"] = 0.0
+        ids = ids_all[order]
+        stats["prior_blend"] = float(score_prior_blend)
+        stats["candidate_source_all_gaussians"] = float(candidate_source == "all_gaussians")
+        prior = prior_all[order].float()
+    else:
+        if candidate_source == "all_gaussians":
+            ids = sampled_ids[:keep]
+            prior = detector_prior_all[ids].float()
+        else:
+            ids = ids_all[:keep]
+            prior = detector_prior_all[:keep].float()
+
     xyz = model.get_xyz()[ids]
 
     loc_feature = model.get_ply_loc_feature()
@@ -215,18 +846,7 @@ def build_stdloc_detector_landmark_bank(
     else:
         desc = decode_gaussian_center_descriptors(model, sp_head, ids)
 
-    score_path = detector_dir / "sampled_scores.pkl"
-    if score_path.exists():
-        scores = _load_pickle_tensor(score_path).float().view(-1)
-        if scores.numel() == model.num_gaussians:
-            prior = scores.to(device=device)[ids]
-        else:
-            prior = scores[: ids.numel()].to(device=device)
-        prior = prior - prior.min()
-        prior = prior / prior.max().clamp_min(1e-6)
-    else:
-        prior = torch.ones(ids.shape[0], device=device)
-    return xyz, F.normalize(desc.float(), p=2, dim=-1), prior.float()
+    return xyz, F.normalize(desc.float(), p=2, dim=-1), prior.float(), stats
 
 
 def select_view_landmark_indices(
@@ -305,10 +925,14 @@ def build_rendered_landmark_bank(
     view_grid_size: int = 8,
     descriptor_source: str = "hybrid",
     ply_loc_feature_weight: float = 0.5,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    score_weights: dict[str, float] | None = None,
+    score_ref_poses: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     xyz_chunks = []
     desc_chunks = []
     prior_chunks = []
+    component_chunks: dict[str, list[torch.Tensor]] = {}
+    weights = score_weights or {}
     max_ref_views = len(dataset) if int(ref_views) <= 0 else min(len(dataset), int(ref_views))
     auto_quota = math.ceil(float(max_landmarks) / float(max(max_ref_views, 1)))
     raw_count = 0
@@ -339,10 +963,37 @@ def build_rendered_landmark_bank(
         )
         if xyz.numel() == 0:
             continue
+        component_maps: dict[str, torch.Tensor] = {}
         if render["locability"] is not None:
+            component_maps["locability"] = render["locability"][0, 0].float()
+        if weights:
+            component_maps["detector"] = superpoint_detector_saliency(render["detector"][0])
+            component_maps["alpha"] = alpha.float().clamp(0.0, 1.0)
+            component_maps["depth"] = depth_consistency_score(
+                render["depth"][0].float(),
+                valid=alpha > float(alpha_threshold),
+                window_size=getattr(dataset, "landmark_score_depth_window", 3),
+            )
+            if weights.get("observability", 0.0) > 0.0:
+                obs = projection_jacobian_observability(
+                    world_points[:, :, :].float(),
+                    pose.float(),
+                    renderer.K.float(),
+                    min_depth=0.05,
+                )[0].view_as(alpha)
+                component_maps["observability"] = normalize_score01(obs, valid=alpha > float(alpha_threshold))
+            if weights.get("distinctiveness", 0.0) > 0.0:
+                component_maps["distinctiveness"] = descriptor_local_distinctiveness(
+                    render["descriptor"][0],
+                    valid=alpha > float(alpha_threshold),
+                )
+            score_map = geometric_mean_score(component_maps, weights)
+            prior = score_map.flatten()[ids]
+        elif render["locability"] is not None:
             prior = render["locability"][0, 0].flatten()[ids]
         else:
             prior = torch.ones(xyz.shape[0], device=device)
+        flat_components = {name: value.flatten()[ids] for name, value in component_maps.items()}
         raw_count += int(xyz.shape[0])
         if selection != "global":
             quota = int(per_view_quota) if int(per_view_quota) > 0 else auto_quota
@@ -358,26 +1009,56 @@ def build_rendered_landmark_bank(
             xyz = xyz[view_keep]
             desc = desc[view_keep]
             prior = prior[view_keep]
+            flat_components = {name: value[view_keep] for name, value in flat_components.items()}
         pre_global_count += int(xyz.shape[0])
         xyz_chunks.append(xyz)
         desc_chunks.append(desc)
         prior_chunks.append(prior)
+        for name, value in flat_components.items():
+            component_chunks.setdefault(name, []).append(value.detach())
     if not xyz_chunks:
         raise RuntimeError("Rendered landmark bank is empty; lower alpha_threshold or check the checkpoint")
     xyz_all = torch.cat(xyz_chunks, dim=0)
     desc_all = torch.cat(desc_chunks, dim=0)
     prior_all = torch.cat(prior_chunks, dim=0).clamp(0.0, 1.0)
-    keep = min(int(max_landmarks), xyz_all.shape[0])
+    components_all = {
+        name: torch.cat(values, dim=0).clamp(0.0, 1.0)
+        for name, values in component_chunks.items()
+        if values
+    }
+    if weights and weights.get("visibility", 0.0) > 0.0:
+        visibility = _splatloc_visibility_score(
+            xyz_all.detach(),
+            score_ref_poses,
+            renderer.K.float(),
+            height=int(renderer.image_height),
+            width=int(renderer.image_width),
+        )
+        components_all["visibility"] = visibility
+        prior_all = geometric_mean_score(
+            {"matchability": prior_all, "visibility": visibility},
+            {"matchability": 1.0, "visibility": float(weights["visibility"])},
+        )
+    keep = xyz_all.shape[0] if int(max_landmarks) <= 0 else min(int(max_landmarks), xyz_all.shape[0])
     if keep < xyz_all.shape[0]:
         _, ids = torch.topk(prior_all, k=keep)
         xyz_all = xyz_all[ids]
         desc_all = desc_all[ids]
         prior_all = prior_all[ids]
+        components_all = {name: value[ids] for name, value in components_all.items()}
+    stats: dict[str, float] = {
+        "raw_count": float(raw_count),
+        "pre_global_count": float(pre_global_count),
+        "kept_count": float(xyz_all.shape[0]),
+    }
+    _score_stats("composite", prior_all, stats)
+    for name, value in components_all.items():
+        _score_stats(name, value, stats)
     print(
         f"[eval] rendered landmark bank selected: raw={raw_count}, "
         f"pre_global={pre_global_count}, kept={xyz_all.shape[0]}, selection={selection}"
     )
-    return xyz_all, desc_all, prior_all
+    return xyz_all, desc_all, prior_all, stats
 
 
 @torch.no_grad()
@@ -404,31 +1085,24 @@ def localize_one(
     if full_renderer is not None and hasattr(full_renderer, "K"):
         full_renderer.K.copy_(K_full.to(device=full_renderer.K.device, dtype=full_renderer.K.dtype))
     teacher_input = teacher_rgb if teacher_rgb is not None else rgb
-    if teacher_cache is not None and image_name and teacher_rgb is None:
+    if teacher_cache is not None and image_name:
         teacher_desc, teacher_det, _cache_hits = extract_superpoint_teacher_batch(
             teacher,
             teacher_input,
             [image_name],
             cache=teacher_cache,
+            expected_hw=(teacher_input.shape[-2] // 8, teacher_input.shape[-1] // 8),
         )
     else:
         teacher_desc, teacher_det = teacher(superpoint_gray(teacher_input))
-    teacher_desc_raw = F.normalize(teacher_desc[0].float(), dim=0)
-    teacher_desc = teacher_desc_raw
     feature_height = int(getattr(renderer, "image_height", teacher_desc.shape[-2]))
     feature_width = int(getattr(renderer, "image_width", teacher_desc.shape[-1]))
-    if teacher_desc.shape[-2:] != (feature_height, feature_width):
-        teacher_desc = F.normalize(
-            F.interpolate(
-                teacher_desc_raw.unsqueeze(0),
-                size=(feature_height, feature_width),
-                mode="bilinear",
-                align_corners=False,
-            )[0],
-            p=2,
-            dim=0,
-        )
-    teacher_det = teacher_det[0].float()
+    teacher_desc_raw, teacher_desc, teacher_det = prepare_query_teacher_maps(
+        teacher_desc,
+        teacher_det,
+        feature_height,
+        feature_width,
+    )
     query_detector = getattr(args, "query_detector", "superpoint")
     sparse_K = K_feature
     sparse_query_offset = 0.0
@@ -504,9 +1178,12 @@ def localize_one(
         else args.reprojection_error
     )
     sparse_matcher, dense_matcher = resolve_matchers(args)
+    sparse_margin_by_query = None
+    sparse_diag_corr = None
     if sparse_matcher == "stdloc_parity":
         corr = query_desc.float() @ F.normalize(landmark_desc.float(), dim=-1).T
         corr = apply_match_prior(corr.unsqueeze(0), landmark_prior, weight=args.locability_prior_weight)
+        sparse_diag_corr = corr[0]
         _b, q_ids, lm_ids, _scores = match_correlation_matrix(
             corr,
             threshold=args.sparse_match_threshold,
@@ -514,11 +1191,22 @@ def localize_one(
             use_dual_softmax=args.sparse_dual_softmax,
             use_mnn=args.mnn,
             topk=1,
+            second_best_margin=sparse_margin,
         )
     elif sparse_matcher in {"lightglue", "dim"}:
         # LightGlue needs two 2D feature sets.  The global 3D landmark bank has no
         # query-view 2D layout, so sparse initialization remains top-k and the
         # learned matcher is applied in the rendered refinement stage.
+        if getattr(args, "matchability_diagnostics", False):
+            sparse_diag_corr = (
+                F.normalize(query_desc.float(), dim=-1)
+                @ F.normalize(landmark_desc.float(), dim=-1).T
+            )
+            sparse_diag_corr = apply_match_prior(
+                sparse_diag_corr.unsqueeze(0),
+                landmark_prior,
+                weight=args.locability_prior_weight,
+            )[0]
         q_ids, lm_ids, _scores = match_descriptors_topk(
             query_desc,
             landmark_desc,
@@ -529,6 +1217,16 @@ def localize_one(
             second_best_margin=sparse_margin,
         )
     else:
+        if getattr(args, "matchability_diagnostics", False):
+            sparse_diag_corr = (
+                F.normalize(query_desc.float(), dim=-1)
+                @ F.normalize(landmark_desc.float(), dim=-1).T
+            )
+            sparse_diag_corr = apply_match_prior(
+                sparse_diag_corr.unsqueeze(0),
+                landmark_prior,
+                weight=args.locability_prior_weight,
+            )[0]
         q_ids, lm_ids, _scores = match_descriptors_topk(
             query_desc,
             landmark_desc,
@@ -538,6 +1236,29 @@ def localize_one(
             prior_weight=args.locability_prior_weight,
             second_best_margin=sparse_margin,
         )
+    if (
+        getattr(args, "matchability_diagnostics", False)
+        and sparse_diag_corr is not None
+        and sparse_diag_corr.shape[1] >= 2
+        and q_ids.numel() > 0
+    ):
+        top2 = torch.topk(sparse_diag_corr, k=2, dim=-1).values
+        sparse_margin_by_query = (top2[:, 0] - top2[:, 1])[q_ids]
+    sparse_keep = select_pnp_match_indices(
+        keypoints[q_ids] + sparse_query_offset,
+        landmark_xyz[lm_ids],
+        scores=_scores,
+        max_matches=getattr(args, "sparse_pnp_max_matches", 0),
+        mode=getattr(args, "pnp_prefilter", "none"),
+        image_grid_size=getattr(args, "pnp_prefilter_image_grid_size", 8),
+        xyz_grid_size=getattr(args, "pnp_prefilter_xyz_grid_size", 4),
+    )
+    if sparse_keep.numel() < q_ids.numel():
+        q_ids = q_ids[sparse_keep]
+        lm_ids = lm_ids[sparse_keep]
+        _scores = _scores[sparse_keep]
+        if sparse_margin_by_query is not None:
+            sparse_margin_by_query = sparse_margin_by_query[sparse_keep]
     sparse_pose, sparse_inliers = solve_pnp_ransac(
         landmark_xyz[lm_ids].detach().cpu().numpy(),
         (keypoints[q_ids] + sparse_query_offset).detach().cpu().numpy(),
@@ -551,7 +1272,18 @@ def localize_one(
         refine_poselib=refine_poselib,
     )
     if sparse_pose is None:
-        return {"pose_w2c": None, "sparse_pose_w2c": None, "sparse_inliers": 0, "dense_inliers": 0}
+        out = {"pose_w2c": None, "sparse_pose_w2c": None, "sparse_inliers": 0, "dense_inliers": 0}
+        if getattr(args, "matchability_diagnostics", False):
+            out["sparse_match_diagnostics"] = {
+                "query_yx": (keypoints[q_ids] + sparse_query_offset).detach().cpu().numpy(),
+                "xyz": landmark_xyz[lm_ids].detach().cpu().numpy(),
+                "scores": _scores.detach().cpu().numpy(),
+                "margins": None
+                if sparse_margin_by_query is None
+                else sparse_margin_by_query.detach().cpu().numpy(),
+                "coord_space": "full" if query_keypoints_are_full_res else "feature",
+            }
+        return out
 
     pose = torch.from_numpy(sparse_pose).to(device=rgb.device, dtype=torch.float32).unsqueeze(0)
     dense_inliers = 0
@@ -638,10 +1370,22 @@ def localize_one(
             valid = torch.isfinite(p3d).all(dim=-1) & (p3d[:, 2].abs() < 1e8)
             if valid.sum() < 4:
                 break
+            valid_ids = torch.where(valid)[0]
+            dense_keep = select_pnp_match_indices(
+                dense_matches.query_yx[valid],
+                p3d[valid],
+                scores=dense_matches.scores[valid_ids],
+                max_matches=getattr(args, "dense_pnp_max_matches", 0),
+                mode=getattr(args, "pnp_prefilter", "none"),
+                image_grid_size=getattr(args, "pnp_prefilter_image_grid_size", 8),
+                xyz_grid_size=getattr(args, "pnp_prefilter_xyz_grid_size", 4),
+            )
+            p3d_valid = p3d[valid][dense_keep]
+            query_valid = dense_matches.query_yx[valid][dense_keep]
             dense_pose, dense_inliers = solve_pnp_ransac(
-                p3d[valid].detach().cpu().numpy(),
+                p3d_valid.detach().cpu().numpy(),
                 (
-                    dense_matches.query_yx[valid]
+                    query_valid
                     + dense_query_offset
                 ).detach().cpu().numpy(),
                 K_full.detach().cpu().numpy(),
@@ -720,9 +1464,21 @@ def localize_one(
             valid = torch.isfinite(dense_points3d).all(dim=-1)
             if valid.sum() < 4:
                 break
+            valid_ids = torch.where(valid)[0]
+            dense_keep = select_pnp_match_indices(
+                query_lg_yx[q_dense][valid],
+                dense_points3d[valid],
+                scores=_lg_scores[valid_ids],
+                max_matches=getattr(args, "dense_pnp_max_matches", 0),
+                mode=getattr(args, "pnp_prefilter", "none"),
+                image_grid_size=getattr(args, "pnp_prefilter_image_grid_size", 8),
+                xyz_grid_size=getattr(args, "pnp_prefilter_xyz_grid_size", 4),
+            )
+            dense_points3d_valid = dense_points3d[valid][dense_keep]
+            query_lg_valid = query_lg_yx[q_dense][valid][dense_keep]
             dense_pose, dense_inliers = solve_pnp_ransac(
-                dense_points3d[valid].detach().cpu().numpy(),
-                (query_lg_yx[q_dense][valid] + dense_query_offset).detach().cpu().numpy(),
+                dense_points3d_valid.detach().cpu().numpy(),
+                (query_lg_valid + dense_query_offset).detach().cpu().numpy(),
                 dense_K.detach().cpu().numpy(),
                 reprojection_error=dense_reprojection_error,
                 refine_reprojection_error=args.refine_reprojection_error,
@@ -795,10 +1551,21 @@ def localize_one(
                 dense_renderer_K,
                 pixel_center_offset=args.render_pixel_center_offset,
             )
+            dense_keep = select_pnp_match_indices(
+                dense_query_yx[q_dense],
+                dense_points3d,
+                scores=_dense_scores,
+                max_matches=getattr(args, "dense_pnp_max_matches", 0),
+                mode=getattr(args, "pnp_prefilter", "none"),
+                image_grid_size=getattr(args, "pnp_prefilter_image_grid_size", 8),
+                xyz_grid_size=getattr(args, "pnp_prefilter_xyz_grid_size", 4),
+            )
+            dense_points3d = dense_points3d[dense_keep]
+            dense_query_for_pnp = dense_query_yx[q_dense][dense_keep]
             dense_pose, dense_inliers = solve_pnp_ransac(
                 dense_points3d.detach().cpu().numpy(),
                 (
-                    dense_query_yx[q_dense]
+                    dense_query_for_pnp
                     + dense_query_offset
                 ).detach().cpu().numpy(),
                 dense_K.detach().cpu().numpy(),
@@ -814,12 +1581,23 @@ def localize_one(
             break
         pose = torch.from_numpy(dense_pose).to(device=rgb.device, dtype=torch.float32).unsqueeze(0)
 
-    return {
+    out = {
         "pose_w2c": pose[0].detach().cpu().numpy(),
         "sparse_pose_w2c": sparse_pose,
         "sparse_inliers": sparse_inliers,
         "dense_inliers": dense_inliers,
     }
+    if getattr(args, "matchability_diagnostics", False):
+        out["sparse_match_diagnostics"] = {
+            "query_yx": (keypoints[q_ids] + sparse_query_offset).detach().cpu().numpy(),
+            "xyz": landmark_xyz[lm_ids].detach().cpu().numpy(),
+            "scores": _scores.detach().cpu().numpy(),
+            "margins": None
+            if sparse_margin_by_query is None
+            else sparse_margin_by_query.detach().cpu().numpy(),
+            "coord_space": "full" if query_keypoints_are_full_res else "feature",
+        }
+    return out
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -834,12 +1612,30 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--query_stride", type=int, default=1)
     parser.add_argument("--landmark_source", choices=["rendered", "gaussian", "stdloc_detector"], default="rendered")
     parser.add_argument("--stdloc_detector_dir", default="")
+    parser.add_argument("--landmark_candidate_source", choices=["sampled", "all_gaussians"], default="sampled")
     parser.add_argument("--landmark_selection", choices=["global", "per_view", "per_view_spatial"], default="global")
     parser.add_argument("--max_landmarks", type=int, default=200000)
     parser.add_argument("--landmark_ref_views", type=int, default=20)
     parser.add_argument("--landmark_stride", type=int, default=2)
     parser.add_argument("--landmark_per_view_quota", type=int, default=0)
     parser.add_argument("--landmark_view_grid_size", type=int, default=8)
+    parser.add_argument(
+        "--landmark_score_mode",
+        choices=["legacy", "matchability", "matchability_prior"],
+        default="legacy",
+    )
+    parser.add_argument("--landmark_score_ref_views", type=int, default=64)
+    parser.add_argument("--landmark_score_detector_weight", type=float, default=1.0)
+    parser.add_argument("--landmark_score_locability_weight", type=float, default=1.0)
+    parser.add_argument("--landmark_score_visibility_weight", type=float, default=0.5)
+    parser.add_argument("--landmark_score_geometry_weight", type=float, default=0.5)
+    parser.add_argument("--landmark_score_alpha_weight", type=float, default=0.25)
+    parser.add_argument("--landmark_score_depth_weight", type=float, default=0.5)
+    parser.add_argument("--landmark_score_observability_weight", type=float, default=0.25)
+    parser.add_argument("--landmark_score_distinctiveness_weight", type=float, default=0.0)
+    parser.add_argument("--landmark_score_legacy_keep_ratio", type=float, default=0.5)
+    parser.add_argument("--landmark_score_spatial_grid_size", type=int, default=8)
+    parser.add_argument("--landmark_score_prior_blend", type=float, default=0.25)
     parser.add_argument("--descriptor_source", choices=["hybrid", "ply_loc", "hybrid_ply_blend"], default="hybrid")
     parser.add_argument("--ply_loc_feature_weight", type=float, default=0.5)
     parser.add_argument("--alpha_threshold", type=float, default=0.05)
@@ -889,6 +1685,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--sparse_pnp_min_iterations", type=int, default=None)
     parser.add_argument("--dense_pnp_iterations", type=int, default=None)
     parser.add_argument("--dense_pnp_min_iterations", type=int, default=None)
+    parser.add_argument("--pnp_prefilter", choices=["none", "score", "image_grid", "xyz_grid", "image_xyz_grid"], default="none")
+    parser.add_argument("--sparse_pnp_max_matches", type=int, default=0)
+    parser.add_argument("--dense_pnp_max_matches", type=int, default=0)
+    parser.add_argument("--pnp_prefilter_image_grid_size", type=int, default=8)
+    parser.add_argument("--pnp_prefilter_xyz_grid_size", type=int, default=4)
+    parser.add_argument("--matchability_diagnostics", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     return parser
 
@@ -1011,11 +1813,27 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         stdloc_detector.eval()
     teacher_cache = None
     if not args.disable_superpoint_cache:
+        cache_split = "test" if args.query_feature_source == "resized" else f"test_{args.query_feature_source}"
         teacher_cache = SuperPointTeacherCache(
             args.superpoint_cache_root or train_args.get("output_root", "output"),
             scene=scene,
-            split="test",
+            split=cache_split,
         )
+
+    landmark_score_stats: dict[str, float] = {}
+    landmark_score_weights = _score_weights(args, rendered=args.landmark_source == "rendered")
+    score_ref_poses = None
+    if landmark_score_weights and int(args.landmark_score_ref_views) > 0:
+        score_ref_dataset = CambridgeHybridDataset(
+            scene_root=scene_root,
+            cameras_json=train_args["cameras_json"],
+            split="train",
+            image_subdir=train_args.get("image_subdir", "processed"),
+            image_height=train_args["image_height"],
+            image_width=train_args["image_width"],
+            max_frames=0,
+        )
+        score_ref_poses = _score_ref_poses(score_ref_dataset, device, args.landmark_score_ref_views)
 
     if args.landmark_source == "rendered":
         train_ref_dataset = CambridgeHybridDataset(
@@ -1031,7 +1849,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             f"[eval] rendering landmark bank from {len(train_ref_dataset)} reference views "
             f"(max_landmarks={args.max_landmarks})"
         )
-        landmark_xyz, landmark_desc, landmark_prior = build_rendered_landmark_bank(
+        landmark_xyz, landmark_desc, landmark_prior, landmark_score_stats = build_rendered_landmark_bank(
             model,
             sp_head,
             renderer,
@@ -1046,6 +1864,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             view_grid_size=args.landmark_view_grid_size,
             descriptor_source=args.descriptor_source,
             ply_loc_feature_weight=args.ply_loc_feature_weight,
+            score_weights=landmark_score_weights,
+            score_ref_poses=score_ref_poses,
         )
     elif args.landmark_source == "gaussian":
         print(f"[eval] decoding up to {args.max_landmarks} Gaussian-center landmark descriptors")
@@ -1061,7 +1881,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             else Path(train_args["ply_path"]).parents[2] / "detector"
         )
         print(f"[eval] loading STDLoc detector landmarks from {detector_dir}")
-        landmark_xyz, landmark_desc, landmark_prior = build_stdloc_detector_landmark_bank(
+        landmark_xyz, landmark_desc, landmark_prior, landmark_score_stats = build_stdloc_detector_landmark_bank(
             model,
             sp_head,
             detector_dir=detector_dir,
@@ -1069,6 +1889,16 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             descriptor_source=args.descriptor_source,
             ply_loc_feature_weight=args.ply_loc_feature_weight,
             device=device,
+            candidate_source=args.landmark_candidate_source,
+            score_weights=landmark_score_weights,
+            score_ref_poses=score_ref_poses,
+            score_K=renderer.K.float(),
+            score_height=train_args["feature_height"],
+            score_width=train_args["feature_width"],
+            legacy_keep_ratio=args.landmark_score_legacy_keep_ratio,
+            spatial_grid_size=args.landmark_score_spatial_grid_size,
+            score_prior_blend=args.landmark_score_prior_blend,
+            select_by_score=args.landmark_score_mode == "matchability",
         )
 
     sparse_te: list[float] = []
@@ -1077,6 +1907,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     dense_te: list[float] = []
     dense_ae: list[float] = []
     dense_inliers: list[int] = []
+    matchability_rows: list[dict[str, float]] = []
     details = []
 
     for item in tqdm(dataset, desc="Evaluating Cambridge hybrid", dynamic_ncols=True):
@@ -1104,11 +1935,24 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             landmark_prior,
             args,
             image_name=item["image_name"],
-            teacher_cache=None if teacher_rgb is not None else teacher_cache,
+            teacher_cache=teacher_cache,
             full_renderer=full_renderer,
             stdloc_detector=stdloc_detector,
             teacher_rgb=teacher_rgb,
         )
+        matchability_i = None
+        sparse_diag = result.pop("sparse_match_diagnostics", None)
+        if sparse_diag is not None:
+            diag_K_tensor = item["K"] if sparse_diag["coord_space"] == "full" else K_feature
+            matchability_i = sparse_matchability_metrics(
+                sparse_diag["query_yx"],
+                sparse_diag["xyz"],
+                gt_pose,
+                diag_K_tensor.detach().cpu().numpy(),
+                scores=sparse_diag.get("scores"),
+                margins=sparse_diag.get("margins"),
+            )
+            matchability_rows.append(matchability_i)
         sparse_te_i = None
         sparse_ae_i = None
         dense_te_i = None
@@ -1137,17 +1981,27 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "dense_ae": dense_ae_i,
                 "dense_inliers": int(result["dense_inliers"]),
                 "localized": result["pose_w2c"] is not None,
+                "matchability": matchability_i,
             }
         )
 
+    eval_config = effective_eval_config(args)
     summary = {
         "checkpoint": str(args.checkpoint),
         "scene": scene,
         "eval_pose_source": args.eval_pose_source,
         "query_offset": int(args.query_offset),
         "query_stride": int(args.query_stride),
+        "eval_config": eval_config,
         "landmark_source": args.landmark_source,
+        "landmark_candidate_source": args.landmark_candidate_source,
         "landmark_selection": args.landmark_selection,
+        "landmark_score_mode": args.landmark_score_mode,
+        "landmark_score_weights": landmark_score_weights,
+        "landmark_score_legacy_keep_ratio": float(args.landmark_score_legacy_keep_ratio),
+        "landmark_score_spatial_grid_size": int(args.landmark_score_spatial_grid_size),
+        "landmark_score_prior_blend": float(args.landmark_score_prior_blend),
+        "landmark_score_stats": landmark_score_stats,
         "query_detector": args.query_detector,
         "query_feature_source": args.query_feature_source,
         "descriptor_source": args.descriptor_source,
@@ -1159,6 +2013,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         "landmarks": int(landmark_xyz.shape[0]),
         "sparse": _summary(sparse_te, sparse_ae, sparse_inliers),
         "dense": _summary(dense_te, dense_ae, dense_inliers),
+        "matchability": _mean_metric_dict(matchability_rows),
         "localized": len(dense_te),
         "queries": len(dataset),
     }
