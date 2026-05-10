@@ -48,9 +48,11 @@ from loc_gs.localization.stdloc_detector import (
 )
 from loc_gs.losses.landmark_selection import (
     depth_consistency_score,
+    descriptor_landmark_distinctiveness,
     descriptor_local_distinctiveness,
     gaussian_geometry_score,
     geometric_mean_score,
+    keypoint_consensus_score,
     normalize_score01,
     spatially_balanced_topk,
     splatloc_saliency_prior,
@@ -231,14 +233,63 @@ def _score_ref_poses(
     device: torch.device,
     max_views: int,
 ) -> torch.Tensor | None:
-    count = min(len(dataset), max(0, int(max_views)))
-    if count <= 0:
+    ids = _score_ref_indices(len(dataset), max_views)
+    if not ids:
         return None
-    if count == len(dataset):
-        ids = list(range(count))
-    else:
-        ids = torch.linspace(0, len(dataset) - 1, steps=count).long().tolist()
     return torch.stack([dataset[int(i)]["pose_w2c"] for i in ids], dim=0).to(device=device, dtype=torch.float32)
+
+
+def _score_ref_indices(length: int, max_views: int) -> list[int]:
+    count = min(int(length), max(0, int(max_views)))
+    if count <= 0:
+        return []
+    if count == int(length):
+        return list(range(count))
+    return torch.linspace(0, int(length) - 1, steps=count).long().tolist()
+
+
+@torch.no_grad()
+def _score_ref_keypoint_maps(
+    dataset: CambridgeHybridDataset,
+    teacher: SuperPointNet,
+    device: torch.device,
+    max_views: int,
+    height: int,
+    width: int,
+    max_keypoints: int,
+    threshold: float,
+    nms_radius: int,
+    include_descriptors: bool = False,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ids = _score_ref_indices(len(dataset), max_views)
+    if not ids:
+        return None, None
+    maps = []
+    desc_maps = []
+    for idx in ids:
+        rgb = dataset[int(idx)]["rgb"].unsqueeze(0).to(device=device, dtype=torch.float32)
+        teacher_desc, teacher_det = teacher(superpoint_gray(rgb))
+        teacher_desc_grid, teacher_det_grid = resize_teacher_outputs_to_feature_grid(
+            teacher_desc,
+            teacher_det,
+            int(height),
+            int(width),
+        )
+        keypoints, _scores = extract_keypoints_from_detector_logits(
+            teacher_det_grid[0],
+            max_keypoints=int(max_keypoints),
+            confidence_threshold=float(threshold),
+            nms_radius=int(nms_radius),
+        )
+        heat = torch.zeros(int(height), int(width), device=device, dtype=torch.float32)
+        if keypoints.numel() > 0:
+            y = keypoints[:, 0].round().long().clamp(0, int(height) - 1)
+            x = keypoints[:, 1].round().long().clamp(0, int(width) - 1)
+            heat[y, x] = 1.0
+        maps.append(heat)
+        if include_descriptors:
+            desc_maps.append(F.normalize(teacher_desc_grid[0].float(), p=2, dim=0))
+    return torch.stack(maps, dim=0), (torch.stack(desc_maps, dim=0) if include_descriptors else None)
 
 
 @torch.no_grad()
@@ -319,6 +370,8 @@ def _score_weights(args: argparse.Namespace, rendered: bool) -> dict[str, float]
         "locability": float(args.landmark_score_locability_weight),
         "visibility": float(args.landmark_score_visibility_weight),
         "geometry": float(args.landmark_score_geometry_weight),
+        "ambiguity": float(getattr(args, "landmark_score_ambiguity_weight", 0.0)),
+        "keypoint_consensus": float(getattr(args, "landmark_score_keypoint_consensus_weight", 0.0)),
     }
     if rendered:
         weights.update(
@@ -634,6 +687,52 @@ def _unique_keep_order(indices: list[torch.Tensor], score: torch.Tensor, k: int)
     return selected[: int(k)]
 
 
+def local_geometric_consistency_scores(
+    query_yx: torch.Tensor,
+    points3d: torch.Tensor,
+    k: int = 6,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Score matches whose local 3D neighborhoods remain coherent in the query image."""
+    query = query_yx.float()
+    xyz = points3d.float()
+    count = min(int(query.shape[0]), int(xyz.shape[0]))
+    if count <= 0:
+        return query.new_empty((0,), dtype=torch.float32)
+    query = query[:count]
+    xyz = xyz[:count, :3]
+    valid = torch.isfinite(query).all(dim=-1) & torch.isfinite(xyz).all(dim=-1)
+    if count < 3 or int(valid.sum()) < 3:
+        return valid.float()
+
+    d3 = torch.cdist(xyz, xyz)
+    d2 = torch.cdist(query, query)
+    eye = torch.eye(count, dtype=torch.bool, device=query.device)
+    d3 = d3.masked_fill(eye, float("inf"))
+    d2 = d2.masked_fill(eye, float("inf"))
+    neighbor_count = min(max(1, int(k)), count - 1)
+    nn = torch.topk(d3, k=neighbor_count, dim=-1, largest=False).indices
+    d3_nn = torch.gather(d3, 1, nn).clamp_min(float(eps))
+    d2_nn = torch.gather(d2, 1, nn).clamp_min(float(eps))
+    finite = torch.isfinite(d3_nn) & torch.isfinite(d2_nn) & valid[:, None]
+
+    ratios = torch.where(finite, d2_nn / d3_nn, torch.ones_like(d2_nn))
+    log_ratios = torch.log(ratios.clamp_min(float(eps)))
+    local_center = log_ratios.median(dim=1, keepdim=True).values
+    local_mad = torch.where(finite, (log_ratios - local_center).abs(), torch.zeros_like(log_ratios))
+    spread = local_mad.sum(dim=1) / finite.float().sum(dim=1).clamp_min(1.0)
+
+    finite_d2 = torch.where(torch.isfinite(d2), d2, torch.zeros_like(d2))
+    global_query_scale = finite_d2[finite_d2 > 0.0].median() if (finite_d2 > 0.0).any() else query.new_tensor(1.0)
+    local_query_radius = torch.where(finite, d2_nn, torch.zeros_like(d2_nn)).sum(dim=1)
+    local_query_radius = local_query_radius / finite.float().sum(dim=1).clamp_min(1.0)
+    isolation = local_query_radius / global_query_scale.clamp_min(float(eps))
+
+    raw = torch.exp(-spread) * torch.exp(-0.25 * isolation.clamp_min(0.0))
+    raw = torch.where(valid, raw, torch.zeros_like(raw))
+    return normalize_score01(raw, valid=valid)
+
+
 def select_pnp_match_indices(
     query_yx: torch.Tensor,
     points3d: torch.Tensor,
@@ -673,7 +772,51 @@ def select_pnp_match_indices(
         image_keep = _balanced_topk_by_coords(score, query, keep, image_grid_size, valid)
         xyz_keep = _balanced_topk_by_coords(score, xyz, keep, xyz_grid_size, valid)
         return _unique_keep_order([image_keep, xyz_keep], score, keep)
+    if mode == "local_geometry":
+        eligible = torch.where(valid)[0]
+        candidate_limit = min(
+            int(eligible.numel()),
+            max(min(keep * 4, 2048), min(keep, 2048), 64),
+        )
+        pre_score = normalize_score01(score[eligible])
+        candidate_rel = torch.topk(pre_score, k=candidate_limit).indices
+        candidate_idx = eligible[candidate_rel]
+        geometry = local_geometric_consistency_scores(query[candidate_idx], xyz[candidate_idx], k=6)
+        combined = pre_score[candidate_rel] * geometry
+        return candidate_idx[torch.topk(combined, k=min(keep, candidate_limit)).indices]
     raise ValueError(f"Unsupported PnP prefilter mode: {mode}")
+
+
+def _detector_prior_for_ids(
+    scores: torch.Tensor,
+    ids_all: torch.Tensor,
+    sampled_ids: torch.Tensor,
+    num_gaussians: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Map STDLoc detector scores to candidate Gaussian ids without index drift."""
+    score = scores.float().view(-1).to(device=device)
+    ids = ids_all.long().view(-1).to(device=device)
+    sampled = sampled_ids.long().view(-1).to(device=device)
+    if score.numel() == int(num_gaussians):
+        prior = score[ids.clamp(0, int(num_gaussians) - 1)]
+    elif score.numel() == sampled.numel() and sampled.numel() > 0:
+        full = torch.zeros(int(num_gaussians), device=device, dtype=torch.float32)
+        valid = (sampled >= 0) & (sampled < int(num_gaussians))
+        full[sampled[valid]] = score[valid]
+        prior = full[ids.clamp(0, int(num_gaussians) - 1)]
+    else:
+        if score.numel() < ids.numel() and sampled.numel() > 0:
+            full = torch.zeros(int(num_gaussians), device=device, dtype=torch.float32)
+            count = min(int(score.numel()), int(sampled.numel()))
+            valid = (sampled[:count] >= 0) & (sampled[:count] < int(num_gaussians))
+            full[sampled[:count][valid]] = score[:count][valid]
+            prior = full[ids.clamp(0, int(num_gaussians) - 1)]
+        else:
+            prior = score[: ids.numel()]
+            if prior.numel() < ids.numel():
+                prior = F.pad(prior, (0, ids.numel() - prior.numel()))
+    return normalize_score01(prior)
 
 
 def _mean_metric_dict(rows: list[dict[str, float]]) -> dict[str, float]:
@@ -707,6 +850,12 @@ def build_stdloc_detector_landmark_bank(
     spatial_grid_size: int = 0,
     score_prior_blend: float = 1.0,
     select_by_score: bool = True,
+    ambiguity_radius: float = 0.0,
+    ambiguity_max_landmarks: int = 32768,
+    keypoint_consensus_maps: torch.Tensor | None = None,
+    keypoint_consensus_radius: int = 2,
+    keypoint_consensus_descriptor_maps: torch.Tensor | None = None,
+    keypoint_consensus_descriptor_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     idx_path = detector_dir / "sampled_idx.pkl"
     if not idx_path.exists():
@@ -722,11 +871,13 @@ def build_stdloc_detector_landmark_bank(
     score_path = detector_dir / "sampled_scores.pkl"
     if score_path.exists():
         scores = _load_pickle_tensor(score_path).float().view(-1)
-        if scores.numel() == model.num_gaussians:
-            detector_prior_all = scores.to(device=device)[ids_all]
-        else:
-            detector_prior_all = scores[: ids_all.numel()].to(device=device)
-        detector_prior_all = normalize_score01(detector_prior_all)
+        detector_prior_all = _detector_prior_for_ids(
+            scores,
+            ids_all=ids_all,
+            sampled_ids=sampled_ids,
+            num_gaussians=model.num_gaussians,
+            device=device,
+        )
     else:
         detector_prior_all = torch.ones(ids_all.shape[0], device=device)
 
@@ -761,6 +912,39 @@ def build_stdloc_detector_landmark_bank(
                 height=score_height,
                 width=score_width,
             )
+        if (
+            weights.get("keypoint_consensus", 0.0) > 0.0
+            and score_K is not None
+            and score_ref_poses is not None
+            and keypoint_consensus_maps is not None
+        ):
+            components["keypoint_consensus"] = keypoint_consensus_score(
+                model.get_xyz()[ids_all].detach(),
+                score_ref_poses,
+                score_K.to(device=device, dtype=torch.float32),
+                height=score_height,
+                width=score_width,
+                keypoint_maps=keypoint_consensus_maps,
+                radius_px=int(keypoint_consensus_radius),
+                descriptor_maps=keypoint_consensus_descriptor_maps,
+                descriptor_consistency_weight=float(keypoint_consensus_descriptor_weight),
+            )
+        if weights.get("ambiguity", 0.0) > 0.0:
+            if ids_all.numel() <= int(ambiguity_max_landmarks):
+                loc_feature = model.get_ply_loc_feature()
+                if loc_feature.numel() > 0 and loc_feature.shape[1] > 0:
+                    ambiguity_desc = F.normalize(loc_feature.to(device=device).float()[ids_all], p=2, dim=-1)
+                else:
+                    ambiguity_desc = decode_gaussian_center_descriptors(model, sp_head, ids_all)
+                components["ambiguity"] = descriptor_landmark_distinctiveness(
+                    ambiguity_desc,
+                    model.get_xyz()[ids_all].detach(),
+                    exclusion_radius=float(ambiguity_radius),
+                )
+                stats["ambiguity_skipped"] = 0.0
+            else:
+                stats["ambiguity_skipped"] = 1.0
+                stats["ambiguity_candidate_count"] = float(ids_all.numel())
         composite = geometric_mean_score(components, weights)
         prior_all = normalize_score01(
             (1.0 - min(max(float(score_prior_blend), 0.0), 1.0)) * detector_prior_all
@@ -1633,6 +1817,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--landmark_score_depth_weight", type=float, default=0.5)
     parser.add_argument("--landmark_score_observability_weight", type=float, default=0.25)
     parser.add_argument("--landmark_score_distinctiveness_weight", type=float, default=0.0)
+    parser.add_argument("--landmark_score_ambiguity_weight", type=float, default=0.0)
+    parser.add_argument("--landmark_score_ambiguity_radius", type=float, default=0.25)
+    parser.add_argument("--landmark_score_ambiguity_max_landmarks", type=int, default=32768)
+    parser.add_argument("--landmark_score_keypoint_consensus_weight", type=float, default=0.0)
+    parser.add_argument("--landmark_score_keypoint_consensus_radius", type=int, default=2)
+    parser.add_argument("--landmark_score_keypoint_consensus_max_keypoints", type=int, default=1024)
+    parser.add_argument("--landmark_score_keypoint_consensus_descriptor_weight", type=float, default=0.0)
     parser.add_argument("--landmark_score_legacy_keep_ratio", type=float, default=0.5)
     parser.add_argument("--landmark_score_spatial_grid_size", type=int, default=8)
     parser.add_argument("--landmark_score_prior_blend", type=float, default=0.25)
@@ -1685,7 +1876,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--sparse_pnp_min_iterations", type=int, default=None)
     parser.add_argument("--dense_pnp_iterations", type=int, default=None)
     parser.add_argument("--dense_pnp_min_iterations", type=int, default=None)
-    parser.add_argument("--pnp_prefilter", choices=["none", "score", "image_grid", "xyz_grid", "image_xyz_grid"], default="none")
+    parser.add_argument(
+        "--pnp_prefilter",
+        choices=["none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry"],
+        default="none",
+    )
     parser.add_argument("--sparse_pnp_max_matches", type=int, default=0)
     parser.add_argument("--dense_pnp_max_matches", type=int, default=0)
     parser.add_argument("--pnp_prefilter_image_grid_size", type=int, default=8)
@@ -1823,6 +2018,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     landmark_score_stats: dict[str, float] = {}
     landmark_score_weights = _score_weights(args, rendered=args.landmark_source == "rendered")
     score_ref_poses = None
+    score_ref_keypoint_maps = None
+    score_ref_keypoint_descriptor_maps = None
     if landmark_score_weights and int(args.landmark_score_ref_views) > 0:
         score_ref_dataset = CambridgeHybridDataset(
             scene_root=scene_root,
@@ -1834,6 +2031,19 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             max_frames=0,
         )
         score_ref_poses = _score_ref_poses(score_ref_dataset, device, args.landmark_score_ref_views)
+        if landmark_score_weights.get("keypoint_consensus", 0.0) > 0.0:
+            score_ref_keypoint_maps, score_ref_keypoint_descriptor_maps = _score_ref_keypoint_maps(
+                score_ref_dataset,
+                teacher,
+                device,
+                max_views=args.landmark_score_ref_views,
+                height=train_args["feature_height"],
+                width=train_args["feature_width"],
+                max_keypoints=args.landmark_score_keypoint_consensus_max_keypoints,
+                threshold=args.keypoint_threshold,
+                nms_radius=args.nms_radius,
+                include_descriptors=args.landmark_score_keypoint_consensus_descriptor_weight > 0.0,
+            )
 
     if args.landmark_source == "rendered":
         train_ref_dataset = CambridgeHybridDataset(
@@ -1899,6 +2109,12 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             spatial_grid_size=args.landmark_score_spatial_grid_size,
             score_prior_blend=args.landmark_score_prior_blend,
             select_by_score=args.landmark_score_mode == "matchability",
+            ambiguity_radius=args.landmark_score_ambiguity_radius,
+            ambiguity_max_landmarks=args.landmark_score_ambiguity_max_landmarks,
+            keypoint_consensus_maps=score_ref_keypoint_maps,
+            keypoint_consensus_radius=args.landmark_score_keypoint_consensus_radius,
+            keypoint_consensus_descriptor_maps=score_ref_keypoint_descriptor_maps,
+            keypoint_consensus_descriptor_weight=args.landmark_score_keypoint_consensus_descriptor_weight,
         )
 
     sparse_te: list[float] = []

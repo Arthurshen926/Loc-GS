@@ -3,9 +3,11 @@ import torch
 from loc_gs.losses.landmark_selection import (
     depth_consistency_score,
     descriptor_ambiguity_loss,
+    descriptor_landmark_distinctiveness,
     descriptor_local_distinctiveness,
     gaussian_geometry_score,
     geometric_mean_score,
+    keypoint_consensus_score,
     key_gaussian_isotropy_loss,
     locability_budget_loss,
     normalize_score01,
@@ -119,6 +121,92 @@ def test_descriptor_distinctiveness_and_geometry_scores_are_bounded():
 
     assert distinct[1, 1] > distinct[0, 0]
     assert torch.all((geom >= 0.0) & (geom <= 1.0))
+
+
+def test_descriptor_landmark_distinctiveness_penalizes_repeated_landmarks():
+    desc = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.99, 0.01],
+            [0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    xyz = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [20.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    score = descriptor_landmark_distinctiveness(desc, xyz, exclusion_radius=0.1)
+
+    assert score[0] < score[2]
+    assert score[1] < score[2]
+    assert torch.all((score >= 0.0) & (score <= 1.0))
+
+
+def test_keypoint_consensus_score_prefers_multi_view_keypoint_hits():
+    points = torch.tensor(
+        [
+            [0.0, 0.0, 2.0],
+            [0.75, 0.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    poses = torch.eye(4).unsqueeze(0).repeat(2, 1, 1)
+    K = torch.tensor([[4.0, 0.0, 2.0], [0.0, 4.0, 2.0], [0.0, 0.0, 1.0]])
+    keypoint_maps = torch.zeros(2, 5, 5)
+    keypoint_maps[:, 2, 2] = 1.0
+
+    score = keypoint_consensus_score(
+        points,
+        poses,
+        K,
+        height=5,
+        width=5,
+        keypoint_maps=keypoint_maps,
+        radius_px=0,
+    )
+
+    assert score[0] > score[1]
+    assert torch.all((score >= 0.0) & (score <= 1.0))
+
+
+def test_keypoint_consensus_score_can_use_descriptor_consistency():
+    points = torch.tensor(
+        [
+            [0.0, 0.0, 2.0],
+            [0.5, 0.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    poses = torch.eye(4).unsqueeze(0).repeat(2, 1, 1)
+    K = torch.tensor([[4.0, 0.0, 2.0], [0.0, 4.0, 2.0], [0.0, 0.0, 1.0]])
+    keypoint_maps = torch.zeros(2, 5, 5)
+    keypoint_maps[:, 2, 2] = 1.0
+    keypoint_maps[:, 2, 3] = 1.0
+    descriptor_maps = torch.zeros(2, 2, 5, 5)
+    descriptor_maps[:, 0, 2, 2] = 1.0
+    descriptor_maps[0, 0, 2, 3] = 1.0
+    descriptor_maps[1, 0, 2, 3] = -1.0
+
+    score = keypoint_consensus_score(
+        points,
+        poses,
+        K,
+        height=5,
+        width=5,
+        keypoint_maps=keypoint_maps,
+        radius_px=0,
+        descriptor_maps=descriptor_maps,
+        descriptor_consistency_weight=1.0,
+    )
+
+    assert score[0] > score[1]
+    assert torch.all((score >= 0.0) & (score <= 1.0))
 
 
 def test_spatially_balanced_topk_spreads_before_filling_by_score():

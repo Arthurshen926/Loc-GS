@@ -220,6 +220,79 @@ def test_queries_without_nearby_gt_target_projection_do_not_supervise_pnp():
     assert out["pose"].item() == 0.0
 
 
+def test_gt_depth_alpha_visibility_masks_pnp_targets():
+    channels = 4
+    height = 4
+    width = 4
+    query_descs = F.normalize(torch.randn(1, 1, channels), dim=-1)
+    query_keypoints = torch.tensor([[[1.0, 1.0]]], dtype=torch.float32)
+    rendered_desc = F.normalize(torch.randn(1, channels, height, width), dim=1)
+    depth = torch.ones(1, height, width)
+    pose = torch.eye(4).unsqueeze(0)
+    K = torch.eye(3)
+    gt_depth = torch.full((1, height, width), 5.0)
+    gt_alpha = torch.ones(1, height, width)
+
+    out = DifferentiablePnPMatchLoss(
+        temperature=0.2,
+        pnp_iterations=1,
+        pose_weight=1.0,
+        match_weight=1.0,
+        quality_weight=1.0,
+        reprojection_weight=1.0,
+        observability_weight=1.0,
+        locability_weight=0.0,
+        target_sigma_px=0.25,
+        occlusion_depth_tolerance=0.05,
+        occlusion_depth_rel_tolerance=0.0,
+    )(
+        query_descs=query_descs,
+        query_keypoints_yx=query_keypoints,
+        query_mask=torch.ones(1, 1, dtype=torch.bool),
+        rendered_desc=rendered_desc,
+        depth_map=depth,
+        render_pose_w2c=pose,
+        gt_pose_w2c=pose,
+        K=K,
+        gt_depth_map=gt_depth,
+        gt_alpha_map=gt_alpha,
+    )
+
+    assert out["valid_queries"].item() == 0.0
+    assert out["match"].item() == 0.0
+
+
+def test_topk_pnp_path_keeps_loss_differentiable():
+    query_descs = F.normalize(torch.randn(1, 4, 8), dim=-1)
+    query_keypoints = torch.tensor(
+        [[[1.0, 1.0], [1.0, 2.0], [2.0, 1.0], [2.0, 2.0]]],
+        dtype=torch.float32,
+    )
+    rendered_desc = F.normalize(torch.randn(1, 8, 4, 4), dim=1).requires_grad_(True)
+    depth = torch.full((1, 4, 4), 4.0, requires_grad=True)
+    pose = torch.eye(4).unsqueeze(0)
+    K = torch.tensor(
+        [[4.0, 0.0, 1.5], [0.0, 4.0, 1.5], [0.0, 0.0, 1.0]],
+        dtype=torch.float32,
+    )
+
+    out = DifferentiablePnPMatchLoss(temperature=0.2, pnp_iterations=1, topk_pnp=2)(
+        query_descs=query_descs,
+        query_keypoints_yx=query_keypoints,
+        query_mask=torch.ones(1, 4, dtype=torch.bool),
+        rendered_desc=rendered_desc,
+        depth_map=depth,
+        render_pose_w2c=pose,
+        gt_pose_w2c=pose,
+        K=K,
+    )
+
+    out["total"].backward()
+    assert torch.isfinite(out["total"])
+    assert rendered_desc.grad is not None
+    assert torch.isfinite(rendered_desc.grad).all()
+
+
 def test_differentiable_pnp_loss_handles_amp_half_inputs_on_cuda():
     if not torch.cuda.is_available():
         return

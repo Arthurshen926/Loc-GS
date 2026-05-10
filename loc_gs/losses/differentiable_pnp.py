@@ -59,6 +59,36 @@ def _project_points_xy(
     return torch.stack([x, y], dim=-1), pts_cam, pts_cam[:, :, 2] > 1e-6
 
 
+def _sample_map_yx(value_map: torch.Tensor, coords_yx: torch.Tensor) -> torch.Tensor:
+    """Bilinearly sample a single-channel map at feature-grid y/x coordinates."""
+    if value_map.ndim == 3:
+        value_map = value_map.unsqueeze(1)
+    if value_map.ndim != 4 or value_map.shape[1] != 1:
+        raise ValueError("value_map must have shape [B,H,W] or [B,1,H,W]")
+    B, _, H, W = value_map.shape
+    if coords_yx.shape[0] != B:
+        raise ValueError("coords_yx batch dimension must match value_map")
+    y = coords_yx[..., 0]
+    x = coords_yx[..., 1]
+    if W > 1:
+        grid_x = x / float(W - 1) * 2.0 - 1.0
+    else:
+        grid_x = torch.zeros_like(x)
+    if H > 1:
+        grid_y = y / float(H - 1) * 2.0 - 1.0
+    else:
+        grid_y = torch.zeros_like(y)
+    grid = torch.stack([grid_x, grid_y], dim=-1).view(B, -1, 1, 2)
+    sampled = F.grid_sample(
+        value_map.float(),
+        grid.float(),
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return sampled[:, 0, :, 0]
+
+
 def _projection_jacobian_xy(points_cam: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
     x = points_cam[:, :, 0]
     y = points_cam[:, :, 1]
@@ -147,6 +177,10 @@ class DifferentiablePnPMatchLoss(nn.Module):
         entropy_weight: float = 0.0,
         locability_prior_weight: float = 0.1,
         locability_target_prior_weight: float = 0.0,
+        topk_pnp: int = 0,
+        occlusion_depth_tolerance: float = 0.05,
+        occlusion_depth_rel_tolerance: float = 0.02,
+        gt_alpha_threshold: float = 0.05,
         target_sigma_px: float = 2.0,
         min_depth: float = 0.05,
         max_depth: float = 100.0,
@@ -166,6 +200,10 @@ class DifferentiablePnPMatchLoss(nn.Module):
         self.entropy_weight = entropy_weight
         self.locability_prior_weight = locability_prior_weight
         self.locability_target_prior_weight = locability_target_prior_weight
+        self.topk_pnp = topk_pnp
+        self.occlusion_depth_tolerance = occlusion_depth_tolerance
+        self.occlusion_depth_rel_tolerance = occlusion_depth_rel_tolerance
+        self.gt_alpha_threshold = gt_alpha_threshold
         self.target_sigma_px = target_sigma_px
         self.min_depth = min_depth
         self.max_depth = max_depth
@@ -183,6 +221,8 @@ class DifferentiablePnPMatchLoss(nn.Module):
         K: torch.Tensor,
         locability_map: Optional[torch.Tensor] = None,
         locability_target_prior_map: Optional[torch.Tensor] = None,
+        gt_depth_map: Optional[torch.Tensor] = None,
+        gt_alpha_map: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         B, C, H, W = rendered_desc.shape
         P = H * W
@@ -205,13 +245,46 @@ class DifferentiablePnPMatchLoss(nn.Module):
         valid_pixels = valid_depth & (depth_flat >= self.min_depth) & (depth_flat <= self.max_depth)
 
         target_pixels_yx, valid_target_proj = project_world_to_image_yx(world_points, gt_pose_w2c, K)
+        _target_xy, target_points_cam, target_valid_z = _project_points_xy(world_points, gt_pose_w2c, K)
         target_in_frame = (
             (target_pixels_yx[..., 0] >= 0.0)
             & (target_pixels_yx[..., 0] <= float(H - 1))
             & (target_pixels_yx[..., 1] >= 0.0)
             & (target_pixels_yx[..., 1] <= float(W - 1))
         )
-        valid_target = valid_target_proj & target_in_frame
+        target_visible = target_valid_z
+        if gt_depth_map is not None:
+            gt_depth = gt_depth_map.float()
+            if gt_depth.shape[-2:] != (H, W):
+                gt_depth = F.interpolate(
+                    gt_depth.unsqueeze(1) if gt_depth.ndim == 3 else gt_depth,
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+            sampled_depth = _sample_map_yx(gt_depth, target_pixels_yx)
+            target_z = target_points_cam[..., 2]
+            depth_tol = float(self.occlusion_depth_tolerance) + float(self.occlusion_depth_rel_tolerance) * sampled_depth.abs()
+            target_visible = (
+                target_visible
+                & torch.isfinite(sampled_depth)
+                & (sampled_depth >= self.min_depth)
+                & ((target_z - sampled_depth).abs() <= depth_tol)
+            )
+        if gt_alpha_map is not None:
+            gt_alpha = gt_alpha_map.float()
+            if gt_alpha.shape[-2:] != (H, W):
+                gt_alpha = F.interpolate(
+                    gt_alpha.unsqueeze(1) if gt_alpha.ndim == 3 else gt_alpha,
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+            sampled_alpha = _sample_map_yx(gt_alpha, target_pixels_yx)
+            target_visible = target_visible & torch.isfinite(sampled_alpha) & (
+                sampled_alpha >= float(self.gt_alpha_threshold)
+            )
+        valid_target = valid_target_proj & target_in_frame & target_visible
         valid_target_pixels = valid_pixels & valid_target
 
         image_diag = float((H * H + W * W) ** 0.5)
@@ -247,7 +320,16 @@ class DifferentiablePnPMatchLoss(nn.Module):
 
         confidence = probs.max(dim=-1).values
         pnp_weights = valid_queries.float() * confidence.detach()
-        expected_world = torch.bmm(probs, world_points)
+        topk_pnp = int(self.topk_pnp)
+        if topk_pnp > 0 and topk_pnp < P:
+            top_ids = logits.detach().topk(k=topk_pnp, dim=-1).indices
+            top_logits = logits.gather(-1, top_ids)
+            top_probs = F.softmax(top_logits, dim=-1)
+            top_world = world_points[:, None, :, :].expand(-1, query_descs.shape[1], -1, -1)
+            top_world = top_world.gather(2, top_ids[..., None].expand(-1, -1, -1, 3))
+            expected_world = (top_probs[..., None] * top_world).sum(dim=2)
+        else:
+            expected_world = torch.bmm(probs, world_points)
         pose_w2c, pnp_residual = differentiable_pnp_gauss_newton(
             expected_world,
             query_keypoints_yx.float(),
@@ -291,7 +373,9 @@ class DifferentiablePnPMatchLoss(nn.Module):
         locability_loss = rendered_desc.new_tensor(0.0)
         if locability_map is not None:
             inlier_support = (
-                probs.detach() * torch.exp(-target_err.detach() / max(float(self.target_sigma_px), 1e-6))
+                probs.detach()
+                * valid_queries.float()[:, :, None]
+                * torch.exp(-target_err.detach() / max(float(self.target_sigma_px), 1e-6))
             ).sum(dim=1)
             inlier_support = inlier_support / inlier_support.amax(dim=1, keepdim=True).clamp_min(1e-6)
             if locability_target_prior_map is not None and self.locability_target_prior_weight > 0.0:
@@ -306,7 +390,7 @@ class DifferentiablePnPMatchLoss(nn.Module):
                 target_prior = target_prior.flatten(2).squeeze(1).clamp(0.0, 1.0)
                 target_prior = target_prior / target_prior.amax(dim=1, keepdim=True).clamp_min(1e-6)
                 mix = min(max(float(self.locability_target_prior_weight), 0.0), 1.0)
-                inlier_support = inlier_support * ((1.0 - mix) + mix * target_prior)
+                inlier_support = (1.0 - mix) * inlier_support + mix * target_prior
             loc = locability_map.float()
             if loc.shape[-2:] != (H, W):
                 loc = F.interpolate(loc, size=(H, W), mode="bilinear", align_corners=False)

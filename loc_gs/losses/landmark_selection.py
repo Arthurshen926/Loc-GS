@@ -166,6 +166,159 @@ def descriptor_local_distinctiveness(
     return normalize_score01(score)
 
 
+@torch.no_grad()
+def descriptor_landmark_distinctiveness(
+    descriptors: torch.Tensor,
+    positions: torch.Tensor | None = None,
+    exclusion_radius: float = 0.0,
+    chunk_size: int = 2048,
+) -> torch.Tensor:
+    """Landmark-side ambiguity score from nearest non-local descriptor similarity."""
+    if descriptors.ndim != 2:
+        raise ValueError("descriptors must have shape [N, C]")
+    if descriptors.shape[0] == 0:
+        return descriptors.new_empty((0,), dtype=torch.float32)
+    if descriptors.shape[0] == 1:
+        return descriptors.new_ones((1,), dtype=torch.float32)
+    desc = F.normalize(descriptors.float(), p=2, dim=-1)
+    pos = None
+    radius = float(exclusion_radius)
+    if positions is not None and radius > 0.0:
+        pos = positions.to(device=desc.device, dtype=torch.float32)
+        if pos.ndim != 2 or pos.shape[0] != desc.shape[0] or pos.shape[1] < 3:
+            raise ValueError("positions must have shape [N, 3+] and match descriptors")
+        pos = pos[:, :3]
+    max_sim_chunks = []
+    N = desc.shape[0]
+    chunk = max(1, int(chunk_size))
+    all_ids = torch.arange(N, device=desc.device)
+    for start in range(0, N, chunk):
+        end = min(start + chunk, N)
+        sim = desc[start:end] @ desc.T
+        local_ids = all_ids[start:end]
+        sim[torch.arange(end - start, device=desc.device), local_ids] = -float("inf")
+        if pos is not None:
+            dist = torch.cdist(pos[start:end], pos)
+            sim = sim.masked_fill(dist <= radius, -float("inf"))
+        max_sim = sim.max(dim=1).values
+        max_sim = torch.where(torch.isfinite(max_sim), max_sim, torch.zeros_like(max_sim))
+        max_sim_chunks.append(max_sim)
+    max_sim_all = torch.cat(max_sim_chunks, dim=0).clamp(-1.0, 1.0)
+    return normalize_score01((1.0 - max_sim_all) * 0.5)
+
+
+@torch.no_grad()
+def keypoint_consensus_score(
+    points: torch.Tensor,
+    poses_w2c: torch.Tensor,
+    K: torch.Tensor,
+    height: int,
+    width: int,
+    keypoint_maps: torch.Tensor,
+    radius_px: int = 2,
+    descriptor_maps: torch.Tensor | None = None,
+    descriptor_consistency_weight: float = 0.0,
+    chunk_size: int = 65536,
+) -> torch.Tensor:
+    """Score landmarks by keypoint hits, optionally weighted by cross-view descriptor consistency."""
+    if points.ndim != 2 or points.shape[-1] < 3:
+        raise ValueError("points must have shape [N, 3+]")
+    if keypoint_maps.ndim != 3:
+        raise ValueError("keypoint_maps must have shape [V, H, W]")
+    if descriptor_maps is not None and descriptor_maps.ndim != 4:
+        raise ValueError("descriptor_maps must have shape [V, C, H, W]")
+    if poses_w2c.ndim != 3 or poses_w2c.shape[-2:] != (4, 4):
+        raise ValueError("poses_w2c must have shape [V, 4, 4]")
+    if points.numel() == 0:
+        return points.new_empty((0,), dtype=torch.float32)
+    view_count = min(int(poses_w2c.shape[0]), int(keypoint_maps.shape[0]))
+    if descriptor_maps is not None:
+        view_count = min(view_count, int(descriptor_maps.shape[0]))
+    if view_count <= 0:
+        return points.new_zeros((points.shape[0],), dtype=torch.float32)
+
+    H = int(height)
+    W = int(width)
+    maps = keypoint_maps[:view_count].to(device=points.device, dtype=torch.float32)
+    if maps.shape[-2:] != (H, W):
+        maps = F.interpolate(maps.unsqueeze(1), size=(H, W), mode="nearest").squeeze(1)
+    radius = max(0, int(radius_px))
+    if radius > 0:
+        maps = F.max_pool2d(
+            maps.unsqueeze(1),
+            kernel_size=2 * radius + 1,
+            stride=1,
+            padding=radius,
+        ).squeeze(1)
+    maps = maps.clamp(0.0, 1.0)
+    poses = poses_w2c[:view_count].to(device=points.device, dtype=torch.float32)
+    K = K.to(device=points.device, dtype=torch.float32)
+    keypoint_maps_bchw = maps.unsqueeze(1)
+    desc_bchw = None
+    desc_weight = min(max(float(descriptor_consistency_weight), 0.0), 1.0)
+    if descriptor_maps is not None and desc_weight > 0.0:
+        desc_bchw = descriptor_maps[:view_count].to(device=points.device, dtype=torch.float32)
+        if desc_bchw.shape[-2:] != (H, W):
+            desc_bchw = F.interpolate(desc_bchw, size=(H, W), mode="bilinear", align_corners=False)
+        desc_bchw = F.normalize(desc_bchw, p=2, dim=1, eps=1e-8)
+
+    scores = []
+    valid_counts = []
+    chunk = max(1, int(chunk_size))
+    for start in range(0, points.shape[0], chunk):
+        end = min(start + chunk, points.shape[0])
+        pts = points[start:end, :3].to(device=points.device, dtype=torch.float32)
+        pts = pts.unsqueeze(0).expand(view_count, -1, -1)
+        proj_yx, valid_z = project_world_to_image_yx(pts, poses, K)
+        in_frame = (
+            valid_z
+            & (proj_yx[..., 0] >= 0.0)
+            & (proj_yx[..., 0] <= float(H - 1))
+            & (proj_yx[..., 1] >= 0.0)
+            & (proj_yx[..., 1] <= float(W - 1))
+        )
+        if W > 1:
+            grid_x = proj_yx[..., 1] / float(W - 1) * 2.0 - 1.0
+        else:
+            grid_x = torch.zeros_like(proj_yx[..., 1])
+        if H > 1:
+            grid_y = proj_yx[..., 0] / float(H - 1) * 2.0 - 1.0
+        else:
+            grid_y = torch.zeros_like(proj_yx[..., 0])
+        grid = torch.stack([grid_x, grid_y], dim=-1).view(view_count, -1, 1, 2)
+        sampled = F.grid_sample(
+            keypoint_maps_bchw,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )[:, 0, :, 0]
+        sampled = torch.where(in_frame, sampled, torch.zeros_like(sampled))
+        hit_sum = sampled.sum(dim=0)
+        count = in_frame.float().sum(dim=0)
+        hit_rate = hit_sum / count.clamp_min(1.0)
+        if desc_bchw is not None:
+            desc_sampled = F.grid_sample(
+                desc_bchw,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )[..., 0]
+            desc_sampled = F.normalize(desc_sampled, p=2, dim=1, eps=1e-8)
+            hit_mask = (sampled > 0.0) & in_frame
+            hit_count = hit_mask.float().sum(dim=0)
+            desc_sum = (desc_sampled * hit_mask[:, None, :].float()).sum(dim=0)
+            consistency = desc_sum.norm(dim=0) / hit_count.clamp_min(1.0)
+            consistency = torch.where(hit_count > 0.0, consistency.clamp(0.0, 1.0), torch.zeros_like(consistency))
+            hit_rate = hit_rate * ((1.0 - desc_weight) + desc_weight * consistency)
+        scores.append(hit_rate)
+        valid_counts.append(count)
+    raw = torch.cat(scores, dim=0)
+    valid = torch.cat(valid_counts, dim=0) > 0
+    return normalize_score01(raw, valid=valid)
+
+
 def gaussian_geometry_score(
     scales: torch.Tensor,
     opacity: torch.Tensor | None = None,

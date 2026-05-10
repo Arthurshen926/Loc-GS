@@ -3,7 +3,9 @@ import torch.nn.functional as F
 
 from loc_gs.scripts.train_cambridge_hybrid import (
     build_argparser,
+    descriptor_residual_alignment_loss,
     extract_superpoint_teacher_batch,
+    locability_prior_alignment_loss,
     make_feature_renderer_intrinsics,
     normalize_position_map,
     resize_teacher_outputs_to_feature_grid,
@@ -135,12 +137,30 @@ def test_training_parser_exposes_same_view_geometric_match_options():
             "1.0",
             "--pnp_locability_target_prior_weight",
             "0.75",
+            "--pnp_locability_target_prior_start_epoch",
+            "2",
+            "--pnp_locability_target_prior_warmup_epochs",
+            "3",
+            "--pnp_topk",
+            "8",
+            "--pnp_occlusion_depth_tolerance",
+            "0.1",
+            "--pnp_occlusion_depth_rel_tolerance",
+            "0.03",
+            "--pnp_gt_alpha_threshold",
+            "0.2",
             "--pnp_start_epoch",
             "3",
             "--pnp_warmup_epochs",
             "2",
             "--locability_target_depth_weight",
             "0.4",
+            "--locability_prior_target_weight",
+            "0.6",
+            "--locability_prior_target_start_epoch",
+            "2",
+            "--locability_prior_target_warmup_epochs",
+            "3",
             "--teacher_feature_source",
             "original",
         ]
@@ -152,9 +172,18 @@ def test_training_parser_exposes_same_view_geometric_match_options():
     assert args.pnp_temperature == 0.05
     assert args.pnp_target_sigma_px == 1.0
     assert args.pnp_locability_target_prior_weight == 0.75
+    assert args.pnp_locability_target_prior_start_epoch == 2
+    assert args.pnp_locability_target_prior_warmup_epochs == 3
+    assert args.pnp_topk == 8
+    assert args.pnp_occlusion_depth_tolerance == 0.1
+    assert args.pnp_occlusion_depth_rel_tolerance == 0.03
+    assert args.pnp_gt_alpha_threshold == 0.2
     assert args.pnp_start_epoch == 3
     assert args.pnp_warmup_epochs == 2
     assert args.locability_target_depth_weight == 0.4
+    assert args.locability_prior_target_weight == 0.6
+    assert args.locability_prior_target_start_epoch == 2
+    assert args.locability_prior_target_warmup_epochs == 3
     assert args.teacher_feature_source == "original"
 
 
@@ -196,6 +225,10 @@ def test_training_parser_exposes_sota_extension_options():
             "0.2",
             "--key_gaussian_isotropy_weight",
             "0.01",
+            "--ply_residual_reg_weight",
+            "0.05",
+            "--ply_residual_reg_samples",
+            "512",
             "--train_scaling",
             "--lr_scaling",
             "3e-7",
@@ -228,6 +261,8 @@ def test_training_parser_exposes_sota_extension_options():
     assert args.locability_ambiguity_weight == 0.3
     assert args.locability_budget_weight == 0.2
     assert args.key_gaussian_isotropy_weight == 0.01
+    assert args.ply_residual_reg_weight == 0.05
+    assert args.ply_residual_reg_samples == 512
     assert args.train_scaling is True
     assert args.lr_scaling == 3e-7
     assert args.external_match_supervision_weight == 0.4
@@ -236,3 +271,26 @@ def test_training_parser_exposes_sota_extension_options():
     assert args.detector_free_hard_negative_weight == 0.2
     assert args.external_match_start_epoch == 3
     assert args.grad_accum_steps == 2
+
+
+def test_descriptor_residual_alignment_loss_rewards_matching_reference():
+    reference = F.normalize(torch.rand(8, 16), p=2, dim=-1)
+    aligned = reference.clone()
+    shuffled = reference.flip(0)
+
+    aligned_loss = descriptor_residual_alignment_loss(aligned, reference)
+    shuffled_loss = descriptor_residual_alignment_loss(shuffled, reference)
+
+    assert aligned_loss < 1e-5
+    assert shuffled_loss > aligned_loss
+
+
+def test_locability_prior_alignment_loss_rewards_matching_prior():
+    target = torch.tensor([[[[0.9, 0.1], [0.7, 0.2]]]])
+    aligned = target.clone()
+    inverted = 1.0 - target
+
+    aligned_loss = locability_prior_alignment_loss(aligned, target)
+    inverted_loss = locability_prior_alignment_loss(inverted, target)
+
+    assert aligned_loss < inverted_loss

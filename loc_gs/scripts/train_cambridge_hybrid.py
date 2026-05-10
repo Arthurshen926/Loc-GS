@@ -274,6 +274,45 @@ def locability_target_prior_from_render(
     return torch.stack(chunks, dim=0).unsqueeze(1)
 
 
+def descriptor_residual_alignment_loss(
+    predicted_desc: torch.Tensor,
+    reference_desc: torch.Tensor,
+) -> torch.Tensor:
+    """Keep learned Gaussian descriptors near the STDLoc/PLY descriptor basis."""
+    if predicted_desc.numel() == 0 or reference_desc.numel() == 0:
+        return predicted_desc.sum() * 0.0
+    pred = F.normalize(predicted_desc.float(), p=2, dim=-1)
+    ref = F.normalize(reference_desc.to(device=pred.device, dtype=torch.float32), p=2, dim=-1)
+    return (1.0 - F.cosine_similarity(pred, ref, dim=-1)).mean()
+
+
+def locability_prior_alignment_loss(
+    locability_map: torch.Tensor | None,
+    target_prior_map: torch.Tensor | None,
+) -> torch.Tensor:
+    """Supervise rendered locability from an external detector/geometry prior."""
+    if locability_map is None:
+        if target_prior_map is None:
+            return torch.tensor(0.0)
+        return target_prior_map.sum() * 0.0
+    if target_prior_map is None:
+        return locability_map.sum() * 0.0
+    loc = locability_map.float()
+    target = target_prior_map.to(device=loc.device, dtype=torch.float32)
+    if target.shape[-2:] != loc.shape[-2:]:
+        target = F.interpolate(target, size=loc.shape[-2:], mode="bilinear", align_corners=False)
+    if target.shape[1] != loc.shape[1]:
+        if target.shape[1] == 1:
+            target = target.expand(-1, loc.shape[1], -1, -1)
+        else:
+            target = target[:, : loc.shape[1]]
+    with torch.cuda.amp.autocast(enabled=False):
+        return F.binary_cross_entropy(
+            loc.clamp(1e-4, 1.0 - 1e-4).float(),
+            target.clamp(0.0, 1.0).float(),
+        )
+
+
 @torch.no_grad()
 def extract_superpoint_teacher_batch(
     teacher: SuperPointNet,
@@ -538,10 +577,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--pnp_locability_loss_weight", type=float, default=0.05)
     parser.add_argument("--pnp_locability_prior_weight", type=float, default=0.1)
     parser.add_argument("--pnp_locability_target_prior_weight", type=float, default=0.0)
+    parser.add_argument("--pnp_locability_target_prior_start_epoch", type=int, default=1)
+    parser.add_argument("--pnp_locability_target_prior_warmup_epochs", type=int, default=1)
+    parser.add_argument("--pnp_topk", type=int, default=16)
+    parser.add_argument("--pnp_occlusion_depth_tolerance", type=float, default=0.05)
+    parser.add_argument("--pnp_occlusion_depth_rel_tolerance", type=float, default=0.02)
+    parser.add_argument("--pnp_gt_alpha_threshold", type=float, default=0.05)
     parser.add_argument("--locability_target_detector_weight", type=float, default=1.0)
     parser.add_argument("--locability_target_alpha_weight", type=float, default=0.25)
     parser.add_argument("--locability_target_depth_weight", type=float, default=0.5)
     parser.add_argument("--locability_target_depth_window", type=int, default=3)
+    parser.add_argument("--locability_prior_target_weight", type=float, default=0.0)
+    parser.add_argument("--locability_prior_target_start_epoch", type=int, default=1)
+    parser.add_argument("--locability_prior_target_warmup_epochs", type=int, default=1)
     parser.add_argument("--same_view_match_weight", type=float, default=0.0)
     parser.add_argument("--same_view_locability_weight", type=float, default=0.0)
     parser.add_argument("--same_view_temperature", type=float, default=0.07)
@@ -569,6 +617,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--locability_ambiguity_weight", type=float, default=0.0)
     parser.add_argument("--locability_budget_weight", type=float, default=0.0)
     parser.add_argument("--key_gaussian_isotropy_weight", type=float, default=0.0)
+    parser.add_argument("--ply_residual_reg_weight", type=float, default=0.0)
+    parser.add_argument("--ply_residual_reg_samples", type=int, default=4096)
     parser.add_argument("--superpoint_cache_root", default="")
     parser.add_argument("--disable_superpoint_cache", action="store_true")
     parser.add_argument("--localization_keypoints", type=int, default=256)
@@ -721,6 +771,10 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         locability_weight=args.pnp_locability_loss_weight,
         locability_prior_weight=args.pnp_locability_prior_weight,
         locability_target_prior_weight=args.pnp_locability_target_prior_weight,
+        topk_pnp=args.pnp_topk,
+        occlusion_depth_tolerance=args.pnp_occlusion_depth_tolerance,
+        occlusion_depth_rel_tolerance=args.pnp_occlusion_depth_rel_tolerance,
+        gt_alpha_threshold=args.pnp_gt_alpha_threshold,
     ).to(device)
     def trainable_params(params):
         return [param for param in params if param.requires_grad]
@@ -884,11 +938,37 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     target_sigma_px=args.same_view_target_sigma_px,
                     locability_weight=args.same_view_locability_weight,
                 )
+                active_locability_prior_target_weight = scheduled_loss_weight(
+                    epoch,
+                    args.locability_prior_target_weight,
+                    start_epoch=args.locability_prior_target_start_epoch,
+                    warmup_epochs=args.locability_prior_target_warmup_epochs,
+                )
+                gt_locability_prior = None
+                if active_locability_prior_target_weight > 0.0:
+                    gt_locability_prior = locability_target_prior_from_render(
+                        gt_render,
+                        detector_weight=args.locability_target_detector_weight,
+                        alpha_weight=args.locability_target_alpha_weight,
+                        depth_weight=args.locability_target_depth_weight,
+                        depth_window=args.locability_target_depth_window,
+                    )
+                locability_prior_target = locability_prior_alignment_loss(
+                    gt_render["locability"],
+                    gt_locability_prior,
+                )
 
                 loc_pose = perturb_pose_batch(pose, args.pose_noise_trans_m, args.pose_noise_rot_deg).detach()
                 loc_render = render_hybrid_superpoint(model, sp_head, renderer, loc_pose)
+                active_locability_target_prior_weight = scheduled_loss_weight(
+                    epoch,
+                    args.pnp_locability_target_prior_weight,
+                    start_epoch=args.pnp_locability_target_prior_start_epoch,
+                    warmup_epochs=args.pnp_locability_target_prior_warmup_epochs,
+                )
+                pnp_loss_fn.locability_target_prior_weight = active_locability_target_prior_weight
                 locability_target_prior = None
-                if args.pnp_locability_target_prior_weight > 0.0:
+                if active_locability_target_prior_weight > 0.0:
                     locability_target_prior = locability_target_prior_from_render(
                         loc_render,
                         detector_weight=args.locability_target_detector_weight,
@@ -907,6 +987,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     K=renderer.K.float(),
                     locability_map=loc_render["locability"],
                     locability_target_prior_map=locability_target_prior,
+                    gt_depth_map=gt_render["depth"],
+                    gt_alpha_map=gt_render["alpha"],
                 )
 
                 locability_sparse = (
@@ -1078,6 +1160,26 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     if args.key_gaussian_isotropy_weight > 0.0
                     else pred_desc.new_tensor(0.0)
                 )
+                ply_residual_reg = pred_desc.new_tensor(0.0)
+                loc_feature = model.get_ply_loc_feature()
+                if (
+                    args.ply_residual_reg_weight > 0.0
+                    and loc_feature.numel() > 0
+                    and loc_feature.shape[1] > 0
+                ):
+                    sample_count = min(
+                        max(1, int(args.ply_residual_reg_samples)),
+                        int(model.num_gaussians),
+                    )
+                    residual_ids = torch.randint(
+                        low=0,
+                        high=int(model.num_gaussians),
+                        size=(sample_count,),
+                        device=device,
+                    )
+                    residual_desc = decode_gaussian_center_descriptors(model, sp_head, residual_ids)
+                    residual_ref = loc_feature.to(device=device, dtype=torch.float32)[residual_ids]
+                    ply_residual_reg = descriptor_residual_alignment_loss(residual_desc, residual_ref)
                 geometry_reg = pred_desc.new_tensor(0.0)
                 if args.train_xyz:
                     geometry_reg = geometry_reg + F.mse_loss(model.get_xyz(), xyz0)
@@ -1098,6 +1200,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     + args.sp_recon_weight * sp_recon
                     + args.detector_recon_weight * det_recon
                     + args.locability_sparse_weight * locability_sparse
+                    + active_locability_prior_target_weight * locability_prior_target
                     + args.geometry_reg_weight * geometry_reg
                     + args.cross_view_weight * xview_out["total"]
                     + args.external_match_supervision_weight * external_out["total"]
@@ -1106,6 +1209,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     + args.splatloc_saliency_prior_weight * saliency_loss
                     + args.locability_ambiguity_weight * ambiguity_loss
                     + args.key_gaussian_isotropy_weight * isotropy_loss
+                    + args.ply_residual_reg_weight * ply_residual_reg
                 )
 
             scaler.scale(loss / float(grad_accum_steps)).backward()
@@ -1125,6 +1229,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             metrics = {
                 "loss": float(loss.detach()),
                 "pnp_weight": float(active_pnp_weight),
+                "locability_target_prior_weight": float(active_locability_target_prior_weight),
+                "locability_prior_target_weight": float(active_locability_prior_target_weight),
                 "pnp": float(pnp_out["total"].detach()),
                 "pose": float(pnp_out["pose"].detach()),
                 "match": float(pnp_out["match"].detach()),
@@ -1137,6 +1243,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "sp_recon": float(sp_recon.detach()),
                 "det_recon": float(det_recon.detach()),
                 "locability": float(locability_sparse.detach()),
+                "locability_prior_target": float(locability_prior_target.detach()),
                 "geometry_reg": float(geometry_reg.detach()),
                 "xview": float(xview_out["total"].detach()),
                 "xview_samples": float(xview_out["valid_samples"].detach()),
@@ -1149,6 +1256,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "saliency": float(saliency_loss.detach()),
                 "ambiguity": float(ambiguity_loss.detach()),
                 "isotropy": float(isotropy_loss.detach()),
+                "ply_residual_reg": float(ply_residual_reg.detach()),
             }
             for key, value in metrics.items():
                 accum[key] = accum.get(key, 0.0) + value
