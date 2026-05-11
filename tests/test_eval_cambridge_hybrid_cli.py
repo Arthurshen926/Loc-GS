@@ -278,6 +278,20 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert config["match_filter_min_matches"] == 64
 
 
+def test_eval_parser_defaults_are_baseline_preserving():
+    args = build_argparser().parse_args(["--checkpoint", "output/model/latest.pth"])
+
+    assert args.eval_split == "test"
+    assert args.landmark_source == "stdloc_detector"
+    assert args.descriptor_source == "ply_loc"
+    assert args.query_detector == "stdloc"
+    assert args.query_feature_source == "original"
+    assert args.matcher == "stdloc_parity"
+
+    config = effective_eval_config(args)
+    assert config["eval_split"] == "test"
+
+
 def test_detector_prior_for_all_gaussians_maps_sampled_scores_to_sampled_ids():
     scores = torch.tensor([0.2, 0.8], dtype=torch.float32)
     sampled_ids = torch.tensor([2, 4], dtype=torch.long)

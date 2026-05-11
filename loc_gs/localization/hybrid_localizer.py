@@ -3,10 +3,70 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+class _CV2Fallback:
+    SOLVEPNP_EPNP = 1
+    SOLVEPNP_ITERATIVE = 0
+
+    def solvePnPRansac(self, *_args, **_kwargs):
+        raise ImportError("OpenCV is required for solvePnPRansac")
+
+    def solvePnP(self, *_args, **_kwargs):
+        raise ImportError("OpenCV is required for solvePnP")
+
+    def Rodrigues(self, src):
+        arr = np.asarray(src, dtype=np.float64)
+        if arr.shape == (3, 3):
+            return np.zeros((3, 1), dtype=np.float64), None
+        vec = arr.reshape(3)
+        theta = float(np.linalg.norm(vec))
+        if theta < 1e-12:
+            return np.eye(3, dtype=np.float64), None
+        axis = vec / theta
+        kx, ky, kz = axis
+        K = np.asarray(
+            [[0.0, -kz, ky], [kz, 0.0, -kx], [-ky, kx, 0.0]],
+            dtype=np.float64,
+        )
+        R = np.eye(3, dtype=np.float64) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
+        return R, None
+
+    def projectPoints(self, object_points, rvec, tvec, K, _dist_coeffs):
+        R, _ = self.Rodrigues(rvec)
+        pts = np.asarray(object_points, dtype=np.float64) @ R.T + np.asarray(tvec, dtype=np.float64).reshape(1, 3)
+        z = np.where(np.abs(pts[:, 2]) < 1e-12, 1e-12, pts[:, 2])
+        intr = np.asarray(K, dtype=np.float64)
+        x = intr[0, 0] * pts[:, 0] / z + intr[0, 2]
+        y = intr[1, 1] * pts[:, 1] / z + intr[1, 2]
+        return np.stack([x, y], axis=-1).reshape(-1, 1, 2), None
+
+
+class _LazyCV2:
+    def __init__(self) -> None:
+        self._module = None
+
+    def _load(self):
+        if self._module is None:
+            try:
+                import cv2 as cv2_module
+            except ImportError:
+                cv2_module = _CV2Fallback()
+            self._module = cv2_module
+        return self._module
+
+    def __getattr__(self, name: str):
+        return getattr(self._load(), name)
+
+
+cv2 = _LazyCV2()
+
+
+def _cv2():
+    return cv2
 
 
 def sample_descriptors_bilinear(
@@ -196,7 +256,8 @@ def solve_pnp_ransac(
                 if refined_pose is not None:
                     return refined_pose, refined_inliers
             return pose, inliers
-    ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+    cv2_module = _cv2()
+    ok, rvec, tvec, inliers = cv2_module.solvePnPRansac(
         object_points,
         image_points_xy,
         K.astype(np.float64),
@@ -204,14 +265,14 @@ def solve_pnp_ransac(
         iterationsCount=int(iterations),
         reprojectionError=float(reprojection_error),
         confidence=float(confidence),
-        flags=cv2.SOLVEPNP_EPNP,
+        flags=cv2_module.SOLVEPNP_EPNP,
     )
     if not ok:
         return None, 0
     if inliers is not None and len(inliers) >= 4:
         refine_ids = inliers[:, 0]
         if refine_reprojection_error is not None and float(refine_reprojection_error) > 0.0:
-            projected, _ = cv2.projectPoints(
+            projected, _ = cv2_module.projectPoints(
                 object_points[refine_ids],
                 rvec,
                 tvec,
@@ -225,7 +286,7 @@ def solve_pnp_ransac(
                 refine_ids = refine_ids[tight]
         inlier_obj = object_points[refine_ids]
         inlier_img = image_points_xy[refine_ids]
-        ok_refine, rvec, tvec = cv2.solvePnP(
+        ok_refine, rvec, tvec = cv2_module.solvePnP(
             inlier_obj,
             inlier_img,
             K.astype(np.float64),
@@ -233,11 +294,11 @@ def solve_pnp_ransac(
             rvec,
             tvec,
             useExtrinsicGuess=True,
-            flags=cv2.SOLVEPNP_ITERATIVE,
+            flags=cv2_module.SOLVEPNP_ITERATIVE,
         )
         if not ok_refine:
             return None, 0
-    R, _ = cv2.Rodrigues(rvec)
+    R, _ = cv2_module.Rodrigues(rvec)
     pose = np.eye(4, dtype=np.float64)
     pose[:3, :3] = R
     pose[:3, 3] = tvec[:, 0]
@@ -254,6 +315,7 @@ def _refine_pose_with_reprojection_inliers(
     reprojection_error: float,
     refine_reprojection_error: Optional[float],
 ) -> tuple[Optional[np.ndarray], int]:
+    cv2 = _cv2()
     pose = np.asarray(init_pose, dtype=np.float64)
     if pose.shape != (4, 4) or not np.isfinite(pose).all():
         return None, 0

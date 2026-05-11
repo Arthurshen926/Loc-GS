@@ -120,3 +120,39 @@ def test_poselib_solver_can_refine_pose_with_opencv_inliers(monkeypatch):
     assert pose is not None
     assert inliers == points3d.shape[0]
     assert calls["solvepnp"] == 1
+
+
+def test_poselib_solver_without_refine_does_not_require_opencv(monkeypatch):
+    points3d = np.array(
+        [
+            [0.0, 0.0, 5.0],
+            [1.0, 0.0, 5.0],
+            [0.0, 1.0, 5.0],
+            [1.0, 1.0, 5.0],
+        ],
+        dtype=np.float64,
+    )
+    keypoints_yx = np.stack([points3d[:, 1] / points3d[:, 2], points3d[:, 0] / points3d[:, 2]], axis=-1)
+    K = np.eye(3, dtype=np.float64)
+    init_pose = np.eye(4, dtype=np.float32)
+
+    def fake_poselib(*_args, **_kwargs):
+        return init_pose, 4
+
+    def fail_solvepnp(*_args, **_kwargs):
+        raise AssertionError("OpenCV fallback should not run when poselib succeeds")
+
+    monkeypatch.setattr(hybrid_localizer, "_solve_pnp_poselib", fake_poselib)
+    monkeypatch.setattr(hybrid_localizer.cv2, "solvePnPRansac", fail_solvepnp)
+
+    pose, inliers = hybrid_localizer.solve_pnp_ransac(
+        points3d,
+        keypoints_yx,
+        K,
+        reprojection_error=2.0,
+        solver="poselib",
+        refine_poselib=False,
+    )
+
+    assert pose is init_pose
+    assert inliers == 4

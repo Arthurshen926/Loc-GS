@@ -187,6 +187,17 @@ def test_training_parser_exposes_same_view_geometric_match_options():
     assert args.teacher_feature_source == "original"
 
 
+def test_training_parser_defaults_to_conservative_reliability_recipe():
+    args = build_argparser().parse_args([])
+
+    assert args.batch_size == 8
+    assert args.num_workers == 4
+    assert args.pnp_weight == 0.1
+    assert args.pnp_pose_loss_weight == 0.0
+    assert args.pnp_reprojection_loss_weight == 0.0
+    assert args.same_view_match_weight == 1.0
+
+
 def test_scheduled_loss_weight_starts_late_and_warms_up_linearly():
     assert scheduled_loss_weight(epoch=1, base_weight=0.5, start_epoch=3, warmup_epochs=2) == 0.0
     assert scheduled_loss_weight(epoch=3, base_weight=0.5, start_epoch=3, warmup_epochs=2) == 0.25

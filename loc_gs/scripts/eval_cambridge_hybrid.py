@@ -418,6 +418,7 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
         "sparse_matcher": sparse_matcher,
         "dense_matcher": dense_matcher,
         "solver": args.solver,
+        "eval_split": getattr(args, "eval_split", "test"),
         "poselib_refine": bool(args.poselib_refine),
         "query_keypoints": int(args.query_keypoints),
         "keypoint_threshold": float(args.keypoint_threshold),
@@ -2397,10 +2398,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--data_root", default="/mnt/pool/sqy/Cambridge_stdloc")
     parser.add_argument("--output_dir", default="")
     parser.add_argument("--eval_pose_source", choices=["cambridge", "cameras_json"], default="cambridge")
+    parser.add_argument("--eval_split", choices=["train", "test"], default="test")
     parser.add_argument("--max_queries", type=int, default=0)
     parser.add_argument("--query_offset", type=int, default=0)
     parser.add_argument("--query_stride", type=int, default=1)
-    parser.add_argument("--landmark_source", choices=["rendered", "gaussian", "stdloc_detector"], default="rendered")
+    parser.add_argument("--landmark_source", choices=["rendered", "gaussian", "stdloc_detector"], default="stdloc_detector")
     parser.add_argument("--stdloc_detector_dir", default="")
     parser.add_argument("--landmark_candidate_source", choices=["sampled", "all_gaussians"], default="sampled")
     parser.add_argument("--landmark_selection", choices=["global", "per_view", "per_view_spatial"], default="global")
@@ -2439,14 +2441,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--descriptor_source",
         choices=["hybrid", "ply_loc", "hybrid_ply_blend", "hybrid_ply_gated_residual"],
-        default="hybrid",
+        default="ply_loc",
     )
     parser.add_argument("--ply_loc_feature_weight", type=float, default=0.5)
     parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.05)
     parser.add_argument("--alpha_threshold", type=float, default=0.05)
     parser.add_argument("--query_keypoints", type=int, default=2048)
-    parser.add_argument("--query_detector", choices=["superpoint", "stdloc"], default="superpoint")
-    parser.add_argument("--query_feature_source", choices=["resized", "original"], default="resized")
+    parser.add_argument("--query_detector", choices=["superpoint", "stdloc"], default="stdloc")
+    parser.add_argument("--query_feature_source", choices=["resized", "original"], default="original")
     parser.add_argument("--stdloc_detector_path", default="")
     parser.add_argument("--keypoint_threshold", type=float, default=0.015)
     parser.add_argument("--nms_radius", type=int, default=4)
@@ -2454,7 +2456,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dense_match_threshold", type=float, default=0.0)
     parser.add_argument("--locability_prior_weight", type=float, default=0.05)
     parser.add_argument("--dense_iters", type=int, default=2)
-    parser.add_argument("--matcher", choices=["stdloc_parity", "topk"], default="topk")
+    parser.add_argument("--matcher", choices=["stdloc_parity", "topk"], default="stdloc_parity")
     parser.add_argument("--sparse_matcher", choices=["", *SPARSE_MATCHERS], default="")
     parser.add_argument("--dense_matcher", choices=["", *DENSE_MATCHERS], default="")
     parser.add_argument("--dim_pipeline", choices=DIM_PIPELINES, default="superpoint+lightglue")
@@ -2572,11 +2574,12 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     if args.query_stride < 1:
         raise ValueError("--query_stride must be at least 1")
     need_query_subset = args.query_offset > 0 or args.query_stride > 1
+    eval_split = getattr(args, "eval_split", "test")
     eval_cameras_json = train_args["cameras_json"] if args.eval_pose_source == "cameras_json" else None
     dataset = CambridgeHybridDataset(
         scene_root=scene_root,
         cameras_json=eval_cameras_json,
-        split="test",
+        split=eval_split,
         image_subdir=train_args.get("image_subdir", "processed"),
         image_height=train_args["image_height"],
         image_width=train_args["image_width"],
@@ -2656,7 +2659,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         stdloc_detector.eval()
     teacher_cache = None
     if not args.disable_superpoint_cache:
-        cache_split = "test" if args.query_feature_source == "resized" else f"test_{args.query_feature_source}"
+        cache_split = eval_split if args.query_feature_source == "resized" else f"{eval_split}_{args.query_feature_source}"
         teacher_cache = SuperPointTeacherCache(
             args.superpoint_cache_root or train_args.get("output_root", "output"),
             scene=scene,
@@ -2874,6 +2877,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         "checkpoint": str(args.checkpoint),
         "scene": scene,
         "eval_pose_source": args.eval_pose_source,
+        "eval_split": eval_split,
         "query_offset": int(args.query_offset),
         "query_stride": int(args.query_stride),
         "eval_config": eval_config,

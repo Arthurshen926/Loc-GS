@@ -137,3 +137,23 @@ def test_coarse_to_fine_dense_matches_applies_fine_rendered_prior():
 
     assert result.query_yx.shape[0] > 0
     assert torch.all(result.rendered_yx == torch.tensor([1.0, 1.0]))
+
+
+def test_coarse_to_fine_dense_matches_handles_multiple_coarse_cells_without_broadcasting():
+    query_fine = F.normalize(torch.ones(2, 4, 8), dim=0)
+    rendered_fine = F.normalize(torch.ones(2, 4, 8), dim=0)
+
+    result = coarse_to_fine_dense_matches(
+        query_fine,
+        rendered_fine,
+        window_size=2,
+        coarse_threshold=0.0,
+        fine_threshold=0.0,
+        use_mnn=False,
+        subpixel_refine=True,
+        subpixel_temperature=0.1,
+    )
+
+    assert result.query_yx.shape[0] > 0
+    assert result.query_yx.ndim == 2
+    assert result.rendered_yx.shape == result.query_yx.shape

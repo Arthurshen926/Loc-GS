@@ -35,7 +35,6 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -48,6 +47,12 @@ import matplotlib.pyplot as plt
 
 from loc_gs.config import load_config
 from loc_gs.scripts.train_feature_field import LocGSTrainer
+
+
+def _cv2():
+    import cv2
+
+    return cv2
 
 
 # ===================================================================
@@ -454,6 +459,7 @@ def solve_pnp(
     Returns:
         estimated_w2c: [4, 4] estimated world-to-camera matrix, or None if failed
     """
+    cv2 = _cv2()
     if len(kp_2d) < 4:
         return None
 

@@ -1,0 +1,99 @@
+{
+  "scenes": {
+    "GreatCourt": {
+      "branches": {
+        "stdloc_baseline": {
+          "eval_dir": "output/stdloc/results/baseline_great_fastscene-map_cambridge_spgs_GreatCourt_stream_stable2-20260504_205223"
+        },
+        "historical_selected": {
+          "eval_dir": "output/stdloc_hybrid/GreatCourt_sweep_full_mnn_blend08_lw005_20260510"
+        },
+        "spgs2_p0_full": {
+          "eval_dir": "output/stdloc_hybrid/GreatCourt_spgs2_p0_full_b6_eval_full_20260511"
+        },
+        "reliability_b8_protected": {
+          "eval_dir": "output/stdloc_hybrid/GreatCourt_reliability_b8_e10_20260511/eval_reliability_protected"
+        },
+        "reliability_b8_learned_blend": {
+          "eval_dir": "output/stdloc_hybrid/GreatCourt_reliability_b8_e10_20260511/eval_reliability_learned_blend"
+        }
+      }
+    },
+    "KingsCollege": {
+      "branches": {
+        "stdloc_baseline": {
+          "eval_dir": "output/stdloc/results/baseline_kings-map_cambridge_spgs_KingsCollege-20260504_195443"
+        },
+        "historical_selected": {
+          "eval_dir": "output/stdloc_hybrid/KingsCollege_latest_cfg4/eval_full_current_strong_r8_20260510"
+        },
+        "spgs2_p0_full": {
+          "eval_dir": "output/stdloc_hybrid/KingsCollege_spgs2_p0_full_b6_eval_full_20260511"
+        },
+        "reliability_b8_protected": {
+          "eval_dir": "output/stdloc_hybrid/KingsCollege_reliability_b8_e10_20260511/eval_reliability_protected"
+        },
+        "reliability_b8_learned_blend": {
+          "eval_dir": "output/stdloc_hybrid/KingsCollege_reliability_b8_e10_20260511/eval_reliability_learned_blend"
+        }
+      }
+    },
+    "OldHospital": {
+      "branches": {
+        "stdloc_baseline": {
+          "eval_dir": "output/stdloc/results/baseline_old-map_cambridge_spgs_OldHospital-20260504_202723"
+        },
+        "historical_selected": {
+          "eval_dir": "output/stdloc_hybrid/OldHospital_latest_cfg4/eval_full_current_strong_r8_20260510"
+        },
+        "spgs2_p0_full": {
+          "eval_dir": "output/stdloc_hybrid/OldHospital_spgs2_p0_full_b6_eval_full_20260511"
+        },
+        "reliability_b8_protected": {
+          "eval_dir": "output/stdloc_hybrid/OldHospital_reliability_b8_e10_20260511/eval_reliability_protected"
+        },
+        "reliability_b8_learned_blend": {
+          "eval_dir": "output/stdloc_hybrid/OldHospital_reliability_b8_e10_20260511/eval_reliability_learned_blend"
+        }
+      }
+    },
+    "ShopFacade": {
+      "branches": {
+        "stdloc_baseline": {
+          "eval_dir": "output/stdloc/results/baseline_shop-map_cambridge_spgs_ShopFacade-20260504_181547"
+        },
+        "historical_selected": {
+          "eval_dir": "output/stdloc_hybrid/ShopFacade_hardneg/eval_full_blend09_dense2_r8"
+        },
+        "spgs2_p0_full": {
+          "eval_dir": "output/stdloc_hybrid/ShopFacade_spgs2_p0_full_b6_eval_full_20260511"
+        },
+        "reliability_b8_protected": {
+          "eval_dir": "output/stdloc_hybrid/ShopFacade_reliability_b8_e10_20260511/eval_reliability_protected"
+        },
+        "reliability_b8_learned_blend": {
+          "eval_dir": "output/stdloc_hybrid/ShopFacade_reliability_b8_e10_20260511/eval_reliability_learned_blend"
+        }
+      }
+    },
+    "StMarysChurch": {
+      "branches": {
+        "stdloc_baseline": {
+          "eval_dir": "output/stdloc/results/baseline_stmary_full-map_cambridge_spgs_StMarysChurch_stream_fastsave-20260504_231007"
+        },
+        "historical_selected": {
+          "eval_dir": "output/stdloc_hybrid/StMarysChurch_latest_cfg4/eval_full_current_strong_r8_20260510"
+        },
+        "spgs2_p0_full": {
+          "eval_dir": "output/stdloc_hybrid/StMarysChurch_spgs2_p0_full_b6_eval_full_20260511"
+        },
+        "reliability_b8_protected": {
+          "eval_dir": "output/stdloc_hybrid/StMarysChurch_reliability_b8_e10_20260511/eval_reliability_protected"
+        },
+        "reliability_b8_learned_blend": {
+          "eval_dir": "output/stdloc_hybrid/StMarysChurch_reliability_b8_e10_20260511/eval_reliability_learned_blend"
+        }
+      }
+    }
+  }
+}

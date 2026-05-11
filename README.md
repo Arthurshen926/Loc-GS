@@ -137,6 +137,62 @@ CUDA_VISIBLE_DEVICES=0 python -m loc_gs.scripts.eval_cambridge_hybrid \
 
 See `docs/cambridge_hybrid_localization.md` for the current implementation status and pilot evidence.
 
+The current paper-facing Cambridge recipe is baseline-preserving: use the
+STDLoc sampled/PLY descriptor backbone by default, then select learned branches
+from a train/calibration-val split instead of hand-picking per-scene test
+results.
+
+```bash
+/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.select_cambridge_branch \
+  --manifest docs/cambridge_branch_manifest_reliability_20260511.json \
+  --output output/paper_figures/reliability_selection_20260511/selected_branch.json \
+  --metric combined
+
+/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.eval_cambridge_branch_selected \
+  --selected_branch output/paper_figures/reliability_selection_20260511/selected_branch.json \
+  --manifest docs/cambridge_branch_manifest_reliability_20260511.json \
+  --output_dir output/paper_figures/reliability_selection_20260511
+
+/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.select_cambridge_query_pose \
+  --manifest docs/cambridge_branch_manifest_reliability_20260511.json \
+  --output_dir output/paper_figures/reliability_query_selection_20260511/split_even_cal_odd_test \
+  --mode calibrated_confidence \
+  --calibration_stride 2 --calibration_offset 0 \
+  --test_stride 2 --test_offset 1
+```
+
+For batched multi-GPU Cambridge training, launch one scene per idle GPU with the
+conservative reliability recipe:
+
+```bash
+/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_reliability_recipe \
+  --scenes GreatCourt,KingsCollege,OldHospital,ShopFacade,StMarysChurch \
+  --batch_size 8 \
+  --gpus 0,1,2
+
+/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_reliability_eval \
+  --scenes GreatCourt,KingsCollege,OldHospital,ShopFacade,StMarysChurch \
+  --tag reliability_recipe \
+  --recipes protected,learned_blend \
+  --gpus 0,1,2
+
+# Optional for long single-scene evals: split each recipe by query index and
+# merge shard summaries back into the recipe eval directory.
+/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_reliability_eval \
+  --scenes StMarysChurch \
+  --tag reliability_recipe \
+  --recipes protected,learned_blend \
+  --query_shards 3 \
+  --gpus 0,1,2
+
+/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.select_cambridge_query_pose \
+  --manifest docs/cambridge_branch_manifest_reliability_b8_e10_20260511.json \
+  --output_dir output/paper_figures/reliability_query_selection_b8_e10_20260511/split_even_cal_odd_test \
+  --mode calibrated_confidence \
+  --calibration_stride 2 --calibration_offset 0 \
+  --test_stride 2 --test_offset 1
+```
+
 ## Verification
 
 From `/root/Loc-GS`:

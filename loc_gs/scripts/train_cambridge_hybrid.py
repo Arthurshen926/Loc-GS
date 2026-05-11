@@ -182,7 +182,17 @@ def scheduled_loss_weight(
 
 
 def default_ply_path(output_root: Path, scene: str) -> Path:
-    return output_root / "stdloc" / "map_cambridge_spgs" / scene / "point_cloud" / "iteration_30000" / "point_cloud.ply"
+    map_root = output_root / "stdloc" / "map_cambridge_spgs"
+    scene_variants = {
+        "GreatCourt": ("GreatCourt", "GreatCourt_stream_stable2"),
+        "StMarysChurch": ("StMarysChurch", "StMarysChurch_stream_fastsave"),
+    }.get(scene, (scene,))
+    fallback = map_root / scene_variants[0] / "point_cloud" / "iteration_30000" / "point_cloud.ply"
+    for variant in scene_variants:
+        candidate = map_root / variant / "point_cloud" / "iteration_30000" / "point_cloud.ply"
+        if candidate.exists():
+            return candidate
+    return fallback
 
 
 def render_hybrid_superpoint(
@@ -550,8 +560,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--image_width", type=int, default=640)
     parser.add_argument("--image_height", type=int, default=360)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--max_train_batches", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
@@ -573,15 +583,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--geometry_reg_weight", type=float, default=1.0)
     parser.add_argument("--sp_recon_weight", type=float, default=0.05)
     parser.add_argument("--detector_recon_weight", type=float, default=0.005)
-    parser.add_argument("--pnp_weight", type=float, default=1.0)
+    parser.add_argument("--pnp_weight", type=float, default=0.1)
     parser.add_argument("--pnp_start_epoch", type=int, default=1)
     parser.add_argument("--pnp_warmup_epochs", type=int, default=1)
     parser.add_argument("--pnp_temperature", type=float, default=0.07)
     parser.add_argument("--pnp_target_sigma_px", type=float, default=2.0)
-    parser.add_argument("--pnp_pose_loss_weight", type=float, default=1.0)
-    parser.add_argument("--pnp_match_loss_weight", type=float, default=0.5)
-    parser.add_argument("--pnp_quality_loss_weight", type=float, default=0.5)
-    parser.add_argument("--pnp_reprojection_loss_weight", type=float, default=0.5)
+    parser.add_argument("--pnp_pose_loss_weight", type=float, default=0.0)
+    parser.add_argument("--pnp_match_loss_weight", type=float, default=0.25)
+    parser.add_argument("--pnp_quality_loss_weight", type=float, default=0.25)
+    parser.add_argument("--pnp_reprojection_loss_weight", type=float, default=0.0)
     parser.add_argument("--pnp_observability_loss_weight", type=float, default=0.02)
     parser.add_argument("--pnp_locability_loss_weight", type=float, default=0.05)
     parser.add_argument("--pnp_locability_prior_weight", type=float, default=0.1)
@@ -599,7 +609,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--locability_prior_target_weight", type=float, default=0.0)
     parser.add_argument("--locability_prior_target_start_epoch", type=int, default=1)
     parser.add_argument("--locability_prior_target_warmup_epochs", type=int, default=1)
-    parser.add_argument("--same_view_match_weight", type=float, default=0.0)
+    parser.add_argument("--same_view_match_weight", type=float, default=1.0)
     parser.add_argument("--same_view_locability_weight", type=float, default=0.0)
     parser.add_argument("--same_view_temperature", type=float, default=0.07)
     parser.add_argument("--same_view_target_sigma_px", type=float, default=1.0)

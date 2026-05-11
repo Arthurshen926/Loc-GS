@@ -37,16 +37,23 @@ def mnn_match(
     """Return mutual-nearest-neighbor matches from [B, N, M] scores."""
     if corr_matrix.dim() != 3:
         raise ValueError("corr_matrix must have shape [B, N, M]")
-    row_best = corr_matrix == corr_matrix.max(dim=-1, keepdim=True).values
-    col_best = corr_matrix == corr_matrix.max(dim=-2, keepdim=True).values
-    keep = row_best & col_best & (corr_matrix > float(threshold))
+    row_ids = torch.argmax(corr_matrix, dim=-1)
+    col_ids = torch.argmax(corr_matrix, dim=-2)
+    B, N, _M = corr_matrix.shape
+    b_grid = torch.arange(B, device=corr_matrix.device).view(B, 1).expand(B, N)
+    q_grid = torch.arange(N, device=corr_matrix.device).view(1, N).expand(B, N)
+    row_scores = corr_matrix.gather(-1, row_ids.unsqueeze(-1)).squeeze(-1)
+    mutual = col_ids.gather(-1, row_ids) == q_grid
+    keep = mutual & (row_scores > float(threshold))
     margin = max(float(second_best_margin), 0.0)
     if margin > 0.0 and corr_matrix.shape[-1] > 1:
         top2 = torch.topk(corr_matrix, k=2, dim=-1).values
         row_margin = top2[..., 0] - top2[..., 1]
-        keep = keep & (row_margin[..., None] >= margin)
-    b_ids, q_ids, r_ids = torch.where(keep)
-    scores = corr_matrix[b_ids, q_ids, r_ids]
+        keep = keep & (row_margin >= margin)
+    b_ids = b_grid[keep]
+    q_ids = q_grid[keep]
+    r_ids = row_ids[keep]
+    scores = row_scores[keep]
     return b_ids, q_ids, r_ids, scores
 
 
@@ -207,45 +214,88 @@ def coarse_to_fine_dense_matches(
         empty_l = torch.empty(0, dtype=torch.long, device=query_fine.device)
         return DenseMatchResult(empty, empty, query_fine.new_empty(0), empty_l, empty_l)
 
-    query_windows = F.unfold(query_fine.unsqueeze(0), kernel_size=(W, W), stride=W)
-    query_windows = query_windows.reshape(1, C, W * W, -1)[c_b, :, :, c_q].permute(0, 2, 1)
-    rendered_windows = F.unfold(rendered_fine.unsqueeze(0), kernel_size=(W, W), stride=W)
-    rendered_windows = rendered_windows.reshape(1, C, W * W, -1)[c_b, :, :, c_r].permute(0, 2, 1)
-    fine_scores_raw = torch.matmul(query_windows, rendered_windows.transpose(-2, -1))
+    c_b = c_b.reshape(-1)
+    c_q = c_q.reshape(-1)
+    c_r = c_r.reshape(-1)
+    query_windows_all = F.unfold(query_fine.unsqueeze(0), kernel_size=(W, W), stride=W)
+    query_windows_all = query_windows_all.reshape(1, C, W * W, -1).permute(0, 3, 2, 1)
+    rendered_windows_all = F.unfold(rendered_fine.unsqueeze(0), kernel_size=(W, W), stride=W)
+    rendered_windows_all = rendered_windows_all.reshape(1, C, W * W, -1).permute(0, 3, 2, 1)
+    rendered_prior_windows_all = None
     if rendered_prior is not None and float(prior_weight) != 0.0:
         rendered_prior_windows = F.unfold(
             rendered_prior.reshape(1, 1, Hf, Wf).float(),
             kernel_size=(W, W),
             stride=W,
         )
-        rendered_prior_windows = rendered_prior_windows.reshape(1, 1, W * W, -1)[c_b, :, :, c_r].squeeze(1)
-        rendered_prior_windows = rendered_prior_windows.clamp(0.0, 1.0)
-        rendered_prior_windows = rendered_prior_windows - rendered_prior_windows.mean(dim=-1, keepdim=True)
-        fine_scores_raw = fine_scores_raw + float(prior_weight) * rendered_prior_windows[:, None, :]
-    fine_corr = dual_softmax(fine_scores_raw, temp=fine_dual_softmax_temp)
-    f_b, f_q, f_r, f_scores = mnn_match(fine_corr, threshold=fine_threshold)
-    if f_q.numel() == 0:
+        rendered_prior_windows_all = rendered_prior_windows.reshape(1, 1, W * W, -1).permute(0, 3, 2, 1)
+
+    coarse_ids = []
+    fine_q_ids = []
+    fine_r_ids = []
+    fine_scores = []
+    q_offsets_chunks = []
+    r_offsets_chunks = []
+    chunk_size = 512
+    coarse_count = int(c_q.numel())
+    for start in range(0, coarse_count, chunk_size):
+        end = min(start + chunk_size, coarse_count)
+        ids = torch.arange(start, end, device=c_q.device)
+        cb = c_b[ids]
+        query_windows = query_windows_all[cb, c_q[ids]]
+        rendered_windows = rendered_windows_all[cb, c_r[ids]]
+        fine_scores_raw = torch.matmul(query_windows, rendered_windows.transpose(-2, -1))
+        if rendered_prior_windows_all is not None:
+            rendered_prior_windows = rendered_prior_windows_all[cb, c_r[ids]].squeeze(-1)
+            rendered_prior_windows = rendered_prior_windows.clamp(0.0, 1.0)
+            rendered_prior_windows = rendered_prior_windows - rendered_prior_windows.mean(dim=-1, keepdim=True)
+            fine_scores_raw = fine_scores_raw + float(prior_weight) * rendered_prior_windows[:, None, :]
+        fine_corr = dual_softmax(fine_scores_raw, temp=fine_dual_softmax_temp)
+        f_b, f_q, f_r, f_scores = mnn_match(fine_corr, threshold=fine_threshold)
+        if f_q.numel() == 0:
+            continue
+        coarse_ids.append(ids[f_b])
+        fine_q_ids.append(f_q)
+        fine_r_ids.append(f_r)
+        fine_scores.append(f_scores)
+        if subpixel_refine:
+            selected_scores = fine_scores_raw[f_b]
+            query_refine_scores = selected_scores.gather(
+                2,
+                f_r.reshape(-1, 1, 1).expand(-1, W * W, 1),
+            ).squeeze(-1)
+            rendered_refine_scores = selected_scores.gather(
+                1,
+                f_q.reshape(-1, 1, 1).expand(-1, 1, W * W),
+            ).squeeze(1)
+            q_offsets_chunks.append(
+                soft_argmax_offsets(
+                    query_refine_scores,
+                    window_size=W,
+                    temperature=subpixel_temperature,
+                )
+            )
+            r_offsets_chunks.append(
+                soft_argmax_offsets(
+                    rendered_refine_scores,
+                    window_size=W,
+                    temperature=subpixel_temperature,
+                )
+            )
+        else:
+            q_offsets_chunks.append(torch.stack([f_q // W, f_q % W], dim=-1).to(dtype=query_fine.dtype))
+            r_offsets_chunks.append(torch.stack([f_r // W, f_r % W], dim=-1).to(dtype=query_fine.dtype))
+    if not fine_q_ids:
         empty = query_fine.new_empty((0, 2))
         empty_l = torch.empty(0, dtype=torch.long, device=query_fine.device)
         return DenseMatchResult(empty, empty, query_fine.new_empty(0), empty_l, empty_l)
 
-    if subpixel_refine:
-        q_offsets = soft_argmax_offsets(
-            fine_scores_raw[f_b, :, f_r],
-            window_size=W,
-            temperature=subpixel_temperature,
-        )
-        r_offsets = soft_argmax_offsets(
-            fine_scores_raw[f_b, f_q, :],
-            window_size=W,
-            temperature=subpixel_temperature,
-        )
-    else:
-        q_offsets = torch.stack([f_q // W, f_q % W], dim=-1).to(dtype=query_fine.dtype)
-        r_offsets = torch.stack([f_r // W, f_r % W], dim=-1).to(dtype=query_fine.dtype)
-
-    coarse_q = c_q[f_b]
-    coarse_r = c_r[f_b]
+    matched_coarse = torch.cat(coarse_ids, dim=0)
+    f_scores = torch.cat(fine_scores, dim=0)
+    q_offsets = torch.cat(q_offsets_chunks, dim=0)
+    r_offsets = torch.cat(r_offsets_chunks, dim=0)
+    coarse_q = c_q[matched_coarse]
+    coarse_r = c_r[matched_coarse]
     q_origins = torch.stack([coarse_q // Wc * W, coarse_q % Wc * W], dim=-1).to(dtype=query_fine.dtype)
     r_origins = torch.stack([coarse_r // Wc * W, coarse_r % Wc * W], dim=-1).to(dtype=query_fine.dtype)
     return DenseMatchResult(
