@@ -14,7 +14,13 @@ from loc_gs.scripts.launch_cambridge_reliability_recipe import DEFAULT_SCENES, p
 from loc_gs.scripts.launch_dim_matcher_experiments import query_gpus, select_idle_gpus
 
 
-EVAL_RECIPES = ("protected", "learned_blend")
+EVAL_RECIPES = (
+    "protected",
+    "learned_blend",
+    "covisibility_select",
+    "covisibility_soft_select",
+    "covisibility_prosac",
+)
 
 
 @dataclass(frozen=True)
@@ -46,7 +52,8 @@ def build_eval_command(
     recipe = str(recipe)
     if recipe not in EVAL_RECIPES:
         raise ValueError(f"unsupported reliability eval recipe: {recipe}")
-    descriptor_source = "ply_loc" if recipe == "protected" else "hybrid_ply_blend"
+    descriptor_source = "hybrid_ply_blend" if recipe == "learned_blend" else "ply_loc"
+    solver = "opencv_prosac" if recipe == "covisibility_prosac" else "opencv"
     cmd = [
         sys.executable,
         "-m",
@@ -76,7 +83,7 @@ def build_eval_command(
         "--dense_full_render",
         "--subpixel_refine",
         "--solver",
-        "opencv",
+        solver,
         "--sparse_reprojection_error",
         str(float(pnp_reprojection_error)),
         "--dense_reprojection_error",
@@ -88,6 +95,93 @@ def build_eval_command(
     ]
     if recipe == "learned_blend":
         cmd.extend(["--ply_loc_feature_weight", "0.9"])
+    if recipe == "covisibility_select":
+        cmd.extend(
+            [
+                "--max_landmarks",
+                "12000",
+                "--landmark_candidate_source",
+                "sampled",
+                "--landmark_score_mode",
+                "matchability",
+                "--landmark_score_detector_weight",
+                "1.0",
+                "--landmark_score_locability_weight",
+                "0.0",
+                "--landmark_score_visibility_weight",
+                "0.75",
+                "--landmark_score_geometry_weight",
+                "0.5",
+                "--landmark_score_observability_weight",
+                "0.5",
+                "--landmark_score_prior_blend",
+                "0.75",
+                "--landmark_score_legacy_keep_ratio",
+                "0.5",
+                "--landmark_score_spatial_grid_size",
+                "8",
+            ]
+        )
+    if recipe == "covisibility_soft_select":
+        cmd.extend(
+            [
+                "--max_landmarks",
+                "14336",
+                "--landmark_candidate_source",
+                "sampled",
+                "--landmark_score_mode",
+                "matchability",
+                "--landmark_score_detector_weight",
+                "1.0",
+                "--landmark_score_locability_weight",
+                "0.0",
+                "--landmark_score_visibility_weight",
+                "0.5",
+                "--landmark_score_geometry_weight",
+                "0.5",
+                "--landmark_score_observability_weight",
+                "0.25",
+                "--landmark_score_ambiguity_weight",
+                "0.35",
+                "--landmark_score_ambiguity_radius",
+                "0.5",
+                "--landmark_score_prior_blend",
+                "0.5",
+                "--landmark_score_legacy_keep_ratio",
+                "0.75",
+                "--landmark_score_spatial_grid_size",
+                "8",
+            ]
+        )
+    if recipe == "covisibility_prosac":
+        cmd.extend(
+            [
+                "--landmark_candidate_source",
+                "sampled",
+                "--landmark_score_mode",
+                "matchability_prior",
+                "--landmark_score_detector_weight",
+                "1.0",
+                "--landmark_score_locability_weight",
+                "0.0",
+                "--landmark_score_visibility_weight",
+                "0.5",
+                "--landmark_score_geometry_weight",
+                "0.5",
+                "--landmark_score_observability_weight",
+                "0.25",
+                "--landmark_score_ambiguity_weight",
+                "0.35",
+                "--landmark_score_ambiguity_radius",
+                "0.5",
+                "--landmark_score_prior_blend",
+                "0.5",
+                "--match_filter_calibrated_score_weight",
+                "0.25",
+                "--match_filter_margin_weight",
+                "0.25",
+            ]
+        )
     if max_queries > 0:
         cmd.extend(["--max_queries", str(int(max_queries))])
     if query_stride != 1:

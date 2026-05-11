@@ -24,6 +24,10 @@ from loc_gs.scripts.eval_cambridge_hybrid import (
     upsample_feature_map,
 )
 from loc_gs.scripts.extract_superpoint_features import SuperPointNet
+from loc_gs.scripts.train_cambridge_hybrid import (
+    render_hybrid_superpoint,
+    sample_rehearsal_pose_batch,
+)
 
 
 def matchability_from_counts(
@@ -195,11 +199,25 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--descriptor_source",
         choices=["hybrid", "ply_loc", "hybrid_ply_blend", "hybrid_ply_gated_residual"],
-        default="hybrid_ply_blend",
+        default="ply_loc",
     )
     parser.add_argument("--ply_loc_feature_weight", type=float, default=0.9)
     parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.05)
     parser.add_argument("--locability_prior_weight", type=float, default=0.05)
+    parser.add_argument("--rendered_rehearsal_views", type=int, default=0)
+    parser.add_argument(
+        "--rendered_rehearsal_pose_mode",
+        choices=["perturb", "pair", "interpolate", "mixed"],
+        default="mixed",
+    )
+    parser.add_argument("--rendered_rehearsal_pair_probability", type=float, default=0.5)
+    parser.add_argument("--rendered_rehearsal_interpolation_min", type=float, default=-0.15)
+    parser.add_argument("--rendered_rehearsal_interpolation_max", type=float, default=1.15)
+    parser.add_argument("--rendered_pose_noise_trans_m", type=float, default=0.35)
+    parser.add_argument("--rendered_pose_noise_rot_deg", type=float, default=20.0)
+    parser.add_argument("--rendered_pair_jitter_trans_m", type=float, default=0.08)
+    parser.add_argument("--rendered_pair_jitter_rot_deg", type=float, default=5.0)
+    parser.add_argument("--rendered_view_pair_min_overlap", type=float, default=0.15)
     parser.add_argument("--stdloc_detector_path", default="")
     parser.add_argument("--stdloc_detector_dir", default="")
     parser.add_argument("--device", default="cuda:0")
@@ -321,6 +339,41 @@ def main(args: argparse.Namespace | None = None) -> None:
     tp = torch.zeros(landmark_xyz.shape[0], device=device, dtype=torch.float32)
     fp = torch.zeros_like(tp)
     landmark_desc = F.normalize(landmark_desc.float(), p=2, dim=-1)
+
+    def accumulate_query(
+        *,
+        query_desc: torch.Tensor,
+        query_yx: torch.Tensor,
+        pose_w2c: torch.Tensor,
+        K: torch.Tensor,
+        depth_map: torch.Tensor | None = None,
+        alpha_map: torch.Tensor | None = None,
+    ) -> None:
+        if query_desc.numel() == 0:
+            return
+        corr = F.normalize(query_desc.float(), p=2, dim=-1) @ landmark_desc.T
+        corr = apply_match_prior(corr.unsqueeze(0), landmark_prior, weight=args.locability_prior_weight)[0]
+        k = min(max(1, int(args.topk)), int(corr.shape[-1]))
+        _vals, lm_topk = torch.topk(corr, k=k, dim=-1)
+        q_ids = torch.arange(lm_topk.shape[0], device=device).view(-1, 1).expand_as(lm_topk).reshape(-1)
+        lm_ids = lm_topk.reshape(-1)
+        accumulate_matchability_counts(
+            tp,
+            fp,
+            query_yx=query_yx,
+            landmark_xyz=landmark_xyz,
+            q_ids=q_ids,
+            lm_ids=lm_ids,
+            pose_w2c=pose_w2c.to(device),
+            K=K,
+            reprojection_threshold_px=args.reprojection_threshold_px,
+            depth_map=depth_map,
+            alpha_map=alpha_map,
+            depth_abs_tolerance=args.visibility_depth_abs_tolerance,
+            depth_rel_tolerance=args.visibility_depth_rel_tolerance,
+            alpha_threshold=args.visibility_alpha_threshold,
+        )
+
     for idx in tqdm(ids, desc=f"Calibrating {scene}", dynamic_ncols=True):
         item = dataset[int(idx)]
         resized_rgb = item["rgb"].unsqueeze(0).to(device=device, dtype=torch.float32)
@@ -377,28 +430,90 @@ def main(args: argparse.Namespace | None = None) -> None:
             )
             depth_map = vis_render["depth_map"][0]
             alpha_map = vis_render["alpha_map"][0]
-        corr = F.normalize(query_desc.float(), p=2, dim=-1) @ landmark_desc.T
-        corr = apply_match_prior(corr.unsqueeze(0), landmark_prior, weight=args.locability_prior_weight)[0]
-        k = min(max(1, int(args.topk)), int(corr.shape[-1]))
-        _vals, lm_topk = torch.topk(corr, k=k, dim=-1)
-        q_ids = torch.arange(lm_topk.shape[0], device=device).view(-1, 1).expand_as(lm_topk).reshape(-1)
-        lm_ids = lm_topk.reshape(-1)
-        accumulate_matchability_counts(
-            tp,
-            fp,
+        accumulate_query(
+            query_desc=query_desc,
             query_yx=query_for_label,
-            landmark_xyz=landmark_xyz,
-            q_ids=q_ids,
-            lm_ids=lm_ids,
             pose_w2c=item["pose_w2c"].to(device),
             K=K,
-            reprojection_threshold_px=args.reprojection_threshold_px,
             depth_map=depth_map,
             alpha_map=alpha_map,
-            depth_abs_tolerance=args.visibility_depth_abs_tolerance,
-            depth_rel_tolerance=args.visibility_depth_rel_tolerance,
-            alpha_threshold=args.visibility_alpha_threshold,
         )
+
+    rendered_rehearsal_views = max(0, int(args.rendered_rehearsal_views))
+    if rendered_rehearsal_views > 0:
+        if args.query_detector != "stdloc":
+            raise ValueError("--rendered_rehearsal_views currently requires --query_detector stdloc")
+        if stdloc_detector is None:
+            raise RuntimeError("rendered rehearsal calibration requires a STDLoc detector")
+        from loc_gs.rendering.feature_renderer import FeatureFieldRenderer
+
+        rendered_renderer = FeatureFieldRenderer(
+            image_height=train_args["image_height"],
+            image_width=train_args["image_width"],
+            fx=full_fx,
+            fy=full_fy,
+            cx=full_cx,
+            cy=full_cy,
+            max_channels_per_chunk=32,
+            far_plane=10000.0,
+            packed=False,
+            rasterize_mode="antialiased",
+        ).to(device)
+        full_K = torch.tensor(
+            [[full_fx, 0.0, full_cx], [0.0, full_fy, full_cy], [0.0, 0.0, 1.0]],
+            device=device,
+            dtype=torch.float32,
+        )
+        for ridx in tqdm(
+            range(rendered_rehearsal_views),
+            desc=f"Calibrating rendered {scene}",
+            dynamic_ncols=True,
+        ):
+            frame_idx = int(ids[ridx % len(ids)] if ids else ridx % len(dataset))
+            item = dataset[frame_idx]
+            base_pose = item["pose_w2c"].to(device=device, dtype=torch.float32).unsqueeze(0)
+            loc_pose = sample_rehearsal_pose_batch(
+                dataset=dataset,
+                frame_indices=torch.tensor([frame_idx], device=device, dtype=torch.long),
+                base_pose_w2c=base_pose,
+                model=model,
+                renderer=rendered_renderer,
+                mode=args.rendered_rehearsal_pose_mode,
+                trans_m=args.rendered_pose_noise_trans_m,
+                rot_deg=args.rendered_pose_noise_rot_deg,
+                pair_probability=args.rendered_rehearsal_pair_probability,
+                interpolation_min=args.rendered_rehearsal_interpolation_min,
+                interpolation_max=args.rendered_rehearsal_interpolation_max,
+                pair_jitter_trans_m=args.rendered_pair_jitter_trans_m,
+                pair_jitter_rot_deg=args.rendered_pair_jitter_rot_deg,
+                min_overlap=args.rendered_view_pair_min_overlap,
+                device=device,
+            ).detach()
+            rendered = render_hybrid_superpoint(
+                model,
+                sp_head,
+                rendered_renderer,
+                loc_pose,
+                descriptor_source=args.descriptor_source,
+                ply_loc_feature_weight=args.ply_loc_feature_weight,
+                hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
+            )
+            query_feature_map = F.normalize(rendered["descriptor"][0].float(), p=2, dim=0)
+            keypoints, _scores = extract_stdloc_detector_keypoints(
+                query_feature_map,
+                stdloc_detector,
+                max_keypoints=args.query_keypoints,
+                nms_radius=args.nms_radius,
+            )
+            query_desc = sample_descriptors_bilinear(query_feature_map, keypoints)
+            accumulate_query(
+                query_desc=query_desc,
+                query_yx=keypoints + 0.5,
+                pose_w2c=loc_pose[0],
+                K=full_K,
+                depth_map=rendered["depth"][0],
+                alpha_map=rendered["alpha"][0],
+            )
 
     matchability = matchability_from_counts(tp, fp, alpha=args.smoothing_alpha)
     fp_rate = fp / (tp + fp).clamp_min(1.0)
@@ -426,6 +541,12 @@ def main(args: argparse.Namespace | None = None) -> None:
             "scene": scene,
             "checkpoint": str(args.checkpoint),
             "views": len(ids),
+            "rendered_rehearsal_views": rendered_rehearsal_views,
+            "rendered_rehearsal_pose_mode": args.rendered_rehearsal_pose_mode,
+            "rendered_rehearsal_interpolation_min": float(args.rendered_rehearsal_interpolation_min),
+            "rendered_rehearsal_interpolation_max": float(args.rendered_rehearsal_interpolation_max),
+            "rendered_pose_noise_trans_m": float(args.rendered_pose_noise_trans_m),
+            "rendered_pose_noise_rot_deg": float(args.rendered_pose_noise_rot_deg),
             "topk": int(args.topk),
             "reprojection_threshold_px": float(args.reprojection_threshold_px),
             "max_landmarks": int(args.max_landmarks),

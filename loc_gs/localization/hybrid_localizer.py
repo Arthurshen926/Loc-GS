@@ -228,11 +228,18 @@ def solve_pnp_ransac(
     min_iterations: int = 0,
     solver: str = "opencv",
     refine_poselib: bool = False,
+    match_scores: Optional[np.ndarray] = None,
 ) -> tuple[Optional[np.ndarray], int]:
     if points3d_world.shape[0] < 4 or keypoints_yx.shape[0] < 4:
         return None, 0
     image_points_xy = np.stack([keypoints_yx[:, 1], keypoints_yx[:, 0]], axis=-1).astype(np.float64)
     object_points = points3d_world.astype(np.float64)
+    if solver == "opencv_prosac" and match_scores is not None:
+        scores = np.asarray(match_scores, dtype=np.float64).reshape(-1)
+        if scores.shape[0] == object_points.shape[0]:
+            order = np.argsort(np.where(np.isfinite(scores), scores, -np.inf))[::-1]
+            object_points = object_points[order]
+            image_points_xy = image_points_xy[order]
     if solver == "poselib":
         pose, inliers = _solve_pnp_poselib(
             object_points,
@@ -257,16 +264,34 @@ def solve_pnp_ransac(
                     return refined_pose, refined_inliers
             return pose, inliers
     cv2_module = _cv2()
-    ok, rvec, tvec, inliers = cv2_module.solvePnPRansac(
-        object_points,
-        image_points_xy,
-        K.astype(np.float64),
-        None,
-        iterationsCount=int(iterations),
-        reprojectionError=float(reprojection_error),
-        confidence=float(confidence),
-        flags=cv2_module.SOLVEPNP_EPNP,
-    )
+    if solver == "opencv_prosac":
+        params = cv2_module.UsacParams()
+        params.confidence = float(confidence)
+        params.maxIterations = int(iterations)
+        params.threshold = float(reprojection_error)
+        params.sampler = cv2_module.SAMPLING_PROSAC
+        params.score = cv2_module.SCORE_METHOD_MSAC
+        ok, _camera_matrix, rvec, tvec, inliers = cv2_module.solvePnPRansac(
+            object_points,
+            image_points_xy,
+            K.astype(np.float64),
+            None,
+            None,
+            None,
+            None,
+            params,
+        )
+    else:
+        ok, rvec, tvec, inliers = cv2_module.solvePnPRansac(
+            object_points,
+            image_points_xy,
+            K.astype(np.float64),
+            None,
+            iterationsCount=int(iterations),
+            reprojectionError=float(reprojection_error),
+            confidence=float(confidence),
+            flags=cv2_module.SOLVEPNP_EPNP,
+        )
     if not ok:
         return None, 0
     if inliers is not None and len(inliers) >= 4:

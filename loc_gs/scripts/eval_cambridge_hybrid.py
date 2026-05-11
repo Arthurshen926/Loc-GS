@@ -1022,6 +1022,7 @@ def generate_pnp_hypotheses(
             min_iterations=min_iterations,
             solver=solver,
             refine_poselib=refine_poselib,
+            match_scores=score[idx].detach().cpu().numpy(),
         )
         if pose is None:
             continue
@@ -2041,6 +2042,7 @@ def localize_one(
             min_iterations=sparse_pnp_min_iterations,
             solver=args.solver,
             refine_poselib=refine_poselib,
+            match_scores=sparse_filter_scores.detach().cpu().numpy(),
         )
     if sparse_pose is None:
         out = {"pose_w2c": None, "sparse_pose_w2c": None, "sparse_inliers": 0, "dense_inliers": 0}
@@ -2158,6 +2160,7 @@ def localize_one(
             )
             p3d_valid = p3d[valid][dense_keep]
             query_valid = dense_matches.query_yx[valid][dense_keep]
+            dense_pnp_scores = dense_matches.scores[valid_ids][dense_keep]
             dense_pose, dense_inliers = solve_pnp_ransac(
                 p3d_valid.detach().cpu().numpy(),
                 (
@@ -2166,13 +2169,14 @@ def localize_one(
                 ).detach().cpu().numpy(),
                 K_full.detach().cpu().numpy(),
                 reprojection_error=dense_reprojection_error,
-            refine_reprojection_error=args.refine_reprojection_error,
-            confidence=args.pnp_confidence,
-            iterations=dense_pnp_iterations,
-            min_iterations=dense_pnp_min_iterations,
-            solver=args.solver,
-            refine_poselib=refine_poselib,
-        )
+                refine_reprojection_error=args.refine_reprojection_error,
+                confidence=args.pnp_confidence,
+                iterations=dense_pnp_iterations,
+                min_iterations=dense_pnp_min_iterations,
+                solver=args.solver,
+                refine_poselib=refine_poselib,
+                match_scores=dense_pnp_scores.detach().cpu().numpy(),
+            )
         elif dense_matcher == "lightglue_rendered":
             full_h = int(rgb.shape[-2])
             full_w = int(rgb.shape[-1])
@@ -2256,6 +2260,7 @@ def localize_one(
             )
             dense_points3d_valid = dense_points3d[valid][dense_keep]
             query_lg_valid = query_lg_yx[q_dense][valid][dense_keep]
+            dense_pnp_scores = _lg_scores[valid_ids][dense_keep]
             dense_pose, dense_inliers = solve_pnp_ransac(
                 dense_points3d_valid.detach().cpu().numpy(),
                 (query_lg_valid + dense_query_offset).detach().cpu().numpy(),
@@ -2267,6 +2272,7 @@ def localize_one(
                 min_iterations=dense_pnp_min_iterations,
                 solver=args.solver,
                 refine_poselib=refine_poselib,
+                match_scores=dense_pnp_scores.detach().cpu().numpy(),
             )
         else:
             if args.dense_full_render and full_renderer is not None:
@@ -2335,14 +2341,15 @@ def localize_one(
             dense_filter_reliability = None
             if prior is not None and pix_ids.numel() > 0:
                 dense_filter_reliability = prior[pix_ids]
+            dense_filter_scores = _match_filter_scores(
+                _dense_scores,
+                dense_filter_reliability,
+                getattr(args, "match_filter_calibrated_score_weight", 0.0),
+            )
             dense_keep = select_pnp_match_indices(
                 dense_query_yx[q_dense],
                 dense_points3d,
-                scores=_match_filter_scores(
-                    _dense_scores,
-                    dense_filter_reliability,
-                    getattr(args, "match_filter_calibrated_score_weight", 0.0),
-                ),
+                scores=dense_filter_scores,
                 max_matches=_stage_match_filter_max_matches(args, "dense", getattr(args, "dense_pnp_max_matches", 0)),
                 mode=_stage_match_filter_mode(args, "dense"),
                 image_grid_size=_match_filter_image_grid_size(args),
@@ -2351,6 +2358,7 @@ def localize_one(
                 max_per_xyz_cell=getattr(args, "match_filter_max_per_xyz_cell", 8),
                 min_matches=getattr(args, "match_filter_min_matches", 0),
             )
+            dense_filter_scores = dense_filter_scores[dense_keep]
             dense_points3d = dense_points3d[dense_keep]
             dense_query_for_pnp = dense_query_yx[q_dense][dense_keep]
             dense_pose, dense_inliers = solve_pnp_ransac(
@@ -2367,6 +2375,7 @@ def localize_one(
                 min_iterations=dense_pnp_min_iterations,
                 solver=args.solver,
                 refine_poselib=refine_poselib,
+                match_scores=dense_filter_scores.detach().cpu().numpy(),
             )
         if dense_pose is None:
             break
@@ -2463,7 +2472,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--rendered_keypoint_source", choices=["locability", "detector", "projected_gaussian"], default="locability")
     parser.add_argument("--lightglue_max_keypoints", type=int, default=2048)
     parser.add_argument("--lightglue_filter_threshold", type=float, default=0.1)
-    parser.add_argument("--solver", choices=["poselib", "opencv"], default="opencv")
+    parser.add_argument("--solver", choices=["poselib", "opencv", "opencv_prosac"], default="opencv")
     parser.add_argument("--poselib_refine", action="store_true")
     parser.add_argument("--sparse_dual_softmax", action="store_true")
     parser.add_argument("--sparse_dual_softmax_temp", type=float, default=0.1)

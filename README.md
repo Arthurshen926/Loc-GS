@@ -162,7 +162,9 @@ results.
 ```
 
 For batched multi-GPU Cambridge training, launch one scene per idle GPU with the
-conservative reliability recipe:
+constrained Loc-GS-FT rehearsal recipe. The recipe keeps the STDLoc/PLY
+descriptor backbone as the trust region, rehearses localization from mixed
+perturbed/interpolated poses, and avoids query-time multi-branch ensembles:
 
 ```bash
 /root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_reliability_recipe \

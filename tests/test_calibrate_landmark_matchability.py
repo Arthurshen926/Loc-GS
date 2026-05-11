@@ -2,6 +2,7 @@ import torch
 
 from loc_gs.scripts.calibrate_landmark_matchability import (
     accumulate_matchability_counts,
+    build_argparser,
     calibration_query_canvas_hw,
     matchability_from_counts,
     write_matchability_calibration,
@@ -23,6 +24,23 @@ def test_calibration_query_canvas_uses_resized_dataset_frame():
     original_teacher_rgb = torch.empty(1, 3, 768, 1024)
 
     assert calibration_query_canvas_hw(resized_rgb, original_teacher_rgb) == (360, 640)
+
+
+def test_calibration_parser_defaults_to_baseline_preserving_descriptor_and_rendered_rehearsal_knobs():
+    args = build_argparser().parse_args(
+        [
+            "--checkpoint",
+            "output/stdloc_hybrid/KingsCollege/latest.pth",
+            "--rendered_rehearsal_views",
+            "8",
+        ]
+    )
+
+    assert args.descriptor_source == "ply_loc"
+    assert args.rendered_rehearsal_views == 8
+    assert args.rendered_rehearsal_pose_mode == "mixed"
+    assert args.rendered_rehearsal_interpolation_min == -0.15
+    assert args.rendered_rehearsal_interpolation_max == 1.15
 
 
 def test_accumulate_matchability_counts_marks_topk_projection_inliers():

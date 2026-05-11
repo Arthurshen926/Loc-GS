@@ -5,9 +5,11 @@ from loc_gs.scripts.train_cambridge_hybrid import (
     build_argparser,
     descriptor_residual_alignment_loss,
     extract_superpoint_teacher_batch,
+    interpolate_pose_batch,
     locability_prior_alignment_loss,
     make_feature_renderer_intrinsics,
     normalize_position_map,
+    perturb_pose_batch,
     resize_teacher_outputs_to_feature_grid,
     scheduled_loss_weight,
     superpoint_gray,
@@ -196,6 +198,8 @@ def test_training_parser_defaults_to_conservative_reliability_recipe():
     assert args.pnp_pose_loss_weight == 0.0
     assert args.pnp_reprojection_loss_weight == 0.0
     assert args.same_view_match_weight == 1.0
+    assert args.rehearsal_pose_mode == "perturb"
+    assert args.rehearsal_pair_probability == 0.5
 
 
 def test_scheduled_loss_weight_starts_late_and_warms_up_linearly():
@@ -255,6 +259,18 @@ def test_training_parser_exposes_sota_extension_options():
             "3",
             "--grad_accum_steps",
             "2",
+            "--rehearsal_pose_mode",
+            "mixed",
+            "--rehearsal_pair_probability",
+            "0.75",
+            "--rehearsal_interpolation_min",
+            "0.1",
+            "--rehearsal_interpolation_max",
+            "0.9",
+            "--rehearsal_pair_jitter_trans_m",
+            "0.2",
+            "--rehearsal_pair_jitter_rot_deg",
+            "7.0",
         ]
     )
 
@@ -282,6 +298,45 @@ def test_training_parser_exposes_sota_extension_options():
     assert args.detector_free_hard_negative_weight == 0.2
     assert args.external_match_start_epoch == 3
     assert args.grad_accum_steps == 2
+    assert args.rehearsal_pose_mode == "mixed"
+    assert args.rehearsal_pair_probability == 0.75
+    assert args.rehearsal_interpolation_min == 0.1
+    assert args.rehearsal_interpolation_max == 0.9
+    assert args.rehearsal_pair_jitter_trans_m == 0.2
+    assert args.rehearsal_pair_jitter_rot_deg == 7.0
+
+
+def test_interpolate_pose_batch_interpolates_camera_centers():
+    pose_a = torch.eye(4).unsqueeze(0)
+    pose_b = torch.eye(4).unsqueeze(0)
+    # w2c translation -R * C, so this camera center is at x=2.
+    pose_b[:, 0, 3] = -2.0
+
+    mid = interpolate_pose_batch(pose_a, pose_b, 0.5)
+    R_mid = mid[:, :3, :3]
+    t_mid = mid[:, :3, 3]
+    center_mid = -(R_mid.transpose(1, 2) @ t_mid.unsqueeze(-1)).squeeze(-1)
+
+    assert torch.allclose(center_mid, torch.tensor([[1.0, 0.0, 0.0]]), atol=1e-5)
+
+
+def test_interpolate_pose_batch_allows_mild_extrapolation():
+    pose_a = torch.eye(4).unsqueeze(0)
+    pose_b = torch.eye(4).unsqueeze(0)
+    pose_b[:, 0, 3] = -2.0
+
+    out = interpolate_pose_batch(pose_a, pose_b, 1.25)
+    center = -(out[:, :3, :3].transpose(1, 2) @ out[:, :3, 3:].contiguous()).squeeze(-1)
+
+    assert torch.allclose(center, torch.tensor([[2.5, 0.0, 0.0]]), atol=1e-5)
+
+
+def test_perturb_pose_batch_identity_when_noise_disabled():
+    pose = torch.eye(4).unsqueeze(0).repeat(2, 1, 1)
+
+    out = perturb_pose_batch(pose, 0.0, 0.0)
+
+    assert torch.allclose(out, pose)
 
 
 def test_descriptor_residual_alignment_loss_rewards_matching_reference():

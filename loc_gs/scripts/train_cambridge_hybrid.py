@@ -163,6 +163,92 @@ def perturb_pose_batch(
     return out
 
 
+def _skew_batch(vec: torch.Tensor) -> torch.Tensor:
+    zeros = torch.zeros_like(vec[:, 0])
+    x, y, z = vec[:, 0], vec[:, 1], vec[:, 2]
+    return torch.stack(
+        [zeros, -z, y, z, zeros, -x, -y, x, zeros],
+        dim=-1,
+    ).view(-1, 3, 3)
+
+
+def so3_log_map(rotation: torch.Tensor) -> torch.Tensor:
+    """Batched SO(3) logarithm for pose interpolation."""
+    trace = rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+    theta = torch.acos(cos_theta)
+    vee = torch.stack(
+        [
+            rotation[:, 2, 1] - rotation[:, 1, 2],
+            rotation[:, 0, 2] - rotation[:, 2, 0],
+            rotation[:, 1, 0] - rotation[:, 0, 1],
+        ],
+        dim=-1,
+    )
+    sin_theta = torch.sin(theta).clamp_min(1e-6)
+    scale = (theta / (2.0 * sin_theta)).unsqueeze(-1)
+    small = theta < 1e-4
+    omega = vee * scale
+    if small.any():
+        omega = torch.where(small.unsqueeze(-1), 0.5 * vee, omega)
+    return omega
+
+
+def so3_exp_map(omega: torch.Tensor) -> torch.Tensor:
+    """Batched SO(3) exponential map."""
+    theta = omega.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+    axis = omega / theta
+    Kmat = _skew_batch(axis)
+    eye = torch.eye(3, device=omega.device, dtype=omega.dtype).expand(omega.shape[0], -1, -1)
+    theta_mat = theta.view(-1, 1, 1)
+    rot = eye + torch.sin(theta_mat) * Kmat + (1.0 - torch.cos(theta_mat)) * (Kmat @ Kmat)
+    small = theta.view(-1) < 1e-5
+    if small.any():
+        Komega = _skew_batch(omega)
+        small_rot = eye + Komega + 0.5 * (Komega @ Komega)
+        rot = torch.where(small.view(-1, 1, 1), small_rot, rot)
+    return rot
+
+
+def interpolate_pose_batch(
+    pose_a_w2c: torch.Tensor,
+    pose_b_w2c: torch.Tensor,
+    alpha: torch.Tensor | float,
+) -> torch.Tensor:
+    """Interpolate two world-to-camera pose batches in camera-to-world space."""
+    if not torch.is_tensor(alpha):
+        alpha = torch.full(
+            (pose_a_w2c.shape[0],),
+            float(alpha),
+            device=pose_a_w2c.device,
+            dtype=pose_a_w2c.dtype,
+        )
+    alpha = alpha.to(device=pose_a_w2c.device, dtype=pose_a_w2c.dtype).view(-1)
+    R_a_w2c = pose_a_w2c[:, :3, :3]
+    t_a_w2c = pose_a_w2c[:, :3, 3]
+    R_b_w2c = pose_b_w2c[:, :3, :3]
+    t_b_w2c = pose_b_w2c[:, :3, 3]
+    R_a_c2w = R_a_w2c.transpose(1, 2)
+    R_b_c2w = R_b_w2c.transpose(1, 2)
+    c_a = -(R_a_c2w @ t_a_w2c.unsqueeze(-1)).squeeze(-1)
+    c_b = -(R_b_c2w @ t_b_w2c.unsqueeze(-1)).squeeze(-1)
+
+    rel = R_b_c2w @ R_a_c2w.transpose(1, 2)
+    omega = so3_log_map(rel)
+    R_interp_c2w = so3_exp_map(alpha.unsqueeze(-1) * omega) @ R_a_c2w
+    c_interp = (1.0 - alpha).unsqueeze(-1) * c_a + alpha.unsqueeze(-1) * c_b
+    R_interp_w2c = R_interp_c2w.transpose(1, 2)
+    t_interp_w2c = -(R_interp_w2c @ c_interp.unsqueeze(-1)).squeeze(-1)
+    out = torch.eye(4, device=pose_a_w2c.device, dtype=pose_a_w2c.dtype).unsqueeze(0).repeat(
+        pose_a_w2c.shape[0],
+        1,
+        1,
+    )
+    out[:, :3, :3] = R_interp_w2c
+    out[:, :3, 3] = t_interp_w2c
+    return out
+
+
 def scheduled_loss_weight(
     epoch: int,
     base_weight: float,
@@ -452,6 +538,59 @@ def select_pair_batch(
     }
 
 
+def sample_rehearsal_pose_batch(
+    *,
+    dataset: CambridgeHybridDataset,
+    frame_indices: torch.Tensor,
+    base_pose_w2c: torch.Tensor,
+    model: HybridFeatureGaussian,
+    renderer,
+    mode: str,
+    trans_m: float,
+    rot_deg: float,
+    pair_probability: float,
+    interpolation_min: float,
+    interpolation_max: float,
+    pair_jitter_trans_m: float,
+    pair_jitter_rot_deg: float,
+    min_overlap: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample map-side rehearsal render poses for localization-guided training.
+
+    The old training path only rendered from a small perturbation of the query
+    training pose.  Pair/interpolate modes render from nearby or interpolated
+    map poses while keeping the current image pose as the GT query pose, which
+    rehearses cross-view 2D-3D matching with broader coverage.
+    """
+    mode = str(mode)
+    if mode not in {"perturb", "pair", "interpolate", "mixed"}:
+        raise ValueError(f"unsupported rehearsal pose mode: {mode}")
+    use_pair = mode in {"pair", "interpolate"}
+    if mode == "mixed":
+        use_pair = bool(torch.rand((), device=device).item() < float(pair_probability))
+    if not use_pair:
+        return perturb_pose_batch(base_pose_w2c, trans_m, rot_deg)
+
+    pair_batch = select_pair_batch(
+        dataset,
+        frame_indices,
+        model,
+        renderer,
+        min_overlap,
+        device,
+    )
+    pair_pose = pair_batch["pose_w2c"].to(device=device, dtype=base_pose_w2c.dtype)
+    if mode in {"interpolate", "mixed"}:
+        lo = min(float(interpolation_min), float(interpolation_max))
+        hi = max(float(interpolation_min), float(interpolation_max))
+        alpha = torch.rand(base_pose_w2c.shape[0], device=device, dtype=base_pose_w2c.dtype) * (hi - lo) + lo
+        loc_pose = interpolate_pose_batch(base_pose_w2c, pair_pose, alpha)
+    else:
+        loc_pose = pair_pose
+    return perturb_pose_batch(loc_pose, pair_jitter_trans_m, pair_jitter_rot_deg)
+
+
 def _xy_to_feature_yx(
     keypoints_xy: np.ndarray,
     image_height: int,
@@ -645,6 +784,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--nms_radius", type=int, default=2)
     parser.add_argument("--pose_noise_trans_m", type=float, default=0.20)
     parser.add_argument("--pose_noise_rot_deg", type=float, default=10.0)
+    parser.add_argument(
+        "--rehearsal_pose_mode",
+        choices=["perturb", "pair", "interpolate", "mixed"],
+        default="perturb",
+        help="Map-side render pose sampling for localization rehearsal.",
+    )
+    parser.add_argument("--rehearsal_pair_probability", type=float, default=0.5)
+    parser.add_argument("--rehearsal_interpolation_min", type=float, default=0.25)
+    parser.add_argument("--rehearsal_interpolation_max", type=float, default=0.75)
+    parser.add_argument("--rehearsal_pair_jitter_trans_m", type=float, default=0.0)
+    parser.add_argument("--rehearsal_pair_jitter_rot_deg", type=float, default=0.0)
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--hash_output_dim", type=int, default=64)
     parser.add_argument("--fine_dim", type=int, default=128)
@@ -977,7 +1127,23 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     gt_locability_prior,
                 )
 
-                loc_pose = perturb_pose_batch(pose, args.pose_noise_trans_m, args.pose_noise_rot_deg).detach()
+                loc_pose = sample_rehearsal_pose_batch(
+                    dataset=dataset,
+                    frame_indices=batch["frame_idx"],
+                    base_pose_w2c=pose,
+                    model=model,
+                    renderer=renderer,
+                    mode=args.rehearsal_pose_mode,
+                    trans_m=args.pose_noise_trans_m,
+                    rot_deg=args.pose_noise_rot_deg,
+                    pair_probability=args.rehearsal_pair_probability,
+                    interpolation_min=args.rehearsal_interpolation_min,
+                    interpolation_max=args.rehearsal_interpolation_max,
+                    pair_jitter_trans_m=args.rehearsal_pair_jitter_trans_m,
+                    pair_jitter_rot_deg=args.rehearsal_pair_jitter_rot_deg,
+                    min_overlap=args.view_pair_min_overlap,
+                    device=device,
+                ).detach()
                 loc_render = render_hybrid_superpoint(model, sp_head, renderer, loc_pose)
                 active_locability_target_prior_weight = scheduled_loss_weight(
                     epoch,
