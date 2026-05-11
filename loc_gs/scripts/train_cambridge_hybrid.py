@@ -20,6 +20,7 @@ from tqdm import tqdm
 from loc_gs.data.cambridge_dataset import CambridgeHybridDataset
 from loc_gs.data.external_match_cache import ExternalMatchCache
 from loc_gs.data.superpoint_cache import SuperPointTeacherCache
+from loc_gs.localization.descriptor_blend import gated_residual_descriptor_blend
 from loc_gs.losses.cross_view import (
     DescriptorMemoryBank,
     cross_view_projective_contrastive_loss,
@@ -191,6 +192,7 @@ def render_hybrid_superpoint(
     pose_w2c: torch.Tensor,
     descriptor_source: str = "hybrid",
     ply_loc_feature_weight: float = 0.5,
+    hybrid_residual_alpha_max: float = 0.05,
 ) -> dict[str, torch.Tensor]:
     from loc_gs.models.hybrid_gaussian import unproject_depth_to_positions
 
@@ -230,6 +232,13 @@ def render_hybrid_superpoint(
                 (1.0 - weight) * descriptor.float() + weight * ply_descriptor,
                 p=2,
                 dim=1,
+            )
+        elif descriptor_source == "hybrid_ply_gated_residual":
+            descriptor = gated_residual_descriptor_blend(
+                ply_descriptor,
+                descriptor.float(),
+                gate=locability,
+                alpha_max=float(hybrid_residual_alpha_max),
             )
         else:
             raise ValueError(f"Unsupported descriptor_source: {descriptor_source}")

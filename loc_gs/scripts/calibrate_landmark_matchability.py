@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+
+from loc_gs.data.cambridge_dataset import CambridgeHybridDataset
+from loc_gs.localization.stdloc_detector import StdlocKeypointDetector, extract_stdloc_detector_keypoints
+from loc_gs.localization.stdloc_parity import apply_match_prior
+from loc_gs.losses.localization_loss import project_world_to_image_yx
+from loc_gs.models.hybrid_gaussian import HybridFeatureGaussian, SuperPointOutputHead
+from loc_gs.scripts.eval_cambridge_hybrid import (
+    build_stdloc_detector_landmark_bank,
+    extract_keypoints_from_detector_logits,
+    load_cambridge_rgb_no_resize,
+    prepare_query_teacher_maps,
+    sample_descriptors_bilinear,
+    superpoint_gray,
+    upsample_feature_map,
+)
+from loc_gs.scripts.extract_superpoint_features import SuperPointNet
+
+
+def matchability_from_counts(
+    tp_count: torch.Tensor,
+    fp_count: torch.Tensor,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Beta-smoothed estimate of PnP-useful landmark reliability."""
+    tp = tp_count.float().clamp_min(0.0)
+    fp = fp_count.float().clamp_min(0.0)
+    a = max(float(alpha), 0.0)
+    return ((tp + a) / (tp + fp + 2.0 * a).clamp_min(1e-6)).clamp(0.0, 1.0)
+
+
+def calibration_query_canvas_hw(
+    resized_rgb: torch.Tensor,
+    teacher_rgb: torch.Tensor | None = None,
+) -> tuple[int, int]:
+    """Return the image canvas used for query keypoints and camera intrinsics.
+
+    SuperPoint can be extracted from an original-resolution teacher image, but
+    CambridgeHybridDataset intrinsics and eval-time PnP operate on the resized
+    dataset frame.  Calibration labels must therefore use the resized canvas.
+    """
+
+    del teacher_rgb
+    return int(resized_rgb.shape[-2]), int(resized_rgb.shape[-1])
+
+
+def _camera_depth(points: torch.Tensor, pose_w2c: torch.Tensor) -> torch.Tensor:
+    ones = torch.ones(points.shape[0], 1, device=points.device, dtype=points.dtype)
+    pts_h = torch.cat([points, ones], dim=-1)
+    cam = (pose_w2c.to(device=points.device, dtype=points.dtype) @ pts_h.T).T
+    return cam[:, 2]
+
+
+def _sample_scalar_map_bilinear(value_map: torch.Tensor, yx: torch.Tensor) -> torch.Tensor:
+    if value_map.dim() == 2:
+        value_map = value_map.unsqueeze(0)
+    if value_map.dim() != 3 or value_map.shape[0] != 1:
+        value_map = value_map.reshape(1, int(value_map.shape[-2]), int(value_map.shape[-1]))
+    _, h, w = value_map.shape
+    y = yx[:, 0].float()
+    x = yx[:, 1].float()
+    x_norm = 2.0 * x / max(w - 1, 1) - 1.0
+    y_norm = 2.0 * y / max(h - 1, 1) - 1.0
+    grid = torch.stack([x_norm, y_norm], dim=-1).view(1, -1, 1, 2)
+    sampled = F.grid_sample(
+        value_map.float().unsqueeze(0),
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )
+    return sampled.reshape(-1)
+
+
+def write_matchability_calibration(payload: dict, output_path: Path) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, output_path)
+    for key in (
+        "landmark_matchability",
+        "landmark_tp_count",
+        "landmark_fp_count",
+        "landmark_fp_rate",
+        "matchability_calibrator",
+    ):
+        if key in payload:
+            torch.save(payload[key], output_path.parent / f"{key}.pt")
+
+    meta = dict(payload.get("metadata", {}))
+    matchability = torch.as_tensor(payload["landmark_matchability"]).float()
+    tp = torch.as_tensor(payload["landmark_tp_count"]).float()
+    fp = torch.as_tensor(payload["landmark_fp_count"]).float()
+    sidecar = output_path.with_suffix(".json")
+    sidecar.write_text(
+        json.dumps(
+            {
+                **meta,
+                "mean_matchability": float(matchability.mean().item()),
+                "observed_landmarks": int(((tp + fp) > 0).sum().item()),
+                "total_tp": float(tp.sum().item()),
+                "total_fp": float(fp.sum().item()),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+@torch.no_grad()
+def accumulate_matchability_counts(
+    tp_count: torch.Tensor,
+    fp_count: torch.Tensor,
+    *,
+    query_yx: torch.Tensor,
+    landmark_xyz: torch.Tensor,
+    q_ids: torch.Tensor,
+    lm_ids: torch.Tensor,
+    pose_w2c: torch.Tensor,
+    K: torch.Tensor,
+    reprojection_threshold_px: float,
+    depth_map: torch.Tensor | None = None,
+    alpha_map: torch.Tensor | None = None,
+    depth_abs_tolerance: float = 0.25,
+    depth_rel_tolerance: float = 0.02,
+    alpha_threshold: float = 0.05,
+) -> None:
+    """Accumulate TP/FP labels for top-k query-to-landmark candidates."""
+    if q_ids.numel() == 0 or lm_ids.numel() == 0:
+        return
+    device = landmark_xyz.device
+    q = q_ids.to(device=device, dtype=torch.long).reshape(-1)
+    lm = lm_ids.to(device=device, dtype=torch.long).reshape(-1)
+    pts = landmark_xyz[lm]
+    proj_yx, valid_z = project_world_to_image_yx(
+        pts.unsqueeze(0),
+        pose_w2c.to(device=device, dtype=torch.float32).unsqueeze(0),
+        K.to(device=device, dtype=torch.float32),
+    )
+    err = torch.linalg.norm(proj_yx[0] - query_yx.to(device=device, dtype=torch.float32)[q], dim=-1)
+    valid = valid_z[0] & torch.isfinite(err)
+    if depth_map is not None or alpha_map is not None:
+        proj = proj_yx[0]
+        h = int((depth_map if depth_map is not None else alpha_map).shape[-2])
+        w = int((depth_map if depth_map is not None else alpha_map).shape[-1])
+        in_frame = (proj[:, 0] >= 0.0) & (proj[:, 0] <= h - 1) & (proj[:, 1] >= 0.0) & (proj[:, 1] <= w - 1)
+        valid = valid & in_frame
+        if depth_map is not None:
+            sampled_depth = _sample_scalar_map_bilinear(depth_map.to(device=device), proj)
+            z = _camera_depth(pts.float(), pose_w2c.to(device=device, dtype=torch.float32))
+            depth_tol = max(float(depth_abs_tolerance), 0.0) + max(float(depth_rel_tolerance), 0.0) * z.abs()
+            depth_ok = (sampled_depth > 0.0) & torch.isfinite(sampled_depth) & ((sampled_depth - z).abs() <= depth_tol)
+            valid = valid & depth_ok
+        if alpha_map is not None:
+            sampled_alpha = _sample_scalar_map_bilinear(alpha_map.to(device=device), proj)
+            valid = valid & torch.isfinite(sampled_alpha) & (sampled_alpha >= float(alpha_threshold))
+    is_tp = valid & (err <= float(reprojection_threshold_px))
+    ones = torch.ones_like(err, dtype=tp_count.dtype, device=tp_count.device)
+    if is_tp.any():
+        tp_count.scatter_add_(0, lm[is_tp].to(tp_count.device), ones[is_tp].to(tp_count.device))
+    is_fp = ~is_tp
+    if is_fp.any():
+        fp_count.scatter_add_(0, lm[is_fp].to(fp_count.device), ones[is_fp].to(fp_count.device))
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Calibrate landmark matchability from train-view TP/FP matches.")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--scene", default="")
+    parser.add_argument("--data_root", default="/mnt/pool/sqy/Cambridge_stdloc")
+    parser.add_argument("--output_path", default="")
+    parser.add_argument("--max_views", type=int, default=128)
+    parser.add_argument("--view_stride", type=int, default=1)
+    parser.add_argument("--max_landmarks", type=int, default=16384)
+    parser.add_argument("--topk", type=int, default=5)
+    parser.add_argument("--reprojection_threshold_px", type=float, default=8.0)
+    parser.add_argument("--smoothing_alpha", type=float, default=1.0)
+    parser.add_argument("--visibility_check", choices=["none", "rendered"], default="rendered")
+    parser.add_argument("--visibility_alpha_threshold", type=float, default=0.05)
+    parser.add_argument("--visibility_depth_abs_tolerance", type=float, default=0.25)
+    parser.add_argument("--visibility_depth_rel_tolerance", type=float, default=0.02)
+    parser.add_argument("--query_detector", choices=["superpoint", "stdloc"], default="stdloc")
+    parser.add_argument("--query_feature_source", choices=["resized", "original"], default="original")
+    parser.add_argument("--query_keypoints", type=int, default=2048)
+    parser.add_argument("--keypoint_threshold", type=float, default=0.015)
+    parser.add_argument("--nms_radius", type=int, default=4)
+    parser.add_argument(
+        "--descriptor_source",
+        choices=["hybrid", "ply_loc", "hybrid_ply_blend", "hybrid_ply_gated_residual"],
+        default="hybrid_ply_blend",
+    )
+    parser.add_argument("--ply_loc_feature_weight", type=float, default=0.9)
+    parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.05)
+    parser.add_argument("--locability_prior_weight", type=float, default=0.05)
+    parser.add_argument("--stdloc_detector_path", default="")
+    parser.add_argument("--stdloc_detector_dir", default="")
+    parser.add_argument("--device", default="cuda:0")
+    return parser
+
+
+def main(args: argparse.Namespace | None = None) -> None:
+    args = build_argparser().parse_args() if args is None else args
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    train_args = ckpt["args"]
+    scene = args.scene or train_args["scene"]
+    scene_root = Path(args.data_root) / scene
+    feature_intr = train_args["feature_intrinsics"]
+    full_fx = feature_intr["fx"] * 8.0
+    full_fy = feature_intr["fy"] * 8.0
+    full_cx = feature_intr["cx"] * 8.0
+    full_cy = feature_intr["cy"] * 8.0
+
+    model = HybridFeatureGaussian(
+        latent_dim=train_args["latent_dim"],
+        hash_output_dim=train_args["hash_output_dim"],
+        fine_dim=train_args["fine_dim"],
+        coarse_dim=train_args["coarse_dim"],
+        output_dim=train_args["hybrid_output_dim"],
+    )
+    model.load_from_ply(train_args["ply_path"])
+    model = model.to(device)
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.eval()
+    sp_head = SuperPointOutputHead(
+        fused_dim=train_args["hybrid_output_dim"],
+        descriptor_dim=256,
+        detector_dim=65,
+        hidden_dim=256,
+        num_res_blocks=2,
+        use_3x3=True,
+    ).to(device)
+    sp_head.load_state_dict(ckpt["sp_head_state_dict"])
+    sp_head.eval()
+    teacher = SuperPointNet().to(device)
+    teacher.load_state_dict(torch.load(train_args["superpoint_weights"], map_location=device), strict=False)
+    teacher.eval()
+
+    stdloc_detector = None
+    if args.query_detector == "stdloc":
+        detector_path = (
+            Path(args.stdloc_detector_path)
+            if args.stdloc_detector_path
+            else Path(train_args["ply_path"]).parents[2] / "detector" / "30000_detector.pth"
+        )
+        stdloc_detector = StdlocKeypointDetector(in_dim=256).to(device)
+        stdloc_detector.load_state_dict(torch.load(detector_path, map_location=device))
+        stdloc_detector.eval()
+
+    detector_dir = (
+        Path(args.stdloc_detector_dir)
+        if args.stdloc_detector_dir
+        else Path(train_args["ply_path"]).parents[2] / "detector"
+    )
+    landmark_xyz, landmark_desc, landmark_prior, stats = build_stdloc_detector_landmark_bank(
+        model,
+        sp_head,
+        detector_dir=detector_dir,
+        max_landmarks=args.max_landmarks,
+        descriptor_source=args.descriptor_source,
+        ply_loc_feature_weight=args.ply_loc_feature_weight,
+        hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
+        device=device,
+        candidate_source="sampled",
+    )
+
+    dataset = CambridgeHybridDataset(
+        scene_root=scene_root,
+        cameras_json=train_args["cameras_json"],
+        split="train",
+        image_subdir=train_args.get("image_subdir", "processed"),
+        image_height=train_args["image_height"],
+        image_width=train_args["image_width"],
+        fx=full_fx,
+        fy=full_fy,
+        cx=full_cx,
+        cy=full_cy,
+        max_frames=0,
+    )
+    visibility_renderer = None
+    visibility_values = None
+    if args.visibility_check == "rendered":
+        from loc_gs.rendering.feature_renderer import FeatureFieldRenderer
+
+        if args.query_detector == "stdloc":
+            visibility_renderer = FeatureFieldRenderer(
+                image_height=train_args["image_height"],
+                image_width=train_args["image_width"],
+                fx=full_fx,
+                fy=full_fy,
+                cx=full_cx,
+                cy=full_cy,
+                max_channels_per_chunk=1,
+                far_plane=10000.0,
+                packed=False,
+                rasterize_mode="antialiased",
+            ).to(device)
+        else:
+            visibility_renderer = FeatureFieldRenderer(
+                image_height=train_args["feature_height"],
+                image_width=train_args["feature_width"],
+                fx=feature_intr["fx"],
+                fy=feature_intr["fy"],
+                cx=feature_intr["cx"],
+                cy=feature_intr["cy"],
+                max_channels_per_chunk=1,
+            ).to(device)
+        visibility_values = torch.ones(model.get_xyz().shape[0], 1, device=device, dtype=torch.float32)
+    ids = list(range(0, len(dataset), max(1, int(args.view_stride))))
+    if args.max_views > 0:
+        ids = ids[: int(args.max_views)]
+
+    tp = torch.zeros(landmark_xyz.shape[0], device=device, dtype=torch.float32)
+    fp = torch.zeros_like(tp)
+    landmark_desc = F.normalize(landmark_desc.float(), p=2, dim=-1)
+    for idx in tqdm(ids, desc=f"Calibrating {scene}", dynamic_ncols=True):
+        item = dataset[int(idx)]
+        resized_rgb = item["rgb"].unsqueeze(0).to(device=device, dtype=torch.float32)
+        teacher_rgb = resized_rgb
+        if args.query_feature_source == "original":
+            teacher_rgb = load_cambridge_rgb_no_resize(
+                scene_root,
+                train_args.get("image_subdir", "processed"),
+                str(item["image_name"]),
+                device,
+            ).unsqueeze(0)
+        with torch.no_grad():
+            teacher_desc_raw_b, teacher_det_raw_b = teacher(superpoint_gray(teacher_rgb))
+        teacher_desc_raw, teacher_desc, teacher_det = prepare_query_teacher_maps(
+            teacher_desc_raw_b,
+            teacher_det_raw_b,
+            train_args["feature_height"],
+            train_args["feature_width"],
+        )
+        if args.query_detector == "stdloc":
+            if stdloc_detector is None:
+                raise RuntimeError("query_detector=stdloc requires a detector")
+            full_h, full_w = calibration_query_canvas_hw(resized_rgb, teacher_rgb)
+            query_feature_map = F.normalize(upsample_feature_map(teacher_desc_raw, full_h, full_w), p=2, dim=0)
+            keypoints, _scores = extract_stdloc_detector_keypoints(
+                query_feature_map,
+                stdloc_detector,
+                max_keypoints=args.query_keypoints,
+                nms_radius=args.nms_radius,
+            )
+            query_desc = sample_descriptors_bilinear(query_feature_map, keypoints)
+            K = item["K"].to(device)
+            query_for_label = keypoints + 0.5
+        else:
+            keypoints, _scores = extract_keypoints_from_detector_logits(
+                teacher_det,
+                max_keypoints=args.query_keypoints,
+                confidence_threshold=args.keypoint_threshold,
+                nms_radius=args.nms_radius,
+            )
+            query_desc = sample_descriptors_bilinear(teacher_desc, keypoints)
+            K = item["feature_K"].to(device)
+            query_for_label = keypoints
+        if query_desc.numel() == 0:
+            continue
+        depth_map = None
+        alpha_map = None
+        if visibility_renderer is not None and visibility_values is not None:
+            visibility_renderer.K.copy_(K.to(device=device, dtype=visibility_renderer.K.dtype))
+            vis_render = visibility_renderer.render_feature_values_batch(
+                model,
+                visibility_values,
+                item["pose_w2c"].to(device=device, dtype=torch.float32).unsqueeze(0),
+            )
+            depth_map = vis_render["depth_map"][0]
+            alpha_map = vis_render["alpha_map"][0]
+        corr = F.normalize(query_desc.float(), p=2, dim=-1) @ landmark_desc.T
+        corr = apply_match_prior(corr.unsqueeze(0), landmark_prior, weight=args.locability_prior_weight)[0]
+        k = min(max(1, int(args.topk)), int(corr.shape[-1]))
+        _vals, lm_topk = torch.topk(corr, k=k, dim=-1)
+        q_ids = torch.arange(lm_topk.shape[0], device=device).view(-1, 1).expand_as(lm_topk).reshape(-1)
+        lm_ids = lm_topk.reshape(-1)
+        accumulate_matchability_counts(
+            tp,
+            fp,
+            query_yx=query_for_label,
+            landmark_xyz=landmark_xyz,
+            q_ids=q_ids,
+            lm_ids=lm_ids,
+            pose_w2c=item["pose_w2c"].to(device),
+            K=K,
+            reprojection_threshold_px=args.reprojection_threshold_px,
+            depth_map=depth_map,
+            alpha_map=alpha_map,
+            depth_abs_tolerance=args.visibility_depth_abs_tolerance,
+            depth_rel_tolerance=args.visibility_depth_rel_tolerance,
+            alpha_threshold=args.visibility_alpha_threshold,
+        )
+
+    matchability = matchability_from_counts(tp, fp, alpha=args.smoothing_alpha)
+    fp_rate = fp / (tp + fp).clamp_min(1.0)
+    output_path = (
+        Path(args.output_path)
+        if args.output_path
+        else Path(train_args.get("output_root", "output"))
+        / "cache"
+        / "calibrated_matchability"
+        / "Cambridge_stdloc"
+        / scene
+        / "stdloc_bank.pt"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "landmark_matchability": matchability.detach().cpu(),
+        "landmark_tp_count": tp.detach().cpu(),
+        "landmark_fp_count": fp.detach().cpu(),
+        "landmark_fp_rate": fp_rate.detach().cpu(),
+        "matchability_calibrator": {
+            "type": "beta_smoothed_tp_fp",
+            "smoothing_alpha": float(args.smoothing_alpha),
+        },
+        "metadata": {
+            "scene": scene,
+            "checkpoint": str(args.checkpoint),
+            "views": len(ids),
+            "topk": int(args.topk),
+            "reprojection_threshold_px": float(args.reprojection_threshold_px),
+            "max_landmarks": int(args.max_landmarks),
+            "query_detector": args.query_detector,
+            "query_feature_source": args.query_feature_source,
+            "visibility_check": args.visibility_check,
+            "visibility_alpha_threshold": float(args.visibility_alpha_threshold),
+            "visibility_depth_abs_tolerance": float(args.visibility_depth_abs_tolerance),
+            "visibility_depth_rel_tolerance": float(args.visibility_depth_rel_tolerance),
+            "landmark_score_stats": stats,
+        },
+    }
+    write_matchability_calibration(payload, output_path)
+    sidecar = output_path.with_suffix(".json")
+    print(f"[calibrate] wrote {output_path}")
+    print(f"[calibrate] wrote {sidecar}")
+
+
+if __name__ == "__main__":
+    main()

@@ -9,6 +9,8 @@ from loc_gs.scripts import eval_cambridge_hybrid
 from loc_gs.scripts.eval_cambridge_hybrid import (
     build_argparser,
     effective_eval_config,
+    gated_residual_descriptor_blend,
+    generate_pnp_hypotheses,
     local_geometric_consistency_scores,
     prepare_query_teacher_maps,
     select_pnp_match_indices,
@@ -120,10 +122,54 @@ def test_eval_parser_exposes_stdloc_parity_options():
             "4",
             "--landmark_score_prior_blend",
             "0.2",
+            "--calibrated_matchability_path",
+            "output/cache/calibrated/ShopFacade/matchability.pt",
+            "--landmark_score_calibrated_matchability_weight",
+            "0.7",
+            "--match_calibrated_prior_weight",
+            "0.2",
+            "--match_filter_mode",
+            "calibrated_coverage",
+            "--match_filter_calibrated_score_weight",
+            "0.3",
+            "--match_filter_margin_weight",
+            "0.4",
+            "--match_filter_top_m",
+            "1024",
+            "--match_filter_image_grid_size",
+            "12",
+            "--match_filter_xyz_grid_size",
+            "10",
+            "--match_filter_max_per_image_cell",
+            "4",
+            "--match_filter_max_per_xyz_cell",
+            "6",
+            "--match_filter_min_matches",
+            "64",
+            "--sparse_match_filter_mode",
+            "calibrated_coverage",
+            "--dense_match_filter_mode",
+            "none",
+            "--sparse_match_filter_top_m",
+            "1024",
+            "--dense_match_filter_top_m",
+            "0",
+            "--pnp_hypotheses",
+            "8",
+            "--pnp_cluster_mode",
+            "xyz_voxel",
+            "--pnp_cluster_grid_size",
+            "4",
+            "--pnp_dense_verify_topk",
+            "4",
+            "--pnp_hypothesis_min_score_gain",
+            "5.0",
             "--descriptor_source",
-            "hybrid_ply_blend",
+            "hybrid_ply_gated_residual",
             "--ply_loc_feature_weight",
             "0.75",
+            "--hybrid_residual_alpha_max",
+            "0.05",
             "--matchability_diagnostics",
             "--pnp_prefilter",
             "image_xyz_grid",
@@ -175,8 +221,30 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert args.landmark_score_legacy_keep_ratio == 0.75
     assert args.landmark_score_spatial_grid_size == 4
     assert args.landmark_score_prior_blend == 0.2
-    assert args.descriptor_source == "hybrid_ply_blend"
+    assert args.calibrated_matchability_path == "output/cache/calibrated/ShopFacade/matchability.pt"
+    assert args.landmark_score_calibrated_matchability_weight == 0.7
+    assert args.match_calibrated_prior_weight == 0.2
+    assert args.match_filter_mode == "calibrated_coverage"
+    assert args.match_filter_calibrated_score_weight == 0.3
+    assert args.match_filter_margin_weight == 0.4
+    assert args.match_filter_top_m == 1024
+    assert args.match_filter_image_grid_size == 12
+    assert args.match_filter_xyz_grid_size == 10
+    assert args.match_filter_max_per_image_cell == 4
+    assert args.match_filter_max_per_xyz_cell == 6
+    assert args.match_filter_min_matches == 64
+    assert args.sparse_match_filter_mode == "calibrated_coverage"
+    assert args.dense_match_filter_mode == "none"
+    assert args.sparse_match_filter_top_m == 1024
+    assert args.dense_match_filter_top_m == 0
+    assert args.pnp_hypotheses == 8
+    assert args.pnp_cluster_mode == "xyz_voxel"
+    assert args.pnp_cluster_grid_size == 4
+    assert args.pnp_dense_verify_topk == 4
+    assert args.pnp_hypothesis_min_score_gain == 5.0
+    assert args.descriptor_source == "hybrid_ply_gated_residual"
     assert args.ply_loc_feature_weight == 0.75
+    assert args.hybrid_residual_alpha_max == 0.05
     assert args.matchability_diagnostics is True
     assert args.pnp_prefilter == "image_xyz_grid"
     assert args.sparse_pnp_max_matches == 512
@@ -190,6 +258,24 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert config["pnp_prefilter"] == "image_xyz_grid"
     assert config["sparse_pnp_max_matches"] == 512
     assert config["dense_pnp_max_matches"] == 4096
+    assert config["match_filter_mode"] == "calibrated_coverage"
+    assert config["match_calibrated_prior_weight"] == 0.2
+    assert config["match_filter_top_m"] == 1024
+    assert config["match_filter_margin_weight"] == 0.4
+    assert config["match_filter_image_grid_size"] == 12
+    assert config["match_filter_xyz_grid_size"] == 10
+    assert config["match_filter_max_per_image_cell"] == 4
+    assert config["match_filter_max_per_xyz_cell"] == 6
+    assert config["sparse_match_filter_mode"] == "calibrated_coverage"
+    assert config["dense_match_filter_mode"] == "none"
+    assert config["sparse_match_filter_top_m"] == 1024
+    assert config["dense_match_filter_top_m"] == 0
+    assert config["pnp_hypotheses"] == 8
+    assert config["pnp_cluster_mode"] == "xyz_voxel"
+    assert config["pnp_dense_verify_topk"] == 4
+    assert config["pnp_hypothesis_min_score_gain"] == 5.0
+    assert config["hybrid_residual_alpha_max"] == 0.05
+    assert config["match_filter_min_matches"] == 64
 
 
 def test_detector_prior_for_all_gaussians_maps_sampled_scores_to_sampled_ids():
@@ -209,6 +295,30 @@ def test_detector_prior_for_all_gaussians_maps_sampled_scores_to_sampled_ids():
     assert prior[0] == 0.0
     assert prior[1] == 0.0
     assert prior.shape == (6,)
+
+
+def test_calibrated_prior_maps_full_or_sampled_scores_to_candidate_ids():
+    sampled_ids = torch.tensor([2, 4], dtype=torch.long)
+    ids_all = torch.tensor([4, 2], dtype=torch.long)
+    full_scores = torch.tensor([0.0, 0.0, 0.2, 0.0, 0.8, 0.0], dtype=torch.float32)
+
+    prior = eval_cambridge_hybrid._calibrated_prior_for_ids(
+        full_scores,
+        ids_all=ids_all,
+        sampled_ids=sampled_ids,
+        num_gaussians=6,
+        device=torch.device("cpu"),
+    )
+
+    assert prior[0] > prior[1]
+    sampled_prior = eval_cambridge_hybrid._calibrated_prior_for_ids(
+        torch.tensor([0.1, 0.9], dtype=torch.float32),
+        ids_all=ids_all,
+        sampled_ids=sampled_ids,
+        num_gaussians=6,
+        device=torch.device("cpu"),
+    )
+    assert sampled_prior[0] > sampled_prior[1]
 
 
 def test_effective_eval_config_uses_global_reprojection_when_specific_values_absent():
@@ -423,6 +533,200 @@ def test_select_pnp_match_indices_can_use_local_geometry_prefilter():
     )
 
     assert 4 not in keep.tolist()
+
+
+def test_calibrated_coverage_filter_preserves_image_and_xyz_spread():
+    query_yx = torch.tensor(
+        [
+            [0.1, 0.1],
+            [0.2, 0.2],
+            [0.3, 0.3],
+            [9.1, 9.1],
+            [9.2, 9.2],
+            [9.3, 9.3],
+        ],
+        dtype=torch.float32,
+    )
+    points3d = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.1, 0.0],
+            [0.2, 0.2, 0.0],
+            [5.0, 5.0, 0.0],
+            [5.1, 5.1, 0.0],
+            [5.2, 5.2, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    scores = torch.tensor([0.99, 0.98, 0.97, 0.7, 0.69, 0.68], dtype=torch.float32)
+
+    keep = select_pnp_match_indices(
+        query_yx,
+        points3d,
+        scores=scores,
+        max_matches=4,
+        mode="calibrated_coverage",
+        image_grid_size=2,
+        xyz_grid_size=2,
+        max_per_image_cell=1,
+        max_per_xyz_cell=1,
+        min_matches=4,
+    )
+
+    assert keep.numel() == 4
+    assert 0 in keep.tolist()
+    assert any(idx in keep.tolist() for idx in (3, 4, 5))
+
+
+def test_gated_residual_descriptor_blend_preserves_ply_at_zero_alpha():
+    ply = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    hybrid = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float32)
+    gate = torch.tensor([1.0, 0.0], dtype=torch.float32)
+
+    zero = gated_residual_descriptor_blend(ply, hybrid, gate=gate, alpha_max=0.0)
+    gated = gated_residual_descriptor_blend(ply, hybrid, gate=gate, alpha_max=1.0)
+
+    assert torch.allclose(zero, torch.nn.functional.normalize(ply, dim=-1))
+    assert gated[0, 1] > gated[0, 0]
+    assert torch.allclose(gated[1], torch.nn.functional.normalize(ply, dim=-1)[1])
+
+
+def test_match_filter_scores_can_use_descriptor_margin():
+    raw = torch.tensor([0.90, 0.89], dtype=torch.float32)
+    margin = torch.tensor([0.01, 0.30], dtype=torch.float32)
+
+    scored = eval_cambridge_hybrid._match_filter_scores(
+        raw,
+        reliability=None,
+        weight=0.0,
+        margin=margin,
+        margin_weight=1.0,
+    )
+
+    assert scored[1] > scored[0]
+
+
+def test_match_filter_scores_can_use_calibrated_reliability_without_mutating_match_prior():
+    scores = torch.zeros(3, dtype=torch.float32)
+    detector_prior = torch.tensor([0.9, 0.8, 0.7], dtype=torch.float32)
+    calibrated_reliability = torch.tensor([0.1, 0.9, 0.2], dtype=torch.float32)
+
+    prior_scored = eval_cambridge_hybrid._match_filter_scores(scores, detector_prior, 1.0)
+    calibrated_scored = eval_cambridge_hybrid._match_filter_scores(scores, calibrated_reliability, 1.0)
+
+    assert torch.argmax(prior_scored).item() == 0
+    assert torch.argmax(calibrated_scored).item() == 1
+
+
+def test_calibrated_matchability_prior_uses_independent_logit_bias():
+    corr = torch.zeros(1, 2, 3, dtype=torch.float32)
+    reliability = torch.tensor([0.1, 0.8, 0.2], dtype=torch.float32)
+
+    biased = eval_cambridge_hybrid.apply_calibrated_matchability_prior(
+        corr,
+        reliability,
+        weight=0.5,
+    )
+
+    assert torch.argmax(biased[0, 0]).item() == 1
+    assert torch.allclose(biased - biased.mean(dim=-1, keepdim=True), biased, atol=1e-6)
+
+
+def test_generate_pnp_hypotheses_tries_clustered_subsets(monkeypatch):
+    points = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.1, 0.0, 1.0],
+            [0.0, 0.1, 1.0],
+            [0.1, 0.1, 1.0],
+            [10.0, 10.0, 1.0],
+            [10.1, 10.0, 1.0],
+            [10.0, 10.1, 1.0],
+            [10.1, 10.1, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    query = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.0, 0.1],
+            [0.1, 0.0],
+            [0.1, 0.1],
+            [10.0, 10.0],
+            [10.0, 10.1],
+            [10.1, 10.0],
+            [10.1, 10.1],
+        ],
+        dtype=torch.float32,
+    )
+    calls = []
+
+    def fake_solve(obj, img, *_args, **_kwargs):
+        calls.append(obj.shape[0])
+        pose = np.eye(4, dtype=np.float32)
+        pose[0, 3] = float(len(calls))
+        return pose, int(obj.shape[0])
+
+    monkeypatch.setattr(eval_cambridge_hybrid, "solve_pnp_ransac", fake_solve)
+
+    hypotheses = generate_pnp_hypotheses(
+        points,
+        query,
+        torch.eye(3),
+        scores=torch.arange(8, dtype=torch.float32),
+        max_hypotheses=3,
+        cluster_mode="xyz_voxel",
+        cluster_grid_size=2,
+        reprojection_error=8.0,
+        confidence=0.999,
+        iterations=100,
+        min_iterations=0,
+        solver="opencv",
+        refine_poselib=False,
+    )
+
+    assert calls[0] == 8
+    assert any(count == 4 for count in calls[1:])
+    assert len(hypotheses) >= 2
+    assert hypotheses[0]["is_full"] in {True, False}
+
+
+def test_select_verified_pnp_hypothesis_prefers_full_without_clear_gain():
+    full_pose = np.eye(4, dtype=np.float32)
+    cluster_pose = np.eye(4, dtype=np.float32)
+    cluster_pose[0, 3] = 1.0
+    hypotheses = [
+        {"pose": cluster_pose, "score": 103.0, "inliers": 20, "is_full": False},
+        {"pose": full_pose, "score": 100.0, "inliers": 18, "is_full": True},
+    ]
+
+    conservative = eval_cambridge_hybrid.select_verified_pnp_hypothesis(
+        hypotheses,
+        min_score_gain=5.0,
+    )
+    permissive = eval_cambridge_hybrid.select_verified_pnp_hypothesis(
+        hypotheses,
+        min_score_gain=1.0,
+    )
+
+    assert conservative["is_full"] is True
+    assert permissive["is_full"] is False
+
+
+def test_descriptor_top2_margin_uses_prior_adjusted_scores():
+    query = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    landmarks = torch.tensor([[1.0, 0.0], [0.99, 0.1]], dtype=torch.float32)
+    prior = torch.tensor([0.0, 1.0], dtype=torch.float32)
+
+    no_prior = eval_cambridge_hybrid.descriptor_top2_margin(query, landmarks)
+    with_prior = eval_cambridge_hybrid.descriptor_top2_margin(
+        query,
+        landmarks,
+        landmark_prior=prior,
+        prior_weight=0.2,
+    )
+
+    assert with_prior[0] > no_prior[0]
 
 
 def test_localize_one_stdloc_dense_branch_unprojects_dense_matches(monkeypatch):

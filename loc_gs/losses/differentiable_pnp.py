@@ -314,22 +314,27 @@ class DifferentiablePnPMatchLoss(nn.Module):
                 loc = F.interpolate(loc, size=(H, W), mode="bilinear", align_corners=False)
             logits = logits + self.locability_prior_weight * loc.flatten(2).expand(B, query_descs.shape[1], P)
         logits = logits / max(float(self.temperature), 1e-6)
-        logits = logits.masked_fill(~valid_pixels[:, None, :], -1e4)
-        log_probs = F.log_softmax(logits, dim=-1)
+        match_logits = logits.masked_fill(~valid_pixels[:, None, :], -1e4)
+        pnp_logits = logits.masked_fill(~valid_target_pixels[:, None, :], -1e4)
+        log_probs = F.log_softmax(match_logits, dim=-1)
         probs = log_probs.exp()
 
         confidence = probs.max(dim=-1).values
-        pnp_weights = valid_queries.float() * confidence.detach()
         topk_pnp = int(self.topk_pnp)
         if topk_pnp > 0 and topk_pnp < P:
-            top_ids = logits.detach().topk(k=topk_pnp, dim=-1).indices
-            top_logits = logits.gather(-1, top_ids)
+            top_ids = pnp_logits.detach().topk(k=topk_pnp, dim=-1).indices
+            top_logits = match_logits.gather(-1, top_ids)
             top_probs = F.softmax(top_logits, dim=-1)
             top_world = world_points[:, None, :, :].expand(-1, query_descs.shape[1], -1, -1)
             top_world = top_world.gather(2, top_ids[..., None].expand(-1, -1, -1, 3))
             expected_world = (top_probs[..., None] * top_world).sum(dim=2)
+            top_geom = geometry_target.gather(-1, top_ids)
+            geom_confidence = (top_probs.detach() * top_geom).sum(dim=-1)
+            pnp_weights = valid_queries.float() * geom_confidence.clamp_min(1e-3)
         else:
             expected_world = torch.bmm(probs, world_points)
+            geom_confidence = (probs.detach() * geometry_target).sum(dim=-1)
+            pnp_weights = valid_queries.float() * (confidence.detach() * geom_confidence).clamp_min(1e-3)
         pose_w2c, pnp_residual = differentiable_pnp_gauss_newton(
             expected_world,
             query_keypoints_yx.float(),

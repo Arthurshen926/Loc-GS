@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from loc_gs.data.cambridge_dataset import CambridgeHybridDataset
 from loc_gs.data.superpoint_cache import SuperPointTeacherCache
+from loc_gs.localization.descriptor_blend import gated_residual_descriptor_blend
 from loc_gs.localization.hybrid_localizer import (
     extract_keypoints_from_detector_logits,
     flatten_rendered_landmarks,
@@ -463,6 +464,30 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
         "dense_pnp_max_matches": int(args.dense_pnp_max_matches),
         "pnp_prefilter_image_grid_size": int(args.pnp_prefilter_image_grid_size),
         "pnp_prefilter_xyz_grid_size": int(args.pnp_prefilter_xyz_grid_size),
+        "calibrated_matchability_path": str(getattr(args, "calibrated_matchability_path", "")),
+        "landmark_score_calibrated_matchability_weight": float(
+            getattr(args, "landmark_score_calibrated_matchability_weight", 0.0)
+        ),
+        "match_calibrated_prior_weight": float(getattr(args, "match_calibrated_prior_weight", 0.0)),
+        "match_filter_mode": str(getattr(args, "match_filter_mode", "")),
+        "match_filter_calibrated_score_weight": float(getattr(args, "match_filter_calibrated_score_weight", 0.0)),
+        "match_filter_margin_weight": float(getattr(args, "match_filter_margin_weight", 0.0)),
+        "match_filter_top_m": int(getattr(args, "match_filter_top_m", 0)),
+        "match_filter_image_grid_size": int(getattr(args, "match_filter_image_grid_size", 8)),
+        "match_filter_xyz_grid_size": int(getattr(args, "match_filter_xyz_grid_size", 8)),
+        "sparse_match_filter_mode": str(getattr(args, "sparse_match_filter_mode", "")),
+        "dense_match_filter_mode": str(getattr(args, "dense_match_filter_mode", "")),
+        "sparse_match_filter_top_m": int(getattr(args, "sparse_match_filter_top_m", 0)),
+        "dense_match_filter_top_m": int(getattr(args, "dense_match_filter_top_m", 0)),
+        "match_filter_max_per_image_cell": int(getattr(args, "match_filter_max_per_image_cell", 8)),
+        "match_filter_max_per_xyz_cell": int(getattr(args, "match_filter_max_per_xyz_cell", 8)),
+        "match_filter_min_matches": int(getattr(args, "match_filter_min_matches", 0)),
+        "pnp_hypotheses": int(getattr(args, "pnp_hypotheses", 1)),
+        "pnp_cluster_mode": str(getattr(args, "pnp_cluster_mode", "none")),
+        "pnp_cluster_grid_size": int(getattr(args, "pnp_cluster_grid_size", 4)),
+        "pnp_dense_verify_topk": int(getattr(args, "pnp_dense_verify_topk", 1)),
+        "pnp_hypothesis_min_score_gain": float(getattr(args, "pnp_hypothesis_min_score_gain", 0.0)),
+        "hybrid_residual_alpha_max": float(getattr(args, "hybrid_residual_alpha_max", 0.05)),
     }
 
 
@@ -687,6 +712,80 @@ def _unique_keep_order(indices: list[torch.Tensor], score: torch.Tensor, k: int)
     return selected[: int(k)]
 
 
+def _grid_cell_ids(coords: torch.Tensor, grid_size: int, valid: torch.Tensor) -> torch.Tensor:
+    grid = max(1, int(grid_size))
+    cells = torch.zeros(coords.shape[0], dtype=torch.long, device=coords.device)
+    if grid <= 1 or coords.numel() == 0:
+        return cells
+    eligible = torch.where(valid)[0]
+    if eligible.numel() == 0:
+        return cells
+    selected = coords[eligible].float()
+    lo = selected.amin(dim=0)
+    hi = selected.amax(dim=0)
+    norm = (selected - lo) / (hi - lo).clamp_min(1e-6)
+    bins = torch.clamp((norm * float(grid)).long(), min=0, max=grid - 1)
+    multipliers = torch.ones(bins.shape[1], device=coords.device, dtype=torch.long)
+    for dim in range(bins.shape[1] - 2, -1, -1):
+        multipliers[dim] = multipliers[dim + 1] * grid
+    cells[eligible] = (bins * multipliers.view(1, -1)).sum(dim=-1)
+    return cells
+
+
+def _coverage_aware_topk(
+    score: torch.Tensor,
+    query: torch.Tensor,
+    xyz: torch.Tensor,
+    keep: int,
+    valid: torch.Tensor,
+    image_grid_size: int,
+    xyz_grid_size: int,
+    max_per_image_cell: int,
+    max_per_xyz_cell: int,
+    min_matches: int,
+) -> torch.Tensor:
+    score = score.float().reshape(-1)
+    keep = min(max(int(keep), 0), int(score.numel()))
+    if keep <= 0:
+        return torch.empty(0, dtype=torch.long, device=score.device)
+    eligible = torch.where(valid)[0]
+    if eligible.numel() <= keep:
+        return eligible[torch.argsort(score[eligible], descending=True)]
+
+    image_cells = _grid_cell_ids(query, image_grid_size, valid)
+    xyz_cells = _grid_cell_ids(xyz[:, :3], xyz_grid_size, valid)
+    image_cap = max(1, int(max_per_image_cell))
+    xyz_cap = max(1, int(max_per_xyz_cell))
+    image_counts: dict[int, int] = {}
+    xyz_counts: dict[int, int] = {}
+    selected: list[int] = []
+    ordered = eligible[torch.argsort(score[eligible], descending=True)]
+    for idx_t in ordered:
+        idx = int(idx_t.item())
+        image_cell = int(image_cells[idx].item())
+        xyz_cell = int(xyz_cells[idx].item())
+        if image_counts.get(image_cell, 0) >= image_cap:
+            continue
+        if xyz_counts.get(xyz_cell, 0) >= xyz_cap:
+            continue
+        selected.append(idx)
+        image_counts[image_cell] = image_counts.get(image_cell, 0) + 1
+        xyz_counts[xyz_cell] = xyz_counts.get(xyz_cell, 0) + 1
+        if len(selected) >= keep:
+            break
+
+    min_keep = min(max(int(min_matches), 0), keep)
+    if len(selected) < min_keep:
+        seen = torch.zeros(score.numel(), dtype=torch.bool, device=score.device)
+        if selected:
+            seen[torch.as_tensor(selected, dtype=torch.long, device=score.device)] = True
+        remaining = torch.where(valid & ~seen)[0]
+        topup = min(min_keep - len(selected), int(remaining.numel()))
+        if topup > 0:
+            selected.extend(remaining[torch.topk(score[remaining], k=topup).indices].tolist())
+    return torch.as_tensor(selected[:keep], dtype=torch.long, device=score.device)
+
+
 def local_geometric_consistency_scores(
     query_yx: torch.Tensor,
     points3d: torch.Tensor,
@@ -741,6 +840,9 @@ def select_pnp_match_indices(
     mode: str = "none",
     image_grid_size: int = 8,
     xyz_grid_size: int = 4,
+    max_per_image_cell: int = 8,
+    max_per_xyz_cell: int = 8,
+    min_matches: int = 0,
 ) -> torch.Tensor:
     """Select PnP correspondences while preserving spatial/pose conditioning."""
     count = min(int(query_yx.shape[0]), int(points3d.shape[0]))
@@ -772,6 +874,19 @@ def select_pnp_match_indices(
         image_keep = _balanced_topk_by_coords(score, query, keep, image_grid_size, valid)
         xyz_keep = _balanced_topk_by_coords(score, xyz, keep, xyz_grid_size, valid)
         return _unique_keep_order([image_keep, xyz_keep], score, keep)
+    if mode == "calibrated_coverage":
+        return _coverage_aware_topk(
+            score,
+            query,
+            xyz,
+            keep,
+            valid,
+            image_grid_size=image_grid_size,
+            xyz_grid_size=xyz_grid_size,
+            max_per_image_cell=max_per_image_cell,
+            max_per_xyz_cell=max_per_xyz_cell,
+            min_matches=min_matches,
+        )
     if mode == "local_geometry":
         eligible = torch.where(valid)[0]
         candidate_limit = min(
@@ -785,6 +900,166 @@ def select_pnp_match_indices(
         combined = pre_score[candidate_rel] * geometry
         return candidate_idx[torch.topk(combined, k=min(keep, candidate_limit)).indices]
     raise ValueError(f"Unsupported PnP prefilter mode: {mode}")
+
+
+def _pose_verification_score(
+    points3d: torch.Tensor,
+    query_yx: torch.Tensor,
+    K: torch.Tensor,
+    pose_w2c: np.ndarray,
+    reprojection_error: float,
+    image_grid_size: int = 8,
+    xyz_grid_size: int = 4,
+) -> tuple[float, int]:
+    if points3d.numel() == 0 or query_yx.numel() == 0:
+        return -float("inf"), 0
+    device = points3d.device
+    pose = torch.as_tensor(pose_w2c, device=device, dtype=torch.float32).unsqueeze(0)
+    proj, valid_z = project_world_to_image_yx(
+        points3d.float().unsqueeze(0),
+        pose,
+        K.to(device=device, dtype=torch.float32),
+    )
+    err = torch.linalg.norm(proj[0] - query_yx.float(), dim=-1)
+    valid = valid_z[0] & torch.isfinite(err)
+    inliers = valid & (err <= float(reprojection_error))
+    inlier_count = int(inliers.sum().item())
+    median_err = float(err[inliers].median().item()) if inliers.any() else (
+        float(err[valid].median().item()) if valid.any() else 1e6
+    )
+    image_cells = _grid_cell_ids(query_yx.float(), image_grid_size, inliers)
+    xyz_cells = _grid_cell_ids(points3d[:, :3].float(), xyz_grid_size, inliers)
+    image_coverage = int(torch.unique(image_cells[inliers]).numel()) if inliers.any() else 0
+    xyz_coverage = int(torch.unique(xyz_cells[inliers]).numel()) if inliers.any() else 0
+    score = float(inlier_count) + 0.05 * float(image_coverage + xyz_coverage) - 0.01 * median_err
+    return score, inlier_count
+
+
+def _cluster_pnp_groups(
+    points3d: torch.Tensor,
+    query_yx: torch.Tensor,
+    scores: torch.Tensor,
+    cluster_mode: str,
+    grid_size: int,
+    max_groups: int,
+) -> list[torch.Tensor]:
+    count = min(int(points3d.shape[0]), int(query_yx.shape[0]), int(scores.shape[0]))
+    if count < 4 or int(max_groups) <= 0:
+        return []
+    valid = torch.isfinite(points3d[:count]).all(dim=-1) & torch.isfinite(query_yx[:count]).all(dim=-1)
+    if int(valid.sum()) < 4:
+        return []
+    modes = []
+    if cluster_mode in {"xyz_voxel", "image_xyz_grid"}:
+        modes.append(points3d[:count, :3])
+    if cluster_mode in {"image_grid", "image_xyz_grid"}:
+        modes.append(query_yx[:count])
+    groups: list[torch.Tensor] = []
+    for coords in modes:
+        cells = _grid_cell_ids(coords.float(), grid_size, valid)
+        candidates = []
+        for cell in torch.unique(cells[valid]).tolist():
+            idx = torch.where(valid & (cells == int(cell)))[0]
+            if idx.numel() >= 4:
+                candidates.append((float(scores[idx].float().sum().item()), idx))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        groups.extend(idx for _score, idx in candidates)
+    return groups[: int(max_groups)]
+
+
+def generate_pnp_hypotheses(
+    points3d: torch.Tensor,
+    query_yx: torch.Tensor,
+    K: torch.Tensor,
+    *,
+    scores: torch.Tensor | None = None,
+    max_hypotheses: int = 1,
+    cluster_mode: str = "none",
+    cluster_grid_size: int = 4,
+    reprojection_error: float = 12.0,
+    refine_reprojection_error: float = 0.0,
+    confidence: float = 0.9999,
+    iterations: int = 10000,
+    min_iterations: int = 0,
+    solver: str = "opencv",
+    refine_poselib: bool = False,
+) -> list[dict[str, object]]:
+    count = min(int(points3d.shape[0]), int(query_yx.shape[0]))
+    if count < 4:
+        return []
+    pts = points3d[:count].float()
+    q = query_yx[:count].float()
+    score = scores[:count].float() if scores is not None else torch.zeros(count, device=pts.device)
+    all_idx = torch.arange(count, device=pts.device, dtype=torch.long)
+    groups = [all_idx]
+    if int(max_hypotheses) > 1 and cluster_mode != "none":
+        groups.extend(
+            _cluster_pnp_groups(
+                pts,
+                q,
+                score,
+                cluster_mode=cluster_mode,
+                grid_size=int(cluster_grid_size),
+                max_groups=max(0, int(max_hypotheses) * 2),
+            )
+        )
+    seen: set[tuple[int, ...]] = set()
+    hypotheses: list[dict[str, object]] = []
+    for group_index, idx in enumerate(groups):
+        key = tuple(int(v) for v in idx.detach().cpu().tolist())
+        if len(key) < 4 or key in seen:
+            continue
+        seen.add(key)
+        pose, pnp_inliers = solve_pnp_ransac(
+            pts[idx].detach().cpu().numpy(),
+            q[idx].detach().cpu().numpy(),
+            K.detach().cpu().numpy(),
+            reprojection_error=reprojection_error,
+            refine_reprojection_error=refine_reprojection_error,
+            confidence=confidence,
+            iterations=iterations,
+            min_iterations=min_iterations,
+            solver=solver,
+            refine_poselib=refine_poselib,
+        )
+        if pose is None:
+            continue
+        verify_score, verify_inliers = _pose_verification_score(
+            pts,
+            q,
+            K,
+            pose,
+            reprojection_error=reprojection_error,
+        )
+        hypotheses.append(
+            {
+                "pose": pose,
+                "inliers": int(max(int(pnp_inliers), int(verify_inliers))),
+                "score": float(verify_score),
+                "source_matches": int(idx.numel()),
+                "group_index": int(group_index),
+                "is_full": bool(group_index == 0),
+            }
+        )
+    hypotheses.sort(key=lambda item: (float(item["score"]), int(item["inliers"])), reverse=True)
+    return hypotheses[: max(1, int(max_hypotheses))]
+
+
+def select_verified_pnp_hypothesis(
+    hypotheses: list[dict[str, object]],
+    min_score_gain: float = 0.0,
+) -> dict[str, object] | None:
+    """Choose the best PnP hypothesis while protecting the full-match RANSAC pose."""
+    if not hypotheses:
+        return None
+    ordered = sorted(hypotheses, key=lambda item: (float(item["score"]), int(item["inliers"])), reverse=True)
+    best = ordered[0]
+    full = next((item for item in ordered if bool(item.get("is_full", False))), None)
+    if full is None or best is full:
+        return best
+    if float(best["score"]) < float(full["score"]) + max(float(min_score_gain), 0.0):
+        return full
+    return best
 
 
 def _detector_prior_for_ids(
@@ -819,6 +1094,134 @@ def _detector_prior_for_ids(
     return normalize_score01(prior)
 
 
+def _calibrated_prior_for_ids(
+    scores: torch.Tensor,
+    ids_all: torch.Tensor,
+    sampled_ids: torch.Tensor,
+    num_gaussians: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Map calibrated TP/(TP+FP) reliability to candidate Gaussian ids."""
+    return _detector_prior_for_ids(
+        scores,
+        ids_all=ids_all,
+        sampled_ids=sampled_ids,
+        num_gaussians=num_gaussians,
+        device=device,
+    )
+
+
+def _load_calibrated_matchability(path: str | Path, device: torch.device) -> torch.Tensor:
+    data = torch.load(Path(path), map_location=device)
+    if isinstance(data, dict):
+        for key in (
+            "landmark_matchability",
+            "matchability",
+            "calibrated_matchability",
+            "landmark_tp_rate",
+        ):
+            if key in data:
+                return torch.as_tensor(data[key], device=device, dtype=torch.float32).reshape(-1)
+        if "landmark_fp_rate" in data:
+            fp_rate = torch.as_tensor(data["landmark_fp_rate"], device=device, dtype=torch.float32)
+            return (1.0 - fp_rate).reshape(-1)
+        raise KeyError(f"Calibration file {path} does not contain a recognized matchability key")
+    return torch.as_tensor(data, device=device, dtype=torch.float32).reshape(-1)
+
+
+def _match_filter_mode(args: argparse.Namespace) -> str:
+    mode = getattr(args, "match_filter_mode", "")
+    return mode if mode else getattr(args, "pnp_prefilter", "none")
+
+
+def _stage_match_filter_mode(args: argparse.Namespace, stage: str) -> str:
+    mode = getattr(args, f"{stage}_match_filter_mode", "")
+    return mode if mode else _match_filter_mode(args)
+
+
+def _match_filter_max_matches(args: argparse.Namespace, fallback: int) -> int:
+    top_m = int(getattr(args, "match_filter_top_m", 0))
+    return top_m if top_m > 0 else int(fallback)
+
+
+def _stage_match_filter_max_matches(args: argparse.Namespace, stage: str, fallback: int) -> int:
+    top_m = int(getattr(args, f"{stage}_match_filter_top_m", 0))
+    if top_m > 0:
+        return top_m
+    return _match_filter_max_matches(args, fallback)
+
+
+def _match_filter_image_grid_size(args: argparse.Namespace) -> int:
+    return int(getattr(args, "match_filter_image_grid_size", getattr(args, "pnp_prefilter_image_grid_size", 8)))
+
+
+def _match_filter_xyz_grid_size(args: argparse.Namespace) -> int:
+    return int(getattr(args, "match_filter_xyz_grid_size", getattr(args, "pnp_prefilter_xyz_grid_size", 4)))
+
+
+def _match_filter_scores(
+    scores: torch.Tensor,
+    reliability: torch.Tensor | None,
+    weight: float,
+    margin: torch.Tensor | None = None,
+    margin_weight: float = 0.0,
+) -> torch.Tensor:
+    out = scores.float()
+    if reliability is not None and float(weight) != 0.0:
+        rel = reliability.to(device=out.device, dtype=out.dtype).reshape(-1)
+        if rel.numel() == out.numel():
+            rel = rel.clamp(0.0, 1.0)
+            rel = rel - rel.mean()
+            out = out + float(weight) * rel
+    if margin is not None and float(margin_weight) != 0.0:
+        m = margin.to(device=out.device, dtype=out.dtype).reshape(-1)
+        if m.numel() == out.numel():
+            m = m.clamp_min(0.0)
+            m = m - m.mean()
+            out = out + float(margin_weight) * m
+    return out
+
+
+def apply_calibrated_matchability_prior(
+    corr_matrix: torch.Tensor,
+    reliability: torch.Tensor | None,
+    weight: float = 0.0,
+) -> torch.Tensor:
+    """Add calibrated P(inlier) as a soft match logit prior.
+
+    This stays separate from the STDLoc detector/locability prior so the
+    protected landmark bank keeps its original matching prior.
+    """
+
+    if reliability is None or float(weight) == 0.0:
+        return corr_matrix
+    rel = reliability.to(device=corr_matrix.device, dtype=corr_matrix.dtype).reshape(-1)
+    if rel.numel() != corr_matrix.shape[-1]:
+        return corr_matrix
+    eps = torch.finfo(corr_matrix.dtype).eps
+    logit = torch.logit(rel.clamp(eps, 1.0 - eps))
+    logit = logit - logit.mean()
+    return corr_matrix + float(weight) * logit.reshape(*([1] * (corr_matrix.dim() - 1)), -1)
+
+
+def descriptor_top2_margin(
+    query_descriptors: torch.Tensor,
+    landmark_descriptors: torch.Tensor,
+    landmark_prior: torch.Tensor | None = None,
+    prior_weight: float = 0.0,
+) -> torch.Tensor:
+    """Return per-query ambiguity margin after the same prior used for matching."""
+    if query_descriptors.numel() == 0:
+        return torch.empty(0, dtype=torch.float32, device=query_descriptors.device)
+    if landmark_descriptors.shape[0] < 2:
+        return torch.zeros(query_descriptors.shape[0], dtype=torch.float32, device=query_descriptors.device)
+    corr = F.normalize(query_descriptors.float(), dim=-1) @ F.normalize(landmark_descriptors.float(), dim=-1).T
+    if landmark_prior is not None and float(prior_weight) > 0.0:
+        corr = apply_match_prior(corr.unsqueeze(0), landmark_prior, weight=float(prior_weight))[0]
+    top2 = torch.topk(corr, k=2, dim=-1).values
+    return (top2[:, 0] - top2[:, 1]).clamp_min(0.0)
+
+
 def _mean_metric_dict(rows: list[dict[str, float]]) -> dict[str, float]:
     if not rows:
         return {}
@@ -839,6 +1242,7 @@ def build_stdloc_detector_landmark_bank(
     max_landmarks: int,
     descriptor_source: str,
     ply_loc_feature_weight: float,
+    hybrid_residual_alpha_max: float,
     device: torch.device,
     candidate_source: str = "sampled",
     score_weights: dict[str, float] | None = None,
@@ -856,7 +1260,12 @@ def build_stdloc_detector_landmark_bank(
     keypoint_consensus_radius: int = 2,
     keypoint_consensus_descriptor_maps: torch.Tensor | None = None,
     keypoint_consensus_descriptor_weight: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+    calibrated_matchability: torch.Tensor | None = None,
+    calibrated_matchability_weight: float = 0.0,
+    return_aux: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]] | tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float], dict[str, torch.Tensor | None]
+]:
     idx_path = detector_dir / "sampled_idx.pkl"
     if not idx_path.exists():
         raise FileNotFoundError(f"STDLoc detector landmark indices not found: {idx_path}")
@@ -883,6 +1292,16 @@ def build_stdloc_detector_landmark_bank(
 
     stats: dict[str, float] = {}
     _score_stats("detector", detector_prior_all, stats)
+    calibrated_prior_all = None
+    if calibrated_matchability is not None:
+        calibrated_prior_all = _calibrated_prior_for_ids(
+            calibrated_matchability,
+            ids_all=ids_all,
+            sampled_ids=sampled_ids,
+            num_gaussians=model.num_gaussians,
+            device=device,
+        )
+        _score_stats("calibrated_matchability", calibrated_prior_all, stats)
     weights = score_weights or {}
     keep = ids_all.numel() if int(max_landmarks) <= 0 else min(int(max_landmarks), ids_all.numel())
     if weights:
@@ -1010,6 +1429,20 @@ def build_stdloc_detector_landmark_bank(
             ids = ids_all[:keep]
             prior = detector_prior_all[:keep].float()
 
+    calib_weight = min(max(float(calibrated_matchability_weight), 0.0), 1.0)
+    selected_calibrated_prior = None
+    if calibrated_matchability is not None:
+        selected_calibrated_prior = _calibrated_prior_for_ids(
+            calibrated_matchability,
+            ids_all=ids,
+            sampled_ids=sampled_ids,
+            num_gaussians=model.num_gaussians,
+            device=device,
+        ).float()
+    if calibrated_matchability is not None and calib_weight > 0.0:
+        prior = normalize_score01((1.0 - calib_weight) * prior.float() + calib_weight * selected_calibrated_prior)
+        stats["calibrated_matchability_blend_weight"] = float(calib_weight)
+
     xyz = model.get_xyz()[ids]
 
     loc_feature = model.get_ply_loc_feature()
@@ -1027,10 +1460,30 @@ def build_stdloc_detector_landmark_bank(
         hybrid_desc = decode_gaussian_center_descriptors(model, sp_head, ids)
         weight = min(max(float(ply_loc_feature_weight), 0.0), 1.0)
         desc = F.normalize((1.0 - weight) * hybrid_desc + weight * ply_desc, p=2, dim=-1)
+    elif descriptor_source == "hybrid_ply_gated_residual":
+        if ply_desc is None:
+            raise ValueError("descriptor_source=hybrid_ply_gated_residual requires loc_* features in the input PLY")
+        hybrid_desc = decode_gaussian_center_descriptors(model, sp_head, ids)
+        gate = model.get_locability().squeeze(-1)[ids].detach()
+        desc = gated_residual_descriptor_blend(
+            ply_desc,
+            hybrid_desc,
+            gate=gate,
+            alpha_max=float(hybrid_residual_alpha_max),
+        )
     else:
         desc = decode_gaussian_center_descriptors(model, sp_head, ids)
 
-    return xyz, F.normalize(desc.float(), p=2, dim=-1), prior.float(), stats
+    result = (xyz, F.normalize(desc.float(), p=2, dim=-1), prior.float(), stats)
+    if return_aux:
+        aux = {
+            "gaussian_ids": ids.detach(),
+            "calibrated_matchability": selected_calibrated_prior.detach()
+            if selected_calibrated_prior is not None
+            else None,
+        }
+        return (*result, aux)
+    return result
 
 
 def select_view_landmark_indices(
@@ -1109,6 +1562,7 @@ def build_rendered_landmark_bank(
     view_grid_size: int = 8,
     descriptor_source: str = "hybrid",
     ply_loc_feature_weight: float = 0.5,
+    hybrid_residual_alpha_max: float = 0.05,
     score_weights: dict[str, float] | None = None,
     score_ref_poses: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
@@ -1131,6 +1585,7 @@ def build_rendered_landmark_bank(
             pose,
             descriptor_source=descriptor_source,
             ply_loc_feature_weight=ply_loc_feature_weight,
+            hybrid_residual_alpha_max=hybrid_residual_alpha_max,
         )
         world_points, _grid_yx, valid_depth = unproject_dense_depth_to_world(
             render["depth"].float(),
@@ -1263,6 +1718,7 @@ def localize_one(
     full_renderer=None,
     stdloc_detector: StdlocKeypointDetector | None = None,
     teacher_rgb: torch.Tensor | None = None,
+    landmark_filter_reliability: torch.Tensor | None = None,
 ) -> dict[str, object]:
     if hasattr(renderer, "K"):
         renderer.K.copy_(K_feature.to(device=renderer.K.device, dtype=renderer.K.dtype))
@@ -1351,6 +1807,8 @@ def localize_one(
     dense_pnp_min_iterations = int(pnp_min_iterations if dense_pnp_min_iterations is None else dense_pnp_min_iterations)
     descriptor_source = getattr(args, "descriptor_source", "hybrid")
     ply_loc_feature_weight = float(getattr(args, "ply_loc_feature_weight", 0.5))
+    match_filter_margin_weight = float(getattr(args, "match_filter_margin_weight", 0.0))
+    match_calibrated_prior_weight = float(getattr(args, "match_calibrated_prior_weight", 0.0))
     sparse_reprojection_error = (
         args.sparse_reprojection_error
         if args.sparse_reprojection_error is not None
@@ -1364,9 +1822,15 @@ def localize_one(
     sparse_matcher, dense_matcher = resolve_matchers(args)
     sparse_margin_by_query = None
     sparse_diag_corr = None
+    calibrated_sparse_reliability = landmark_filter_reliability
     if sparse_matcher == "stdloc_parity":
         corr = query_desc.float() @ F.normalize(landmark_desc.float(), dim=-1).T
         corr = apply_match_prior(corr.unsqueeze(0), landmark_prior, weight=args.locability_prior_weight)
+        corr = apply_calibrated_matchability_prior(
+            corr,
+            calibrated_sparse_reliability,
+            weight=match_calibrated_prior_weight,
+        )
         sparse_diag_corr = corr[0]
         _b, q_ids, lm_ids, _scores = match_correlation_matrix(
             corr,
@@ -1381,7 +1845,7 @@ def localize_one(
         # LightGlue needs two 2D feature sets.  The global 3D landmark bank has no
         # query-view 2D layout, so sparse initialization remains top-k and the
         # learned matcher is applied in the rendered refinement stage.
-        if getattr(args, "matchability_diagnostics", False):
+        if getattr(args, "matchability_diagnostics", False) or match_filter_margin_weight != 0.0:
             sparse_diag_corr = (
                 F.normalize(query_desc.float(), dim=-1)
                 @ F.normalize(landmark_desc.float(), dim=-1).T
@@ -1391,17 +1855,32 @@ def localize_one(
                 landmark_prior,
                 weight=args.locability_prior_weight,
             )[0]
-        q_ids, lm_ids, _scores = match_descriptors_topk(
-            query_desc,
-            landmark_desc,
-            topk=1,
+            sparse_diag_corr = apply_calibrated_matchability_prior(
+                sparse_diag_corr.unsqueeze(0),
+                calibrated_sparse_reliability,
+                weight=match_calibrated_prior_weight,
+            )[0]
+        corr = (
+            F.normalize(query_desc.float(), dim=-1)
+            @ F.normalize(landmark_desc.float(), dim=-1).T
+        )
+        corr = apply_match_prior(corr.unsqueeze(0), landmark_prior, weight=args.locability_prior_weight)
+        corr = apply_calibrated_matchability_prior(
+            corr,
+            calibrated_sparse_reliability,
+            weight=match_calibrated_prior_weight,
+        )
+        _b, q_ids, lm_ids, _scores = match_correlation_matrix(
+            corr,
             threshold=args.sparse_match_threshold,
-            landmark_prior=landmark_prior,
-            prior_weight=args.locability_prior_weight,
+            dual_softmax_temp=args.sparse_dual_softmax_temp,
+            use_dual_softmax=False,
+            use_mnn=False,
+            topk=1,
             second_best_margin=sparse_margin,
         )
     else:
-        if getattr(args, "matchability_diagnostics", False):
+        if getattr(args, "matchability_diagnostics", False) or match_filter_margin_weight != 0.0:
             sparse_diag_corr = (
                 F.normalize(query_desc.float(), dim=-1)
                 @ F.normalize(landmark_desc.float(), dim=-1).T
@@ -1411,50 +1890,157 @@ def localize_one(
                 landmark_prior,
                 weight=args.locability_prior_weight,
             )[0]
-        q_ids, lm_ids, _scores = match_descriptors_topk(
-            query_desc,
-            landmark_desc,
-            topk=1,
+            sparse_diag_corr = apply_calibrated_matchability_prior(
+                sparse_diag_corr.unsqueeze(0),
+                calibrated_sparse_reliability,
+                weight=match_calibrated_prior_weight,
+            )[0]
+        corr = (
+            F.normalize(query_desc.float(), dim=-1)
+            @ F.normalize(landmark_desc.float(), dim=-1).T
+        )
+        corr = apply_match_prior(corr.unsqueeze(0), landmark_prior, weight=args.locability_prior_weight)
+        corr = apply_calibrated_matchability_prior(
+            corr,
+            calibrated_sparse_reliability,
+            weight=match_calibrated_prior_weight,
+        )
+        _b, q_ids, lm_ids, _scores = match_correlation_matrix(
+            corr,
             threshold=args.sparse_match_threshold,
-            landmark_prior=landmark_prior,
-            prior_weight=args.locability_prior_weight,
+            dual_softmax_temp=args.sparse_dual_softmax_temp,
+            use_dual_softmax=False,
+            use_mnn=False,
+            topk=1,
             second_best_margin=sparse_margin,
         )
     if (
-        getattr(args, "matchability_diagnostics", False)
+        (getattr(args, "matchability_diagnostics", False) or match_filter_margin_weight != 0.0)
         and sparse_diag_corr is not None
         and sparse_diag_corr.shape[1] >= 2
         and q_ids.numel() > 0
     ):
         top2 = torch.topk(sparse_diag_corr, k=2, dim=-1).values
         sparse_margin_by_query = (top2[:, 0] - top2[:, 1])[q_ids]
+    sparse_reliability = None
+    if lm_ids.numel() > 0:
+        reliability_source = landmark_filter_reliability if landmark_filter_reliability is not None else landmark_prior
+        sparse_reliability = reliability_source[lm_ids]
+    sparse_filter_scores = _match_filter_scores(
+        _scores,
+        sparse_reliability,
+        getattr(args, "match_filter_calibrated_score_weight", 0.0),
+        margin=sparse_margin_by_query,
+        margin_weight=match_filter_margin_weight,
+    )
     sparse_keep = select_pnp_match_indices(
         keypoints[q_ids] + sparse_query_offset,
         landmark_xyz[lm_ids],
-        scores=_scores,
-        max_matches=getattr(args, "sparse_pnp_max_matches", 0),
-        mode=getattr(args, "pnp_prefilter", "none"),
-        image_grid_size=getattr(args, "pnp_prefilter_image_grid_size", 8),
-        xyz_grid_size=getattr(args, "pnp_prefilter_xyz_grid_size", 4),
+        scores=sparse_filter_scores,
+        max_matches=_stage_match_filter_max_matches(args, "sparse", getattr(args, "sparse_pnp_max_matches", 0)),
+        mode=_stage_match_filter_mode(args, "sparse"),
+        image_grid_size=_match_filter_image_grid_size(args),
+        xyz_grid_size=_match_filter_xyz_grid_size(args),
+        max_per_image_cell=getattr(args, "match_filter_max_per_image_cell", 8),
+        max_per_xyz_cell=getattr(args, "match_filter_max_per_xyz_cell", 8),
+        min_matches=getattr(args, "match_filter_min_matches", 0),
     )
     if sparse_keep.numel() < q_ids.numel():
         q_ids = q_ids[sparse_keep]
         lm_ids = lm_ids[sparse_keep]
         _scores = _scores[sparse_keep]
+        sparse_filter_scores = sparse_filter_scores[sparse_keep]
         if sparse_margin_by_query is not None:
             sparse_margin_by_query = sparse_margin_by_query[sparse_keep]
-    sparse_pose, sparse_inliers = solve_pnp_ransac(
-        landmark_xyz[lm_ids].detach().cpu().numpy(),
-        (keypoints[q_ids] + sparse_query_offset).detach().cpu().numpy(),
-        sparse_K.detach().cpu().numpy(),
-        reprojection_error=sparse_reprojection_error,
-        refine_reprojection_error=args.refine_reprojection_error,
-        confidence=args.pnp_confidence,
-        iterations=sparse_pnp_iterations,
-        min_iterations=sparse_pnp_min_iterations,
-        solver=args.solver,
-        refine_poselib=refine_poselib,
-    )
+    sparse_query_for_pnp = keypoints[q_ids] + sparse_query_offset
+    if int(getattr(args, "pnp_hypotheses", 1)) > 1:
+        sparse_hypotheses = generate_pnp_hypotheses(
+            landmark_xyz[lm_ids],
+            sparse_query_for_pnp,
+            sparse_K,
+            scores=sparse_filter_scores,
+            max_hypotheses=int(getattr(args, "pnp_hypotheses", 1)),
+            cluster_mode=str(getattr(args, "pnp_cluster_mode", "none")),
+            cluster_grid_size=int(getattr(args, "pnp_cluster_grid_size", 4)),
+            reprojection_error=sparse_reprojection_error,
+            refine_reprojection_error=args.refine_reprojection_error,
+            confidence=args.pnp_confidence,
+            iterations=sparse_pnp_iterations,
+            min_iterations=sparse_pnp_min_iterations,
+            solver=args.solver,
+            refine_poselib=refine_poselib,
+        )
+        verify_topk = min(
+            int(getattr(args, "pnp_dense_verify_topk", 1)),
+            len(sparse_hypotheses),
+        )
+        if verify_topk > 1:
+            verify_full = query_keypoints_are_full_res and full_renderer is not None
+            verify_renderer = full_renderer if verify_full else renderer
+            verify_K = K_full if verify_full else K_feature
+            verify_query_yx = keypoints[q_ids] if verify_full else (
+                keypoints[q_ids] / 8.0 if query_keypoints_are_full_res else keypoints[q_ids]
+            )
+            for hypothesis in sparse_hypotheses[:verify_topk]:
+                hyp_pose = torch.from_numpy(np.asarray(hypothesis["pose"], dtype=np.float32)).to(
+                    device=rgb.device,
+                    dtype=torch.float32,
+                ).unsqueeze(0)
+                try:
+                    hyp_render = render_hybrid_superpoint(
+                        model,
+                        sp_head,
+                        verify_renderer,
+                        hyp_pose,
+                        descriptor_source=descriptor_source,
+                        ply_loc_feature_weight=ply_loc_feature_weight,
+                        hybrid_residual_alpha_max=getattr(args, "hybrid_residual_alpha_max", 0.05),
+                    )
+                    proj_yx, valid_proj = project_world_to_image_yx(
+                        landmark_xyz[lm_ids].unsqueeze(0),
+                        hyp_pose,
+                        verify_K,
+                    )
+                    proj = proj_yx[0]
+                    desc_map = hyp_render["descriptor"][0]
+                    in_frame = (
+                        valid_proj[0]
+                        & (proj[:, 0] >= 0.0)
+                        & (proj[:, 0] <= desc_map.shape[-2] - 1)
+                        & (proj[:, 1] >= 0.0)
+                        & (proj[:, 1] <= desc_map.shape[-1] - 1)
+                    )
+                    if int(in_frame.sum()) >= 4:
+                        rendered_at_proj = sample_descriptors_bilinear(desc_map, proj[in_frame])
+                        query_at_proj = F.normalize(query_desc[q_ids][in_frame].float(), p=2, dim=-1)
+                        desc_agreement = (query_at_proj * rendered_at_proj.float()).sum(dim=-1).mean()
+                        reproj_err = torch.linalg.norm(proj[in_frame] - verify_query_yx[in_frame], dim=-1)
+                        geom_bonus = (reproj_err <= float(sparse_reprojection_error)).float().mean()
+                        hypothesis["score"] = float(hypothesis["score"]) + float(desc_agreement.item()) + float(
+                            geom_bonus.item()
+                        )
+                except Exception:
+                    continue
+            sparse_hypotheses.sort(key=lambda item: (float(item["score"]), int(item["inliers"])), reverse=True)
+        selected_hypothesis = select_verified_pnp_hypothesis(
+            sparse_hypotheses,
+            min_score_gain=getattr(args, "pnp_hypothesis_min_score_gain", 0.0),
+        )
+        sparse_pose = selected_hypothesis["pose"] if selected_hypothesis is not None else None
+        sparse_inliers = int(selected_hypothesis["inliers"]) if selected_hypothesis is not None else 0
+    else:
+        sparse_pose, sparse_inliers = solve_pnp_ransac(
+            landmark_xyz[lm_ids].detach().cpu().numpy(),
+            sparse_query_for_pnp.detach().cpu().numpy(),
+            sparse_K.detach().cpu().numpy(),
+            reprojection_error=sparse_reprojection_error,
+            refine_reprojection_error=args.refine_reprojection_error,
+            confidence=args.pnp_confidence,
+            iterations=sparse_pnp_iterations,
+            min_iterations=sparse_pnp_min_iterations,
+            solver=args.solver,
+            refine_poselib=refine_poselib,
+        )
     if sparse_pose is None:
         out = {"pose_w2c": None, "sparse_pose_w2c": None, "sparse_inliers": 0, "dense_inliers": 0}
         if getattr(args, "matchability_diagnostics", False):
@@ -1479,6 +2065,7 @@ def localize_one(
             pose,
             descriptor_source=descriptor_source,
             ply_loc_feature_weight=ply_loc_feature_weight,
+            hybrid_residual_alpha_max=getattr(args, "hybrid_residual_alpha_max", 0.05),
         )
         desc_map = render["descriptor"][0]
         loc_map = render["locability"]
@@ -1498,6 +2085,7 @@ def localize_one(
                     pose,
                     descriptor_source=descriptor_source,
                     ply_loc_feature_weight=ply_loc_feature_weight,
+                    hybrid_residual_alpha_max=getattr(args, "hybrid_residual_alpha_max", 0.05),
                 )
                 rendered_fine = full_render["descriptor"][0]
                 dense_depth = full_render["depth"][0].float()
@@ -1559,10 +2147,13 @@ def localize_one(
                 dense_matches.query_yx[valid],
                 p3d[valid],
                 scores=dense_matches.scores[valid_ids],
-                max_matches=getattr(args, "dense_pnp_max_matches", 0),
-                mode=getattr(args, "pnp_prefilter", "none"),
-                image_grid_size=getattr(args, "pnp_prefilter_image_grid_size", 8),
-                xyz_grid_size=getattr(args, "pnp_prefilter_xyz_grid_size", 4),
+                max_matches=_stage_match_filter_max_matches(args, "dense", getattr(args, "dense_pnp_max_matches", 0)),
+                mode=_stage_match_filter_mode(args, "dense"),
+                image_grid_size=_match_filter_image_grid_size(args),
+                xyz_grid_size=_match_filter_xyz_grid_size(args),
+                max_per_image_cell=getattr(args, "match_filter_max_per_image_cell", 8),
+                max_per_xyz_cell=getattr(args, "match_filter_max_per_xyz_cell", 8),
+                min_matches=getattr(args, "match_filter_min_matches", 0),
             )
             p3d_valid = p3d[valid][dense_keep]
             query_valid = dense_matches.query_yx[valid][dense_keep]
@@ -1592,6 +2183,7 @@ def localize_one(
                     pose,
                     descriptor_source=descriptor_source,
                     ply_loc_feature_weight=ply_loc_feature_weight,
+                    hybrid_residual_alpha_max=getattr(args, "hybrid_residual_alpha_max", 0.05),
                 )
                 dense_desc_map = full_render["descriptor"][0]
                 dense_depth = full_render["depth"][0].float()
@@ -1653,10 +2245,13 @@ def localize_one(
                 query_lg_yx[q_dense][valid],
                 dense_points3d[valid],
                 scores=_lg_scores[valid_ids],
-                max_matches=getattr(args, "dense_pnp_max_matches", 0),
-                mode=getattr(args, "pnp_prefilter", "none"),
-                image_grid_size=getattr(args, "pnp_prefilter_image_grid_size", 8),
-                xyz_grid_size=getattr(args, "pnp_prefilter_xyz_grid_size", 4),
+                max_matches=_stage_match_filter_max_matches(args, "dense", getattr(args, "dense_pnp_max_matches", 0)),
+                mode=_stage_match_filter_mode(args, "dense"),
+                image_grid_size=_match_filter_image_grid_size(args),
+                xyz_grid_size=_match_filter_xyz_grid_size(args),
+                max_per_image_cell=getattr(args, "match_filter_max_per_image_cell", 8),
+                max_per_xyz_cell=getattr(args, "match_filter_max_per_xyz_cell", 8),
+                min_matches=getattr(args, "match_filter_min_matches", 0),
             )
             dense_points3d_valid = dense_points3d[valid][dense_keep]
             query_lg_valid = query_lg_yx[q_dense][valid][dense_keep]
@@ -1681,6 +2276,7 @@ def localize_one(
                     pose,
                     descriptor_source=descriptor_source,
                     ply_loc_feature_weight=ply_loc_feature_weight,
+                    hybrid_residual_alpha_max=getattr(args, "hybrid_residual_alpha_max", 0.05),
                 )
                 dense_desc_map = full_render["descriptor"][0]
                 dense_depth = full_render["depth"][0].float()
@@ -1735,14 +2331,24 @@ def localize_one(
                 dense_renderer_K,
                 pixel_center_offset=args.render_pixel_center_offset,
             )
+            dense_filter_reliability = None
+            if prior is not None and pix_ids.numel() > 0:
+                dense_filter_reliability = prior[pix_ids]
             dense_keep = select_pnp_match_indices(
                 dense_query_yx[q_dense],
                 dense_points3d,
-                scores=_dense_scores,
-                max_matches=getattr(args, "dense_pnp_max_matches", 0),
-                mode=getattr(args, "pnp_prefilter", "none"),
-                image_grid_size=getattr(args, "pnp_prefilter_image_grid_size", 8),
-                xyz_grid_size=getattr(args, "pnp_prefilter_xyz_grid_size", 4),
+                scores=_match_filter_scores(
+                    _dense_scores,
+                    dense_filter_reliability,
+                    getattr(args, "match_filter_calibrated_score_weight", 0.0),
+                ),
+                max_matches=_stage_match_filter_max_matches(args, "dense", getattr(args, "dense_pnp_max_matches", 0)),
+                mode=_stage_match_filter_mode(args, "dense"),
+                image_grid_size=_match_filter_image_grid_size(args),
+                xyz_grid_size=_match_filter_xyz_grid_size(args),
+                max_per_image_cell=getattr(args, "match_filter_max_per_image_cell", 8),
+                max_per_xyz_cell=getattr(args, "match_filter_max_per_xyz_cell", 8),
+                min_matches=getattr(args, "match_filter_min_matches", 0),
             )
             dense_points3d = dense_points3d[dense_keep]
             dense_query_for_pnp = dense_query_yx[q_dense][dense_keep]
@@ -1824,11 +2430,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--landmark_score_keypoint_consensus_radius", type=int, default=2)
     parser.add_argument("--landmark_score_keypoint_consensus_max_keypoints", type=int, default=1024)
     parser.add_argument("--landmark_score_keypoint_consensus_descriptor_weight", type=float, default=0.0)
-    parser.add_argument("--landmark_score_legacy_keep_ratio", type=float, default=0.5)
+    parser.add_argument("--landmark_score_legacy_keep_ratio", type=float, default=0.9)
     parser.add_argument("--landmark_score_spatial_grid_size", type=int, default=8)
     parser.add_argument("--landmark_score_prior_blend", type=float, default=0.25)
-    parser.add_argument("--descriptor_source", choices=["hybrid", "ply_loc", "hybrid_ply_blend"], default="hybrid")
+    parser.add_argument("--calibrated_matchability_path", default="")
+    parser.add_argument("--landmark_score_calibrated_matchability_weight", type=float, default=0.0)
+    parser.add_argument("--match_calibrated_prior_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--descriptor_source",
+        choices=["hybrid", "ply_loc", "hybrid_ply_blend", "hybrid_ply_gated_residual"],
+        default="hybrid",
+    )
     parser.add_argument("--ply_loc_feature_weight", type=float, default=0.5)
+    parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.05)
     parser.add_argument("--alpha_threshold", type=float, default=0.05)
     parser.add_argument("--query_keypoints", type=int, default=2048)
     parser.add_argument("--query_detector", choices=["superpoint", "stdloc"], default="superpoint")
@@ -1885,6 +2499,40 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dense_pnp_max_matches", type=int, default=0)
     parser.add_argument("--pnp_prefilter_image_grid_size", type=int, default=8)
     parser.add_argument("--pnp_prefilter_xyz_grid_size", type=int, default=4)
+    parser.add_argument(
+        "--match_filter_mode",
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "calibrated_coverage"],
+        default="",
+    )
+    parser.add_argument("--match_filter_calibrated_score_weight", type=float, default=0.0)
+    parser.add_argument("--match_filter_margin_weight", type=float, default=0.0)
+    parser.add_argument("--match_filter_top_m", type=int, default=0)
+    parser.add_argument("--match_filter_image_grid_size", type=int, default=8)
+    parser.add_argument("--match_filter_xyz_grid_size", type=int, default=8)
+    parser.add_argument(
+        "--sparse_match_filter_mode",
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "calibrated_coverage"],
+        default="",
+    )
+    parser.add_argument(
+        "--dense_match_filter_mode",
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "calibrated_coverage"],
+        default="",
+    )
+    parser.add_argument("--sparse_match_filter_top_m", type=int, default=0)
+    parser.add_argument("--dense_match_filter_top_m", type=int, default=0)
+    parser.add_argument("--match_filter_max_per_image_cell", type=int, default=8)
+    parser.add_argument("--match_filter_max_per_xyz_cell", type=int, default=8)
+    parser.add_argument("--match_filter_min_matches", type=int, default=0)
+    parser.add_argument("--pnp_hypotheses", type=int, default=1)
+    parser.add_argument(
+        "--pnp_cluster_mode",
+        choices=["none", "xyz_voxel", "image_grid", "image_xyz_grid"],
+        default="none",
+    )
+    parser.add_argument("--pnp_cluster_grid_size", type=int, default=4)
+    parser.add_argument("--pnp_dense_verify_topk", type=int, default=1)
+    parser.add_argument("--pnp_hypothesis_min_score_gain", type=float, default=0.0)
     parser.add_argument("--matchability_diagnostics", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     return parser
@@ -2014,6 +2662,12 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             scene=scene,
             split=cache_split,
         )
+    calibrated_matchability = None
+    if args.calibrated_matchability_path:
+        calibration_path = Path(args.calibrated_matchability_path)
+        if not calibration_path.exists():
+            raise FileNotFoundError(f"Calibrated matchability cache not found: {calibration_path}")
+        calibrated_matchability = _load_calibrated_matchability(calibration_path, device)
 
     landmark_score_stats: dict[str, float] = {}
     landmark_score_weights = _score_weights(args, rendered=args.landmark_source == "rendered")
@@ -2045,6 +2699,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 include_descriptors=args.landmark_score_keypoint_consensus_descriptor_weight > 0.0,
             )
 
+    landmark_filter_reliability = None
     if args.landmark_source == "rendered":
         train_ref_dataset = CambridgeHybridDataset(
             scene_root=scene_root,
@@ -2074,6 +2729,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             view_grid_size=args.landmark_view_grid_size,
             descriptor_source=args.descriptor_source,
             ply_loc_feature_weight=args.ply_loc_feature_weight,
+            hybrid_residual_alpha_max=getattr(args, "hybrid_residual_alpha_max", 0.05),
             score_weights=landmark_score_weights,
             score_ref_poses=score_ref_poses,
         )
@@ -2091,13 +2747,20 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             else Path(train_args["ply_path"]).parents[2] / "detector"
         )
         print(f"[eval] loading STDLoc detector landmarks from {detector_dir}")
-        landmark_xyz, landmark_desc, landmark_prior, landmark_score_stats = build_stdloc_detector_landmark_bank(
+        (
+            landmark_xyz,
+            landmark_desc,
+            landmark_prior,
+            landmark_score_stats,
+            landmark_aux,
+        ) = build_stdloc_detector_landmark_bank(
             model,
             sp_head,
             detector_dir=detector_dir,
             max_landmarks=args.max_landmarks,
             descriptor_source=args.descriptor_source,
             ply_loc_feature_weight=args.ply_loc_feature_weight,
+            hybrid_residual_alpha_max=getattr(args, "hybrid_residual_alpha_max", 0.05),
             device=device,
             candidate_source=args.landmark_candidate_source,
             score_weights=landmark_score_weights,
@@ -2115,7 +2778,11 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             keypoint_consensus_radius=args.landmark_score_keypoint_consensus_radius,
             keypoint_consensus_descriptor_maps=score_ref_keypoint_descriptor_maps,
             keypoint_consensus_descriptor_weight=args.landmark_score_keypoint_consensus_descriptor_weight,
+            calibrated_matchability=calibrated_matchability,
+            calibrated_matchability_weight=args.landmark_score_calibrated_matchability_weight,
+            return_aux=True,
         )
+        landmark_filter_reliability = landmark_aux.get("calibrated_matchability")
 
     sparse_te: list[float] = []
     sparse_ae: list[float] = []
@@ -2155,6 +2822,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             full_renderer=full_renderer,
             stdloc_detector=stdloc_detector,
             teacher_rgb=teacher_rgb,
+            landmark_filter_reliability=landmark_filter_reliability,
         )
         matchability_i = None
         sparse_diag = result.pop("sparse_match_diagnostics", None)
@@ -2218,14 +2886,20 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         "landmark_score_spatial_grid_size": int(args.landmark_score_spatial_grid_size),
         "landmark_score_prior_blend": float(args.landmark_score_prior_blend),
         "landmark_score_stats": landmark_score_stats,
+        "calibrated_matchability_path": str(args.calibrated_matchability_path),
+        "landmark_score_calibrated_matchability_weight": float(args.landmark_score_calibrated_matchability_weight),
+        "match_calibrated_prior_weight": float(args.match_calibrated_prior_weight),
         "query_detector": args.query_detector,
         "query_feature_source": args.query_feature_source,
         "descriptor_source": args.descriptor_source,
         "ply_loc_feature_weight": float(args.ply_loc_feature_weight),
+        "hybrid_residual_alpha_max": float(args.hybrid_residual_alpha_max),
         "sparse_matcher": resolve_matchers(args)[0],
         "dense_matcher": resolve_matchers(args)[1],
         "dim_pipeline": args.dim_pipeline,
         "rendered_keypoint_source": args.rendered_keypoint_source,
+        "match_filter_margin_weight": float(args.match_filter_margin_weight),
+        "pnp_hypothesis_min_score_gain": float(args.pnp_hypothesis_min_score_gain),
         "landmarks": int(landmark_xyz.shape[0]),
         "sparse": _summary(sparse_te, sparse_ae, sparse_inliers),
         "dense": _summary(dense_te, dense_ae, dense_inliers),
