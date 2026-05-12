@@ -9,9 +9,11 @@ from loc_gs.scripts import eval_cambridge_hybrid
 from loc_gs.scripts.eval_cambridge_hybrid import (
     build_argparser,
     effective_eval_config,
+    fuse_projected_teacher_descriptors,
     gated_residual_descriptor_blend,
     generate_pnp_hypotheses,
     local_geometric_consistency_scores,
+    local_image_pair_geometry_scores,
     prepare_query_teacher_maps,
     select_pnp_match_indices,
     select_view_landmark_indices,
@@ -56,6 +58,24 @@ def test_eval_parser_exposes_stdloc_parity_options():
             "512",
             "--lightglue_filter_threshold",
             "0.05",
+            "--loftr_image_scale",
+            "0.5",
+            "--loftr_min_confidence",
+            "0.1",
+            "--loftr_max_matches",
+            "1024",
+            "--dense_sparse_consistency_gate",
+            "--dense_sparse_consistency_max_median_ratio",
+            "1.2",
+            "--dense_sparse_consistency_max_median_increase",
+            "0.5",
+            "--dense_sparse_consistency_min_inlier_ratio_factor",
+            "0.8",
+            "--dense_pose_delta_gate",
+            "--dense_pose_delta_max_trans_cm",
+            "25",
+            "--dense_pose_delta_max_rot_deg",
+            "2",
             "--solver",
             "poselib",
             "--poselib_refine",
@@ -187,6 +207,16 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert args.rendered_keypoint_source == "locability"
     assert args.lightglue_max_keypoints == 512
     assert args.lightglue_filter_threshold == 0.05
+    assert args.loftr_image_scale == 0.5
+    assert args.loftr_min_confidence == 0.1
+    assert args.loftr_max_matches == 1024
+    assert args.dense_sparse_consistency_gate is True
+    assert args.dense_sparse_consistency_max_median_ratio == 1.2
+    assert args.dense_sparse_consistency_max_median_increase == 0.5
+    assert args.dense_sparse_consistency_min_inlier_ratio_factor == 0.8
+    assert args.dense_pose_delta_gate is True
+    assert args.dense_pose_delta_max_trans_cm == 25
+    assert args.dense_pose_delta_max_rot_deg == 2
     assert args.solver == "poselib"
     assert args.poselib_refine is True
     assert args.sparse_dual_softmax is True
@@ -255,6 +285,16 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert config["dense_reprojection_error"] == 12.0
     assert config["solver"] == "poselib"
     assert config["dense_full_render"] is False
+    assert config["loftr_image_scale"] == 0.5
+    assert config["loftr_min_confidence"] == 0.1
+    assert config["loftr_max_matches"] == 1024
+    assert config["dense_sparse_consistency_gate"] is True
+    assert config["dense_sparse_consistency_max_median_ratio"] == 1.2
+    assert config["dense_sparse_consistency_max_median_increase"] == 0.5
+    assert config["dense_sparse_consistency_min_inlier_ratio_factor"] == 0.8
+    assert config["dense_pose_delta_gate"] is True
+    assert config["dense_pose_delta_max_trans_cm"] == 25.0
+    assert config["dense_pose_delta_max_rot_deg"] == 2.0
     assert config["pnp_prefilter"] == "image_xyz_grid"
     assert config["sparse_pnp_max_matches"] == 512
     assert config["dense_pnp_max_matches"] == 4096
@@ -549,6 +589,128 @@ def test_select_pnp_match_indices_can_use_local_geometry_prefilter():
     assert 4 not in keep.tolist()
 
 
+def test_image_pair_geometry_prefers_rendered_query_neighborhood_agreement():
+    reference_yx = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+        ],
+        dtype=torch.float32,
+    )
+    query_yx = torch.tensor(
+        [
+            [10.0, 10.0],
+            [10.0, 12.0],
+            [12.0, 10.0],
+            [12.0, 12.0],
+            [100.0, 100.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    scores = local_image_pair_geometry_scores(query_yx, reference_yx, k=3)
+
+    assert scores[-1] < scores[:4].min()
+    assert torch.all((scores >= 0.0) & (scores <= 1.0))
+
+
+def test_fuse_projected_teacher_descriptors_samples_visible_views():
+    desc_maps = torch.zeros(1, 2, 3, 3, dtype=torch.float32)
+    desc_maps[0, 0, 1, 1] = 1.0
+    desc_maps[0, 1, 0, 0] = 1.0
+    poses = torch.eye(4, dtype=torch.float32).view(1, 4, 4)
+    K = torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]], dtype=torch.float32)
+    points = torch.tensor([[0.0, 0.0, 1.0], [5.0, 5.0, 1.0]], dtype=torch.float32)
+
+    fused, counts = fuse_projected_teacher_descriptors(
+        points,
+        poses,
+        K,
+        desc_maps,
+        height=3,
+        width=3,
+        chunk_size=1,
+    )
+
+    assert torch.allclose(fused[0], torch.tensor([1.0, 0.0]))
+    assert counts.tolist() == [1.0, 0.0]
+
+
+def test_fuse_projected_teacher_descriptors_can_prefer_centered_observations():
+    desc_maps = torch.zeros(2, 2, 3, 3, dtype=torch.float32)
+    desc_maps[0, 0, 1, 1] = 1.0
+    desc_maps[1, 1, 2, 2] = 1.0
+    poses = torch.eye(4, dtype=torch.float32).view(1, 4, 4).repeat(2, 1, 1)
+    poses[1, 0, 3] = 1.0
+    poses[1, 1, 3] = 1.0
+    K = torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]], dtype=torch.float32)
+    points = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32)
+
+    uniform, counts = fuse_projected_teacher_descriptors(
+        points,
+        poses,
+        K,
+        desc_maps,
+        height=3,
+        width=3,
+        chunk_size=1,
+    )
+    centered, centered_counts = fuse_projected_teacher_descriptors(
+        points,
+        poses,
+        K,
+        desc_maps,
+        height=3,
+        width=3,
+        chunk_size=1,
+        centrality_power=4.0,
+    )
+
+    assert counts.tolist() == [2.0]
+    assert centered_counts.tolist() == [2.0]
+    assert torch.allclose(uniform[0], torch.nn.functional.normalize(torch.tensor([1.0, 1.0]), dim=0))
+    assert centered[0, 0] > centered[0, 1]
+
+
+def test_select_pnp_match_indices_can_use_image_pair_geometry_prefilter():
+    reference_yx = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+        ],
+        dtype=torch.float32,
+    )
+    query_yx = torch.tensor(
+        [
+            [10.0, 10.0],
+            [10.0, 12.0],
+            [12.0, 10.0],
+            [12.0, 12.0],
+            [100.0, 100.0],
+        ],
+        dtype=torch.float32,
+    )
+    points3d = torch.cat([reference_yx, torch.ones(5, 1)], dim=1)
+    scores = torch.ones(5, dtype=torch.float32)
+
+    keep = select_pnp_match_indices(
+        query_yx,
+        points3d,
+        scores=scores,
+        reference_yx=reference_yx,
+        max_matches=4,
+        mode="image_pair_geometry",
+    )
+
+    assert 4 not in keep.tolist()
+
+
 def test_calibrated_coverage_filter_preserves_image_and_xyz_spread():
     query_yx = torch.tensor(
         [
@@ -741,6 +903,61 @@ def test_descriptor_top2_margin_uses_prior_adjusted_scores():
     )
 
     assert with_prior[0] > no_prior[0]
+
+
+def test_sparse_consistency_gate_rejects_pose_that_breaks_sparse_reprojection():
+    sparse_xyz = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    sparse_query_yx = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    previous = torch.eye(4).unsqueeze(0)
+    candidate = torch.eye(4).unsqueeze(0)
+    candidate[0, 0, 3] = 10.0
+
+    reject, stats = eval_cambridge_hybrid.should_reject_dense_pose_by_sparse_consistency(
+        previous,
+        candidate,
+        sparse_xyz,
+        sparse_query_yx,
+        torch.eye(3),
+        threshold=2.0,
+        max_median_ratio=1.5,
+        max_median_increase=0.5,
+        min_inlier_ratio_factor=0.75,
+    )
+
+    assert reject is True
+    assert stats["candidate_sparse_reproj_median"] > stats["prev_sparse_reproj_median"]
+
+
+def test_dense_pose_delta_gate_rejects_large_pose_jump():
+    previous = torch.eye(4).unsqueeze(0)
+    candidate = torch.eye(4).unsqueeze(0)
+    candidate[0, 0, 3] = 2.0
+
+    reject, stats = eval_cambridge_hybrid.should_reject_dense_pose_by_delta(
+        previous,
+        candidate,
+        max_trans_cm=50.0,
+        max_rot_deg=5.0,
+    )
+
+    assert reject is True
+    assert stats["dense_pose_delta_trans_cm"] > 50.0
 
 
 def test_localize_one_stdloc_dense_branch_unprojects_dense_matches(monkeypatch):
@@ -967,4 +1184,121 @@ def test_localize_one_lightglue_rendered_branch_uses_rendered_sparse_matches(mon
         args=args,
     )
 
+    assert result["dense_inliers"] == 4
+
+
+def test_localize_one_loftr_rendered_branch_matches_rendered_rgb_to_depth(monkeypatch):
+    args = SimpleNamespace(
+        matcher="topk",
+        sparse_matcher="topk",
+        dense_matcher="loftr_rendered",
+        dim_pipeline="loftr",
+        query_keypoints=4,
+        keypoint_threshold=0.0,
+        nms_radius=0,
+        sparse_match_threshold=0.0,
+        dense_match_threshold=0.0,
+        locability_prior_weight=0.0,
+        dense_iters=1,
+        solver="opencv",
+        sparse_dual_softmax=False,
+        sparse_dual_softmax_temp=0.1,
+        dense_dual_softmax_temp=0.1,
+        fine_dual_softmax_temp=0.1,
+        mnn=True,
+        subpixel_refine=False,
+        subpixel_temperature=0.1,
+        topk_refine_window=1,
+        render_pixel_center_offset=0.0,
+        dense_query_pixel_center_offset=0.0,
+        dense_full_render=True,
+        loftr_pretrained="outdoor",
+        loftr_image_scale=0.5,
+        loftr_min_confidence=0.1,
+        loftr_max_matches=4,
+        match_second_best_margin=0.0,
+        sparse_match_second_best_margin=None,
+        dense_match_second_best_margin=None,
+        reprojection_error=2.0,
+        sparse_reprojection_error=None,
+        dense_reprojection_error=None,
+        refine_reprojection_error=0.0,
+        pnp_confidence=0.9999,
+        pnp_iterations=100,
+        pnp_min_iterations=0,
+        sparse_pnp_iterations=None,
+        sparse_pnp_min_iterations=None,
+        dense_pnp_iterations=None,
+        dense_pnp_min_iterations=None,
+        query_detector="superpoint",
+    )
+    keypoints = torch.tensor(
+        [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]],
+        dtype=torch.float32,
+    )
+    query_desc = torch.eye(4, dtype=torch.float32)
+    landmark_xyz = torch.tensor(
+        [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
+        dtype=torch.float32,
+    )
+
+    class DummyTeacher:
+        def __call__(self, _gray):
+            return torch.ones(1, 4, 2, 2), torch.zeros(1, 65, 2, 2)
+
+    monkeypatch.setattr(
+        eval_cambridge_hybrid,
+        "extract_keypoints_from_detector_logits",
+        lambda *_args, **_kwargs: (keypoints, torch.ones(4)),
+    )
+    monkeypatch.setattr(
+        eval_cambridge_hybrid,
+        "sample_descriptors_bilinear",
+        lambda descriptor_map, sample_yx: query_desc[: sample_yx.shape[0]],
+    )
+    monkeypatch.setattr(
+        eval_cambridge_hybrid,
+        "render_hybrid_superpoint",
+        lambda *_args, **_kwargs: {
+            "descriptor": torch.ones(1, 4, 16, 16),
+            "detector": torch.zeros(1, 65, 16, 16),
+            "depth": torch.ones(1, 16, 16),
+            "locability": torch.ones(1, 1, 16, 16),
+            "rgb": torch.zeros(1, 3, 16, 16),
+        },
+    )
+    loftr_calls = {"count": 0}
+
+    def fake_match_loftr(query_rgb, rendered_rgb, **kwargs):
+        loftr_calls["count"] += 1
+        assert query_rgb.shape == (1, 3, 16, 16)
+        assert rendered_rgb.shape == (1, 3, 16, 16)
+        assert kwargs["image_scale"] == 0.5
+        return keypoints * 8.0, keypoints * 8.0, torch.tensor([0.9, 0.8, 0.7, 0.6])
+
+    monkeypatch.setattr(eval_cambridge_hybrid, "match_loftr_images", fake_match_loftr)
+    monkeypatch.setattr(eval_cambridge_hybrid, "unproject_positions_yx", lambda *_args, **_kwargs: landmark_xyz)
+    poses = [np.eye(4, dtype=np.float32), np.eye(4, dtype=np.float32)]
+
+    def fake_solve_pnp(*_args, **_kwargs):
+        return poses.pop(0), 4
+
+    monkeypatch.setattr(eval_cambridge_hybrid, "solve_pnp_ransac", fake_solve_pnp)
+
+    result = eval_cambridge_hybrid.localize_one(
+        model=object(),
+        sp_head=object(),
+        renderer=SimpleNamespace(K=torch.eye(3)),
+        full_renderer=SimpleNamespace(K=torch.eye(3)),
+        teacher=DummyTeacher(),
+        rgb=torch.zeros(1, 3, 16, 16),
+        K_feature=torch.eye(3),
+        K_full=torch.eye(3),
+        landmark_xyz=landmark_xyz,
+        landmark_desc=query_desc,
+        landmark_prior=torch.ones(4),
+        args=args,
+    )
+
+    assert loftr_calls["count"] == 1
     assert result["dense_inliers"] == 4

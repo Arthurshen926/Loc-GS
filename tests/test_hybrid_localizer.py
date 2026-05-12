@@ -197,3 +197,45 @@ def test_opencv_prosac_orders_correspondences_by_match_score(monkeypatch):
 
     assert pose is not None
     assert inliers == 5
+
+
+def test_opencv_prosac_magsac_uses_magsac_score(monkeypatch):
+    points3d = np.array(
+        [
+            [0.0, 0.0, 5.0],
+            [1.0, 0.0, 5.0],
+            [0.0, 1.0, 5.0],
+            [1.0, 1.0, 5.0],
+        ],
+        dtype=np.float64,
+    )
+    keypoints_yx = np.stack([points3d[:, 1] / points3d[:, 2], points3d[:, 0] / points3d[:, 2]], axis=-1)
+    scores = np.array([0.1, 0.9, 0.3, 0.7], dtype=np.float64)
+    K = np.eye(3, dtype=np.float64)
+    seen = {}
+
+    def fake_solvepnp_ransac(_obj, _img, _K, _dist, *_args):
+        params = _args[-1]
+        seen["score"] = params.score
+        seen["sampler"] = params.sampler
+        return True, _K, np.zeros((3, 1), dtype=np.float64), np.zeros((3, 1), dtype=np.float64), np.arange(4).reshape(-1, 1)
+
+    def fake_solvepnp(*_args, **_kwargs):
+        return True, np.zeros((3, 1), dtype=np.float64), np.zeros((3, 1), dtype=np.float64)
+
+    monkeypatch.setattr(hybrid_localizer.cv2, "solvePnPRansac", fake_solvepnp_ransac)
+    monkeypatch.setattr(hybrid_localizer.cv2, "solvePnP", fake_solvepnp)
+
+    pose, inliers = hybrid_localizer.solve_pnp_ransac(
+        points3d,
+        keypoints_yx,
+        K,
+        reprojection_error=2.0,
+        solver="opencv_prosac_magsac",
+        match_scores=scores,
+    )
+
+    assert pose is not None
+    assert inliers == 4
+    assert seen["sampler"] == hybrid_localizer.cv2.SAMPLING_PROSAC
+    assert seen["score"] == hybrid_localizer.cv2.SCORE_METHOD_MAGSAC

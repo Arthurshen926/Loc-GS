@@ -12,6 +12,7 @@ from tqdm import tqdm
 from loc_gs.data.cambridge_dataset import CambridgeHybridDataset
 from loc_gs.localization.stdloc_detector import StdlocKeypointDetector, extract_stdloc_detector_keypoints
 from loc_gs.localization.stdloc_parity import apply_match_prior
+from loc_gs.losses.cross_view import projective_view_overlap
 from loc_gs.losses.localization_loss import project_world_to_image_yx
 from loc_gs.models.hybrid_gaussian import HybridFeatureGaussian, SuperPointOutputHead
 from loc_gs.scripts.eval_cambridge_hybrid import (
@@ -25,6 +26,7 @@ from loc_gs.scripts.eval_cambridge_hybrid import (
 )
 from loc_gs.scripts.extract_superpoint_features import SuperPointNet
 from loc_gs.scripts.train_cambridge_hybrid import (
+    pose_delta_trans_rot,
     render_hybrid_superpoint,
     sample_rehearsal_pose_batch,
 )
@@ -205,6 +207,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.05)
     parser.add_argument("--locability_prior_weight", type=float, default=0.05)
     parser.add_argument("--rendered_rehearsal_views", type=int, default=0)
+    parser.add_argument(
+        "--rendered_query_source",
+        choices=["rendered_rgb_teacher", "feature_field"],
+        default="rendered_rgb_teacher",
+        help="Use rendered RGB plus the frozen query extractor for query-like calibration, or the rendered field descriptors.",
+    )
     parser.add_argument(
         "--rendered_rehearsal_pose_mode",
         choices=["perturb", "pair", "interpolate", "mixed"],
@@ -440,6 +448,9 @@ def main(args: argparse.Namespace | None = None) -> None:
         )
 
     rendered_rehearsal_views = max(0, int(args.rendered_rehearsal_views))
+    rendered_trans_deltas: list[float] = []
+    rendered_rot_deltas: list[float] = []
+    rendered_overlap_values: list[float] = []
     if rendered_rehearsal_views > 0:
         if args.query_detector != "stdloc":
             raise ValueError("--rendered_rehearsal_views currently requires --query_detector stdloc")
@@ -464,6 +475,8 @@ def main(args: argparse.Namespace | None = None) -> None:
             device=device,
             dtype=torch.float32,
         )
+        xyz_probe = model.get_xyz().detach()
+        xyz_probe = xyz_probe[:: max(1, xyz_probe.shape[0] // 4096)]
         for ridx in tqdm(
             range(rendered_rehearsal_views),
             desc=f"Calibrating rendered {scene}",
@@ -489,16 +502,51 @@ def main(args: argparse.Namespace | None = None) -> None:
                 min_overlap=args.rendered_view_pair_min_overlap,
                 device=device,
             ).detach()
-            rendered = render_hybrid_superpoint(
-                model,
-                sp_head,
-                rendered_renderer,
-                loc_pose,
-                descriptor_source=args.descriptor_source,
-                ply_loc_feature_weight=args.ply_loc_feature_weight,
-                hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
+            trans_delta, rot_delta = pose_delta_trans_rot(base_pose, loc_pose)
+            rendered_trans_deltas.append(float(trans_delta[0].detach().cpu()))
+            rendered_rot_deltas.append(float(rot_delta[0].detach().cpu()))
+            rendered_overlap_values.append(
+                float(
+                    projective_view_overlap(
+                        xyz_probe,
+                        base_pose[0],
+                        loc_pose[0],
+                        full_K,
+                        train_args["image_height"],
+                        train_args["image_width"],
+                    )
+                )
             )
-            query_feature_map = F.normalize(rendered["descriptor"][0].float(), p=2, dim=0)
+            if args.rendered_query_source == "rendered_rgb_teacher":
+                rgb_render = rendered_renderer.render_rgb(model, loc_pose[0])
+                rendered_rgb = rgb_render["rgb"].unsqueeze(0).to(device=device, dtype=torch.float32)
+                teacher_desc_raw_b, teacher_det_raw_b = teacher(superpoint_gray(rendered_rgb))
+                teacher_desc_raw, _teacher_desc_grid, _teacher_det_grid = prepare_query_teacher_maps(
+                    teacher_desc_raw_b,
+                    teacher_det_raw_b,
+                    train_args["feature_height"],
+                    train_args["feature_width"],
+                )
+                query_feature_map = F.normalize(
+                    upsample_feature_map(teacher_desc_raw, train_args["image_height"], train_args["image_width"]),
+                    p=2,
+                    dim=0,
+                )
+                depth_map = rgb_render["depth"]
+                alpha_map = rgb_render["alpha"]
+            else:
+                rendered = render_hybrid_superpoint(
+                    model,
+                    sp_head,
+                    rendered_renderer,
+                    loc_pose,
+                    descriptor_source=args.descriptor_source,
+                    ply_loc_feature_weight=args.ply_loc_feature_weight,
+                    hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
+                )
+                query_feature_map = F.normalize(rendered["descriptor"][0].float(), p=2, dim=0)
+                depth_map = rendered["depth"][0]
+                alpha_map = rendered["alpha"][0]
             keypoints, _scores = extract_stdloc_detector_keypoints(
                 query_feature_map,
                 stdloc_detector,
@@ -511,12 +559,22 @@ def main(args: argparse.Namespace | None = None) -> None:
                 query_yx=keypoints + 0.5,
                 pose_w2c=loc_pose[0],
                 K=full_K,
-                depth_map=rendered["depth"][0],
-                alpha_map=rendered["alpha"][0],
+                depth_map=depth_map,
+                alpha_map=alpha_map,
             )
 
     matchability = matchability_from_counts(tp, fp, alpha=args.smoothing_alpha)
     fp_rate = fp / (tp + fp).clamp_min(1.0)
+    def _summary(values: list[float]) -> dict[str, float]:
+        if not values:
+            return {"mean": 0.0, "min": 0.0, "max": 0.0}
+        tensor = torch.tensor(values, dtype=torch.float32)
+        return {
+            "mean": float(tensor.mean().item()),
+            "min": float(tensor.min().item()),
+            "max": float(tensor.max().item()),
+        }
+
     output_path = (
         Path(args.output_path)
         if args.output_path
@@ -542,11 +600,15 @@ def main(args: argparse.Namespace | None = None) -> None:
             "checkpoint": str(args.checkpoint),
             "views": len(ids),
             "rendered_rehearsal_views": rendered_rehearsal_views,
+            "rendered_query_source": args.rendered_query_source,
             "rendered_rehearsal_pose_mode": args.rendered_rehearsal_pose_mode,
             "rendered_rehearsal_interpolation_min": float(args.rendered_rehearsal_interpolation_min),
             "rendered_rehearsal_interpolation_max": float(args.rendered_rehearsal_interpolation_max),
             "rendered_pose_noise_trans_m": float(args.rendered_pose_noise_trans_m),
             "rendered_pose_noise_rot_deg": float(args.rendered_pose_noise_rot_deg),
+            "rendered_pose_delta_trans_m": _summary(rendered_trans_deltas),
+            "rendered_pose_delta_rot_deg": _summary(rendered_rot_deltas),
+            "rendered_base_overlap": _summary(rendered_overlap_values),
             "topk": int(args.topk),
             "reprojection_threshold_px": float(args.reprojection_threshold_px),
             "max_landmarks": int(args.max_landmarks),

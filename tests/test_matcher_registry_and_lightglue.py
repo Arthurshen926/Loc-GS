@@ -19,6 +19,7 @@ def test_matcher_registry_exposes_dim_and_lightglue_choices():
     assert "lightglue" in SPARSE_MATCHERS
     assert "dim" in SPARSE_MATCHERS
     assert "lightglue_rendered" in DENSE_MATCHERS
+    assert "loftr_rendered" in DENSE_MATCHERS
     assert "superpoint+lightglue" in DIM_PIPELINES
     assert "loftr" in DIM_PIPELINES
     assert normalize_dim_pipeline("SuperPoint+LightGlue") == "superpoint+lightglue"

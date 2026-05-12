@@ -249,6 +249,36 @@ def interpolate_pose_batch(
     return out
 
 
+def camera_centers_from_w2c(pose_w2c: torch.Tensor) -> torch.Tensor:
+    """Return camera centers in world coordinates for batched w2c poses."""
+    if pose_w2c.dim() == 2:
+        pose_w2c = pose_w2c.unsqueeze(0)
+    R_w2c = pose_w2c[:, :3, :3]
+    t_w2c = pose_w2c[:, :3, 3]
+    return -(R_w2c.transpose(1, 2) @ t_w2c.unsqueeze(-1)).squeeze(-1)
+
+
+def pose_delta_trans_rot(
+    base_pose_w2c: torch.Tensor,
+    sampled_pose_w2c: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return camera-center translation and relative rotation in degrees."""
+    if base_pose_w2c.dim() == 2:
+        base_pose_w2c = base_pose_w2c.unsqueeze(0)
+    if sampled_pose_w2c.dim() == 2:
+        sampled_pose_w2c = sampled_pose_w2c.unsqueeze(0)
+    base_center = camera_centers_from_w2c(base_pose_w2c)
+    sampled_center = camera_centers_from_w2c(sampled_pose_w2c)
+    trans = torch.linalg.norm(sampled_center - base_center, dim=-1)
+    R_base_c2w = base_pose_w2c[:, :3, :3].transpose(1, 2)
+    R_sampled_c2w = sampled_pose_w2c[:, :3, :3].transpose(1, 2)
+    rel = R_sampled_c2w @ R_base_c2w.transpose(1, 2)
+    trace = rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    rot_deg = torch.rad2deg(torch.acos(cos_theta))
+    return trans, rot_deg
+
+
 def scheduled_loss_weight(
     epoch: int,
     base_weight: float,
@@ -289,10 +319,14 @@ def render_hybrid_superpoint(
     descriptor_source: str = "hybrid",
     ply_loc_feature_weight: float = 0.5,
     hybrid_residual_alpha_max: float = 0.05,
+    include_rgb: bool = False,
 ) -> dict[str, torch.Tensor]:
     from loc_gs.models.hybrid_gaussian import unproject_depth_to_positions
 
-    render = renderer.render_features_batch(model, pose_w2c)
+    if include_rgb and hasattr(renderer, "render_features_and_rgb"):
+        render = renderer.render_features_and_rgb(model, pose_w2c)
+    else:
+        render = renderer.render_features_batch(model, pose_w2c)
     depth_map = render["depth_map"].float()
     position_map = unproject_depth_to_positions(
         depth_map,
@@ -345,6 +379,7 @@ def render_hybrid_superpoint(
         "alpha": render["alpha_map"],
         "locability": locability,
         "features": fused,
+        "rgb": render.get("rgb"),
     }
 
 
@@ -498,6 +533,39 @@ def decode_gaussian_center_descriptors(
     return sp_head(fused)["descriptor"].squeeze(0).squeeze(-1).T
 
 
+def pair_candidate_indices(
+    frame_idx: int,
+    dataset_size: int,
+    *,
+    local_offsets: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64),
+    global_bins: int = 8,
+) -> list[int]:
+    """Deterministic local+global candidates for query-like rehearsal pairs."""
+    n = int(dataset_size)
+    if n <= 1:
+        return []
+    base = int(frame_idx) % n
+    candidates: list[int] = []
+    for offset in local_offsets:
+        off = int(offset)
+        if off <= 0:
+            continue
+        candidates.extend([(base + off) % n, (base - off) % n])
+    bins = max(0, int(global_bins))
+    if bins > 0:
+        step = max(1, n // bins)
+        candidates.extend(range(0, n, step))
+    out: list[int] = []
+    seen: set[int] = {base}
+    for idx in candidates:
+        idx = int(idx) % n
+        if idx in seen:
+            continue
+        seen.add(idx)
+        out.append(idx)
+    return out
+
+
 def select_pair_batch(
     dataset: CambridgeHybridDataset,
     frame_indices: torch.Tensor,
@@ -513,9 +581,12 @@ def select_pair_batch(
     for frame_idx in frame_indices.detach().cpu().tolist():
         best_idx = (int(frame_idx) + 1) % len(dataset)
         best_overlap = -1.0
+        best_dist = -1.0
+        fallback_idx = best_idx
+        fallback_overlap = -1.0
         base_pose = dataset[int(frame_idx)]["pose_w2c"].to(device=device, dtype=torch.float32)
-        for offset in (1, 2, 4, 8, 16):
-            cand_idx = (int(frame_idx) + offset) % len(dataset)
+        base_center = camera_centers_from_w2c(base_pose)[0]
+        for cand_idx in pair_candidate_indices(int(frame_idx), len(dataset)):
             cand_pose = dataset[cand_idx]["pose_w2c"].to(device=device, dtype=torch.float32)
             overlap = projective_view_overlap(
                 xyz_probe,
@@ -525,11 +596,17 @@ def select_pair_batch(
                 renderer.image_height,
                 renderer.image_width,
             )
-            if overlap > best_overlap:
+            cand_center = camera_centers_from_w2c(cand_pose)[0]
+            dist = float(torch.linalg.norm(cand_center - base_center).item())
+            if overlap > fallback_overlap:
+                fallback_idx = cand_idx
+                fallback_overlap = overlap
+            if overlap >= float(min_overlap) and (dist > best_dist or (dist == best_dist and overlap > best_overlap)):
                 best_idx = cand_idx
+                best_dist = dist
                 best_overlap = overlap
-            if overlap >= float(min_overlap):
-                break
+        if best_dist < 0.0:
+            best_idx = fallback_idx
         pair_items.append(dataset[best_idx])
     return {
         "rgb": torch.stack([item["rgb"] for item in pair_items], dim=0),

@@ -3,13 +3,16 @@ import torch.nn.functional as F
 
 from loc_gs.scripts.train_cambridge_hybrid import (
     build_argparser,
+    camera_centers_from_w2c,
     descriptor_residual_alignment_loss,
     extract_superpoint_teacher_batch,
     interpolate_pose_batch,
     locability_prior_alignment_loss,
     make_feature_renderer_intrinsics,
     normalize_position_map,
+    pair_candidate_indices,
     perturb_pose_batch,
+    pose_delta_trans_rot,
     resize_teacher_outputs_to_feature_grid,
     scheduled_loss_weight,
     superpoint_gray,
@@ -329,6 +332,38 @@ def test_interpolate_pose_batch_allows_mild_extrapolation():
     center = -(out[:, :3, :3].transpose(1, 2) @ out[:, :3, 3:].contiguous()).squeeze(-1)
 
     assert torch.allclose(center, torch.tensor([[2.5, 0.0, 0.0]]), atol=1e-5)
+
+
+def test_pair_candidate_indices_mix_local_and_global_views():
+    candidates = pair_candidate_indices(5, 20, local_offsets=(1, 4), global_bins=4)
+
+    assert candidates[:4] == [6, 4, 9, 1]
+    assert 0 in candidates and 10 in candidates and 15 in candidates
+    assert 5 not in candidates
+    assert len(candidates) == len(set(candidates))
+
+
+def test_pose_delta_trans_rot_reports_camera_motion():
+    pose_a = torch.eye(4).unsqueeze(0)
+    pose_b = torch.eye(4).unsqueeze(0)
+    pose_b[:, 0, 3] = -2.0
+    theta = torch.deg2rad(torch.tensor(90.0))
+    c = float(torch.cos(theta))
+    s = float(torch.sin(theta))
+    pose_b[:, :3, :3] = torch.tensor(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+
+    centers = camera_centers_from_w2c(pose_b)
+    trans, rot = pose_delta_trans_rot(pose_a, pose_b)
+
+    assert torch.allclose(centers[:, :2].norm(dim=-1), torch.tensor([2.0]), atol=1e-5)
+    assert torch.allclose(trans, torch.tensor([2.0]), atol=1e-5)
+    assert torch.allclose(rot, torch.tensor([90.0]), atol=1e-4)
 
 
 def test_perturb_pose_batch_identity_when_noise_disabled():

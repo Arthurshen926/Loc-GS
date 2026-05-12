@@ -1,5 +1,6 @@
 import torch
 
+from loc_gs.scripts.launch_cambridge_matchability_calibration import build_calibration_command
 from loc_gs.scripts.calibrate_landmark_matchability import (
     accumulate_matchability_counts,
     build_argparser,
@@ -38,9 +39,27 @@ def test_calibration_parser_defaults_to_baseline_preserving_descriptor_and_rende
 
     assert args.descriptor_source == "ply_loc"
     assert args.rendered_rehearsal_views == 8
+    assert args.rendered_query_source == "rendered_rgb_teacher"
     assert args.rendered_rehearsal_pose_mode == "mixed"
     assert args.rendered_rehearsal_interpolation_min == -0.15
     assert args.rendered_rehearsal_interpolation_max == 1.15
+
+
+def test_query_like_calibration_launcher_uses_rendered_rgb_teacher():
+    cmd, env = build_calibration_command(
+        gpu_id=2,
+        scene="OldHospital",
+        checkpoint="output/stdloc_hybrid/OldHospital/latest.pth",
+        output_path="output/calib/OldHospital/stdloc_bank.pt",
+        max_views=32,
+        rendered_rehearsal_views=64,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert cmd[cmd.index("--rendered_query_source") + 1] == "rendered_rgb_teacher"
+    assert cmd[cmd.index("--rendered_rehearsal_views") + 1] == "64"
+    assert cmd[cmd.index("--max_views") + 1] == "32"
+    assert cmd[cmd.index("--rendered_rehearsal_pose_mode") + 1] == "mixed"
 
 
 def test_accumulate_matchability_counts_marks_topk_projection_inliers():

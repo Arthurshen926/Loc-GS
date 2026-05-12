@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 SPARSE_MATCHERS = ("topk", "stdloc_parity", "lightglue", "dim")
-DENSE_MATCHERS = ("topk", "stdloc_parity", "lightglue_rendered")
+DENSE_MATCHERS = ("topk", "stdloc_parity", "lightglue_rendered", "loftr_rendered")
 DIM_PIPELINES = (
     "superpoint+lightglue",
     "aliked+lightglue",

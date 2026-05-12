@@ -234,7 +234,7 @@ def solve_pnp_ransac(
         return None, 0
     image_points_xy = np.stack([keypoints_yx[:, 1], keypoints_yx[:, 0]], axis=-1).astype(np.float64)
     object_points = points3d_world.astype(np.float64)
-    if solver == "opencv_prosac" and match_scores is not None:
+    if solver in {"opencv_prosac", "opencv_prosac_magsac"} and match_scores is not None:
         scores = np.asarray(match_scores, dtype=np.float64).reshape(-1)
         if scores.shape[0] == object_points.shape[0]:
             order = np.argsort(np.where(np.isfinite(scores), scores, -np.inf))[::-1]
@@ -264,13 +264,17 @@ def solve_pnp_ransac(
                     return refined_pose, refined_inliers
             return pose, inliers
     cv2_module = _cv2()
-    if solver == "opencv_prosac":
+    if solver in {"opencv_prosac", "opencv_prosac_magsac"}:
         params = cv2_module.UsacParams()
         params.confidence = float(confidence)
         params.maxIterations = int(iterations)
         params.threshold = float(reprojection_error)
         params.sampler = cv2_module.SAMPLING_PROSAC
-        params.score = cv2_module.SCORE_METHOD_MSAC
+        params.score = (
+            cv2_module.SCORE_METHOD_MAGSAC
+            if solver == "opencv_prosac_magsac"
+            else cv2_module.SCORE_METHOD_MSAC
+        )
         ok, _camera_matrix, rvec, tvec, inliers = cv2_module.solvePnPRansac(
             object_points,
             image_points_xy,

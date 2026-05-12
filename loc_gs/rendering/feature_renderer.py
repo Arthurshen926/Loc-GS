@@ -443,7 +443,13 @@ class FeatureFieldRenderer(nn.Module):
         if self.use_2dgs:
             depth_map = renders[0, :, :, 3]
         elif "depths" in info:
-            depth_map = info["depths"][0, :, :, 0]
+            depths = info["depths"]
+            if depths.ndim == 4:
+                depth_map = depths[0, :, :, 0]
+            elif depths.ndim == 3:
+                depth_map = depths[0]
+            else:
+                depth_map = depths
 
         return {"rgb": rgb, "depth": depth_map, "alpha": alpha}
 

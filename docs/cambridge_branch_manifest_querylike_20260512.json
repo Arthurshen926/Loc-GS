@@ -1,0 +1,102 @@
+{
+  "protocol": {
+    "name": "cambridge_train_calib_querylike_scene_branch_selection_20260512",
+    "description": "Scene-level single-branch selection with STDLoc baseline, historical learned, and query-like calibrated-prior branches. Branch selection uses held-out train calibration only; query-like full-test results are ablations, not oracle selection.",
+    "calibration_split": "train",
+    "calibration_query_stride": 8,
+    "calibration_max_queries": 120,
+    "test_stage": "dense",
+    "candidate_branches": [
+      "stdloc_baseline",
+      "historical_selected",
+      "query_like_calibrated_prior"
+    ]
+  },
+  "scenes": {
+    "GreatCourt": {
+      "branches": {
+        "stdloc_baseline": {
+          "calibration_dir": "output/stdloc/results_train/baseline_GreatCourt_calib_train_s8_q120_20260512",
+          "test_dir": "output/stdloc/results/baseline_great_fastscene-map_cambridge_spgs_GreatCourt_stream_stable2-20260504_205223"
+        },
+        "historical_selected": {
+          "calibration_dir": "output/stdloc_hybrid/GreatCourt_latest_cfg4/eval_train_calib_historical_s8_q120_20260512",
+          "test_dir": "output/stdloc_hybrid/GreatCourt_sweep_full_mnn_blend08_lw005_20260510"
+        },
+        "query_like_calibrated_prior": {
+          "calibration_dir": "output/stdloc_hybrid/GreatCourt_spgs4_rehearsal_ft_b8_e10_20260511/eval_querylike_v64_traincalib_s8_q120_covisibility_prosac",
+          "test_dir": "output/stdloc_hybrid/GreatCourt_spgs4_rehearsal_ft_b8_e10_20260511/eval_querylike_v64_full_covisibility_prosac",
+          "matchability_cache": "output/stdloc_hybrid/query_like_matchability_20260512_v64/GreatCourt/stdloc_bank_query_like.pt"
+        }
+      }
+    },
+    "KingsCollege": {
+      "branches": {
+        "stdloc_baseline": {
+          "calibration_dir": "output/stdloc/results_train/baseline_KingsCollege_calib_train_s8_q120_20260512",
+          "test_dir": "output/stdloc/results/baseline_kings-map_cambridge_spgs_KingsCollege-20260504_195443"
+        },
+        "historical_selected": {
+          "calibration_dir": "output/stdloc_hybrid/KingsCollege_latest_cfg4/eval_train_calib_historical_s8_q120_20260512",
+          "test_dir": "output/stdloc_hybrid/KingsCollege_latest_cfg4/eval_full_current_strong_r8_20260510"
+        },
+        "query_like_calibrated_prior": {
+          "calibration_dir": "output/stdloc_hybrid/KingsCollege_spgs4_rehearsal_ft_b8_e10_20260511/eval_querylike_v64_traincalib_s8_q120_covisibility_prosac",
+          "test_dir": "output/stdloc_hybrid/KingsCollege_spgs4_rehearsal_ft_b8_e10_20260511/eval_querylike_v64_full_covisibility_prosac",
+          "matchability_cache": "output/stdloc_hybrid/query_like_matchability_20260512_v64/KingsCollege/stdloc_bank_query_like.pt"
+        }
+      }
+    },
+    "OldHospital": {
+      "branches": {
+        "stdloc_baseline": {
+          "calibration_dir": "output/stdloc/results_train/baseline_OldHospital_calib_train_s8_q120_20260512",
+          "test_dir": "output/stdloc/results/baseline_old-map_cambridge_spgs_OldHospital-20260504_202723"
+        },
+        "historical_selected": {
+          "calibration_dir": "output/stdloc_hybrid/OldHospital_latest_cfg4/eval_train_calib_historical_s8_q120_20260512",
+          "test_dir": "output/stdloc_hybrid/OldHospital_latest_cfg4/eval_full_current_strong_r8_20260510"
+        },
+        "query_like_calibrated_prior": {
+          "calibration_dir": "output/stdloc_hybrid/OldHospital_spgs4_rehearsal_ft_b8_e10_20260511/eval_querylike_v64_traincalib_s8_q120_covisibility_prosac",
+          "test_dir": "output/stdloc_hybrid/OldHospital_spgs4_rehearsal_ft_b8_e10_20260511/eval_querylike_v64_full_covisibility_prosac",
+          "matchability_cache": "output/stdloc_hybrid/query_like_matchability_20260512_v64/OldHospital/stdloc_bank_query_like.pt"
+        }
+      }
+    },
+    "ShopFacade": {
+      "branches": {
+        "stdloc_baseline": {
+          "calibration_dir": "output/stdloc/results_train/baseline_ShopFacade_calib_train_s8_q120_20260512",
+          "test_dir": "output/stdloc/results/baseline_shop-map_cambridge_spgs_ShopFacade-20260504_181547"
+        },
+        "historical_selected": {
+          "calibration_dir": "output/stdloc_hybrid/ShopFacade_hardneg/origteacher_e2_nocache/eval_train_calib_hardneg_s8_q120_20260512",
+          "test_dir": "output/stdloc_hybrid/ShopFacade_hardneg/eval_full_blend09_dense2_r8"
+        },
+        "query_like_calibrated_prior": {
+          "calibration_dir": "output/stdloc_hybrid/ShopFacade_spgs4_rehearsal_ft_b8_e10_20260511/eval_querylike_v64_traincalib_s8_q120_covisibility_prosac",
+          "test_dir": "output/stdloc_hybrid/ShopFacade_spgs4_rehearsal_ft_b8_e10_20260511/eval_querylike_v64_full_covisibility_prosac",
+          "matchability_cache": "output/stdloc_hybrid/query_like_matchability_20260512_v64/ShopFacade/stdloc_bank_query_like.pt"
+        }
+      }
+    },
+    "StMarysChurch": {
+      "branches": {
+        "stdloc_baseline": {
+          "calibration_dir": "output/stdloc/results_train/baseline_StMarysChurch_calib_train_s8_q120_20260512",
+          "test_dir": "output/stdloc/results/baseline_stmary_full-map_cambridge_spgs_StMarysChurch_stream_fastsave-20260504_231007"
+        },
+        "historical_selected": {
+          "calibration_dir": "output/stdloc_hybrid/StMarysChurch_latest_cfg4/eval_train_calib_historical_s8_q120_20260512",
+          "test_dir": "output/stdloc_hybrid/StMarysChurch_latest_cfg4/eval_full_current_strong_r8_20260510"
+        },
+        "query_like_calibrated_prior": {
+          "calibration_dir": "output/stdloc_hybrid/StMarysChurch_spgs4_rehearsal_ft_b8_e10_20260511/eval_querylike_v64_traincalib_s8_q120_covisibility_prosac",
+          "test_dir": "output/stdloc_hybrid/StMarysChurch_spgs4_rehearsal_ft_b8_e10_20260511/eval_querylike_v64_full_covisibility_prosac",
+          "matchability_cache": "output/stdloc_hybrid/query_like_matchability_20260512_v64/StMarysChurch/stdloc_bank_query_like.pt"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+dense:
+  coarse_dual_softmax_temp: 0.1
+  coarse_threshold: 0
+  confidence: 0.99999
+  depth_interpolation: bilinear
+  fine_dual_softmax_temp: 0.1
+  fine_threshold: 0
+  iters: 2
+  locability_prior_weight: 0.05
+  max_iterations: 5000
+  min_iterations: 100
+  norm_before_render: true
+  reprojection_error: 12.0
+  solver: poselib
+  subpixel_refine: true
+  subpixel_temperature: 0.1
+feature_type: sp
+longest_edge: 640
+model_path: output/stdloc/map_cambridge_spgs/GreatCourt_stream_stable2
+sparse:
+  confidence: 0.99999
+  detect_num: 2048
+  detector_path: detector/30000_detector.pth
+  dual_softmax: false
+  dual_softmax_temp: 0.1
+  landmark_path: detector/sampled_idx.pkl
+  landmark_prior_weight: 0.05
+  landmark_score_path: detector/sampled_scores.pkl
+  max_iterations: 100000
+  min_iterations: 1000
+  mnn_match: false
+  nms: 4
+  reprojection_error: 12.0
+  solver: poselib
+  threshold: 0
+  topk: 1

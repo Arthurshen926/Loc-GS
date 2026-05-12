@@ -9,6 +9,8 @@ from typing import Any
 
 import numpy as np
 
+from loc_gs.localization.pose_metrics import pose_error_summary
+
 
 def _finite_float(value: Any) -> float | None:
     if value is None:
@@ -32,17 +34,7 @@ def _summary_from_details(rows: list[dict[str, Any]], stage: str) -> dict[str, f
         te_values.append(te)
         ae_values.append(ae)
         inlier_values.append(int(_finite_float(row.get(f"{stage}_inliers")) or 0))
-    te = np.asarray(te_values, dtype=np.float64)
-    ae = np.asarray(ae_values, dtype=np.float64)
-    return {
-        "median_te": float(np.median(te)) if len(te) else float("inf"),
-        "median_ae": float(np.median(ae)) if len(ae) else float("inf"),
-        "recall_5m_10d": float(((te <= 500.0) & (ae <= 10.0)).mean()) if len(te) else 0.0,
-        "recall_2m_5d": float(((te <= 200.0) & (ae <= 5.0)).mean()) if len(te) else 0.0,
-        "recall_5cm_5d": float(((te <= 5.0) & (ae <= 5.0)).mean()) if len(te) else 0.0,
-        "recall_2cm_2d": float(((te <= 2.0) & (ae <= 2.0)).mean()) if len(te) else 0.0,
-        "avg_inliers": float(np.mean(inlier_values)) if inlier_values else 0.0,
-    }
+    return pose_error_summary(te_values, ae_values, inlier_values)
 
 
 def _mean_matchability(rows: list[dict[str, Any]]) -> dict[str, float]:

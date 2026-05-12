@@ -20,6 +20,8 @@ EVAL_RECIPES = (
     "covisibility_select",
     "covisibility_soft_select",
     "covisibility_prosac",
+    "covisibility_prosac_magsac",
+    "covisibility_prosac_loftr",
 )
 
 
@@ -48,12 +50,17 @@ def build_eval_command(
     query_offset: int = 0,
     eval_split: str = "test",
     pnp_reprojection_error: float = 8.0,
+    calibrated_matchability_path: str = "",
+    calibrated_matchability_weight: float = 0.25,
 ) -> tuple[list[str], dict[str, str]]:
     recipe = str(recipe)
     if recipe not in EVAL_RECIPES:
         raise ValueError(f"unsupported reliability eval recipe: {recipe}")
     descriptor_source = "hybrid_ply_blend" if recipe == "learned_blend" else "ply_loc"
-    solver = "opencv_prosac" if recipe == "covisibility_prosac" else "opencv"
+    if recipe == "covisibility_prosac_magsac":
+        solver = "opencv_prosac_magsac"
+    else:
+        solver = "opencv_prosac" if recipe in {"covisibility_prosac", "covisibility_prosac_loftr"} else "opencv"
     cmd = [
         sys.executable,
         "-m",
@@ -153,7 +160,7 @@ def build_eval_command(
                 "8",
             ]
         )
-    if recipe == "covisibility_prosac":
+    if recipe in {"covisibility_prosac", "covisibility_prosac_magsac", "covisibility_prosac_loftr"}:
         cmd.extend(
             [
                 "--landmark_candidate_source",
@@ -180,6 +187,32 @@ def build_eval_command(
                 "0.25",
                 "--match_filter_margin_weight",
                 "0.25",
+            ]
+        )
+    if calibrated_matchability_path:
+        cmd.extend(
+            [
+                "--calibrated_matchability_path",
+                calibrated_matchability_path,
+                "--landmark_score_calibrated_matchability_weight",
+                str(float(calibrated_matchability_weight)),
+            ]
+        )
+    if recipe == "covisibility_prosac_loftr":
+        cmd.extend(
+            [
+                "--dense_matcher",
+                "loftr_rendered",
+                "--dim_pipeline",
+                "loftr",
+                "--dense_iters",
+                "1",
+                "--loftr_image_scale",
+                "1.0",
+                "--loftr_min_confidence",
+                "0.0",
+                "--loftr_max_matches",
+                "4096",
             ]
         )
     if max_queries > 0:
@@ -225,6 +258,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--query_offset", type=int, default=0)
     parser.add_argument("--query_shards", type=int, default=1)
     parser.add_argument("--pnp_reprojection_error", type=float, default=8.0)
+    parser.add_argument(
+        "--calibrated_matchability_template",
+        default="",
+        help="Optional per-scene template such as output/calib/{scene}/stdloc_bank_query_like.pt.",
+    )
+    parser.add_argument("--calibrated_matchability_weight", type=float, default=0.25)
     parser.add_argument("--gpus", default="")
     parser.add_argument("--max_memory_used_mb", type=int, default=1000)
     parser.add_argument("--max_utilization", type=int, default=10)
@@ -292,6 +331,13 @@ def main() -> None:
         if not args.dry_run and not job.checkpoint.exists():
             raise FileNotFoundError(f"checkpoint not found for {job.scene}: {job.checkpoint}")
         job.output_dir.mkdir(parents=True, exist_ok=True)
+        calibrated_path = (
+            args.calibrated_matchability_template.format(scene=job.scene, tag=args.tag, recipe=job.recipe)
+            if args.calibrated_matchability_template
+            else ""
+        )
+        if calibrated_path and not args.dry_run and not Path(calibrated_path).exists():
+            raise FileNotFoundError(f"calibrated matchability not found for {job.scene}: {calibrated_path}")
         cmd, env = build_eval_command(
             gpu_id=gpu_id,
             scene=job.scene,
@@ -303,6 +349,8 @@ def main() -> None:
             query_offset=job.query_offset,
             eval_split=args.eval_split,
             pnp_reprojection_error=args.pnp_reprojection_error,
+            calibrated_matchability_path=calibrated_path,
+            calibrated_matchability_weight=args.calibrated_matchability_weight,
         )
         print(" ".join(cmd), f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
         if args.dry_run:

@@ -1,0 +1,21 @@
+{
+    "model_path": "output/stdloc/map_cambridge_spgs/GreatCourt_stream_stable2",
+    "sparse": {
+        "median_ae": 0.8570930314768341,
+        "median_te": 143.74345615506172,
+        "recall_5m_10d": 1.0,
+        "recall_2m_5d": 0.5,
+        "recall_5cm_5d": 0.0,
+        "recall_2cm_2d": 0.0,
+        "avg_inliers": 350.5
+    },
+    "dense": {
+        "median_ae": 0.1460568260762755,
+        "median_te": 32.90780633687973,
+        "recall_5m_10d": 1.0,
+        "recall_2m_5d": 1.0,
+        "recall_5cm_5d": 0.0,
+        "recall_2cm_2d": 0.0,
+        "avg_inliers": 20746.5
+    }
+}

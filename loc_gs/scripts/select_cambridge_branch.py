@@ -8,7 +8,11 @@ import math
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+from loc_gs.localization.pose_metrics import (
+    POSE_RECALL_THRESHOLDS,
+    pose_error_summary,
+    recall_metric_key,
+)
 
 
 def _as_float(value: Any) -> float | None:
@@ -144,18 +148,14 @@ def filter_rows(
 
 
 def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, float]:
-    te = np.asarray([row["te"] for row in rows if row["te"] is not None], dtype=np.float64)
-    ae = np.asarray([row["ae"] for row in rows if row["ae"] is not None], dtype=np.float64)
-    inliers = np.asarray([row["inliers"] for row in rows if row["te"] is not None], dtype=np.float64)
-    valid = len(te) > 0 and len(ae) == len(te)
+    te = [row["te"] for row in rows if row["te"] is not None and row["ae"] is not None]
+    ae = [row["ae"] for row in rows if row["te"] is not None and row["ae"] is not None]
+    inliers = [row["inliers"] for row in rows if row["te"] is not None and row["ae"] is not None]
+    summary = pose_error_summary(te, ae, inliers)
     return {
         "queries": float(len(rows)),
         "localized": float(len(te)),
-        "median_te": float(np.median(te)) if valid else float("inf"),
-        "median_ae": float(np.median(ae)) if valid else float("inf"),
-        "recall_5cm_5d": float(((te <= 5.0) & (ae <= 5.0)).mean()) if valid else 0.0,
-        "recall_2cm_2d": float(((te <= 2.0) & (ae <= 2.0)).mean()) if valid else 0.0,
-        "avg_inliers": float(inliers.mean()) if len(inliers) else 0.0,
+        **summary,
     }
 
 
@@ -204,10 +204,11 @@ def branch_score(
         if baseline is not None:
             score -= float(te_penalty_per_cm) * max(0.0, float(metrics["median_te"]) - float(baseline["median_te"]))
         return score
-    if metric == "r5":
-        return float(metrics["recall_5cm_5d"])
     if metric == "median_te":
         return -float(metrics["median_te"])
+    recall_key = recall_metric_key(metric)
+    if recall_key in metrics:
+        return float(metrics[recall_key])
     raise ValueError(f"unsupported target metric: {metric}")
 
 
@@ -219,6 +220,12 @@ def select_scene_branch(
     te_penalty_per_cm: float = 0.002,
     allow_r5_drop: float = 0.0,
     r5_tie: float = 0.01,
+    candidate_min_r5: float = 0.0,
+    max_median_te_increase_cm: float = math.inf,
+    tie_prefer_branch: str = "",
+    tie_max_te_increase_cm: float = 0.0,
+    tie_max_r5_drop: float = 0.0,
+    tie_min_r5: float = 0.0,
 ) -> tuple[str, dict[str, float]]:
     if not branch_metrics:
         raise ValueError("at least one candidate branch is required")
@@ -226,7 +233,11 @@ def select_scene_branch(
     candidates: list[tuple[str, float, dict[str, float]]] = []
     for name, metrics in branch_metrics.items():
         if baseline is not None and name != baseline_branch:
+            if float(metrics["recall_5cm_5d"]) < float(candidate_min_r5):
+                continue
             if float(metrics["recall_5cm_5d"]) < float(baseline["recall_5cm_5d"]) - float(allow_r5_drop):
+                continue
+            if float(metrics["median_te"]) > float(baseline["median_te"]) + float(max_median_te_increase_cm):
                 continue
         score = branch_score(metrics, baseline, metric, te_penalty_per_cm)
         candidates.append((name, score, metrics))
@@ -244,6 +255,23 @@ def select_scene_branch(
         baseline_score = branch_score(baseline, baseline, metric, te_penalty_per_cm)
         if abs(best_score - baseline_score) < 1e-12 and float(baseline["median_te"]) <= float(best_metrics["median_te"]):
             return baseline_branch, baseline
+    if (
+        baseline is not None
+        and best_name == baseline_branch
+        and tie_prefer_branch
+        and tie_prefer_branch in branch_metrics
+    ):
+        preferred = branch_metrics[tie_prefer_branch]
+        preferred_r5 = float(preferred["recall_5cm_5d"])
+        baseline_r5 = float(baseline["recall_5cm_5d"])
+        preferred_te = float(preferred["median_te"])
+        baseline_te = float(baseline["median_te"])
+        if (
+            preferred_r5 >= float(tie_min_r5)
+            and preferred_r5 >= baseline_r5 - float(tie_max_r5_drop)
+            and preferred_te <= baseline_te + float(tie_max_te_increase_cm)
+        ):
+            return tie_prefer_branch, preferred
     return best_name, best_metrics
 
 
@@ -259,6 +287,12 @@ def select_branches(
     te_penalty_per_cm: float,
     allow_r5_drop: float,
     r5_tie: float,
+    candidate_min_r5: float = 0.0,
+    max_median_te_increase_cm: float = math.inf,
+    tie_prefer_branch: str = "",
+    tie_max_te_increase_cm: float = 0.0,
+    tie_max_r5_drop: float = 0.0,
+    tie_min_r5: float = 0.0,
 ) -> dict[str, Any]:
     scene_outputs: dict[str, Any] = {}
     selected: dict[str, str] = {}
@@ -283,6 +317,12 @@ def select_branches(
             te_penalty_per_cm=te_penalty_per_cm,
             allow_r5_drop=allow_r5_drop,
             r5_tie=r5_tie,
+            candidate_min_r5=candidate_min_r5,
+            max_median_te_increase_cm=max_median_te_increase_cm,
+            tie_prefer_branch=tie_prefer_branch,
+            tie_max_te_increase_cm=tie_max_te_increase_cm,
+            tie_max_r5_drop=tie_max_r5_drop,
+            tie_min_r5=tie_min_r5,
         )
         selected[scene] = selected_branch
         selected_spec = branches[selected_branch]
@@ -303,6 +343,12 @@ def select_branches(
             "te_penalty_per_cm": float(te_penalty_per_cm),
             "allow_r5_drop": float(allow_r5_drop),
             "r5_tie": float(r5_tie),
+            "candidate_min_r5": float(candidate_min_r5),
+            "max_median_te_increase_cm": float(max_median_te_increase_cm),
+            "tie_prefer_branch": str(tie_prefer_branch),
+            "tie_max_te_increase_cm": float(tie_max_te_increase_cm),
+            "tie_max_r5_drop": float(tie_max_r5_drop),
+            "tie_min_r5": float(tie_min_r5),
             "calibration_stride": int(calibration_stride),
             "calibration_offset": int(calibration_offset),
             "uses_calibration_ids": calibration_ids is not None,
@@ -312,13 +358,13 @@ def select_branches(
 
 def write_selection_csv(selection: dict[str, Any], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    recall_fields = [key for key, _te_thr, _ae_thr in POSE_RECALL_THRESHOLDS]
     fieldnames = [
         "scene",
         "selected_branch",
         "median_te",
         "median_ae",
-        "recall_5cm_5d",
-        "recall_2cm_2d",
+        *recall_fields,
         "localized",
         "queries",
         "selected_dir",
@@ -334,8 +380,7 @@ def write_selection_csv(selection: dict[str, Any], output_path: Path) -> None:
                     "selected_branch": data["selected_branch"],
                     "median_te": metrics["median_te"],
                     "median_ae": metrics["median_ae"],
-                    "recall_5cm_5d": metrics["recall_5cm_5d"],
-                    "recall_2cm_2d": metrics["recall_2cm_2d"],
+                    **{key: metrics.get(key, 0.0) for key in recall_fields},
                     "localized": int(metrics["localized"]),
                     "queries": int(metrics["queries"]),
                     "selected_dir": data["selected_dir"],
@@ -352,10 +397,34 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration_stride", type=int, default=0, help="Use every Nth result row as calibration-val")
     parser.add_argument("--calibration_offset", type=int, default=0)
     parser.add_argument("--baseline_branch", default="stdloc_baseline")
-    parser.add_argument("--metric", choices=["combined", "r5", "median_te"], default="combined")
+    parser.add_argument(
+        "--metric",
+        choices=["combined", "median_te", "r5", "r2", "r10", "r25", "r50", "r1m", "r2m", "r5m"],
+        default="combined",
+    )
     parser.add_argument("--te_penalty_per_cm", type=float, default=0.002)
     parser.add_argument("--allow_r5_drop", type=float, default=0.0)
     parser.add_argument("--r5_tie", type=float, default=0.01)
+    parser.add_argument(
+        "--candidate_min_r5",
+        type=float,
+        default=0.0,
+        help="Reject non-baseline branches whose calibration R@5cm falls below this floor.",
+    )
+    parser.add_argument(
+        "--max_median_te_increase_cm",
+        type=float,
+        default=math.inf,
+        help="Reject non-baseline branches whose calibration median error exceeds baseline by this margin.",
+    )
+    parser.add_argument(
+        "--tie_prefer_branch",
+        default="",
+        help="Prefer this branch over the baseline when calibration metrics are within the tie tolerances.",
+    )
+    parser.add_argument("--tie_max_te_increase_cm", type=float, default=0.0)
+    parser.add_argument("--tie_max_r5_drop", type=float, default=0.0)
+    parser.add_argument("--tie_min_r5", type=float, default=0.0)
     return parser
 
 
@@ -374,6 +443,12 @@ def main() -> None:
         te_penalty_per_cm=args.te_penalty_per_cm,
         allow_r5_drop=args.allow_r5_drop,
         r5_tie=args.r5_tie,
+        candidate_min_r5=args.candidate_min_r5,
+        max_median_te_increase_cm=args.max_median_te_increase_cm,
+        tie_prefer_branch=args.tie_prefer_branch,
+        tie_max_te_increase_cm=args.tie_max_te_increase_cm,
+        tie_max_r5_drop=args.tie_max_r5_drop,
+        tie_min_r5=args.tie_min_r5,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

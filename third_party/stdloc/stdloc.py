@@ -586,10 +586,14 @@ if __name__ == "__main__":
     parser.add_argument("--prefix", default=None, type=str)
     parser.add_argument("--max_test_cameras", default=None, type=int)
     parser.add_argument("--test_stride", default=1, type=int)
+    parser.add_argument("--eval_split", choices=["test", "train"], default="test")
+    parser.add_argument("--output_path", default=None, type=str)
     args = get_combined_args(parser)
-    args.eval = True
+    args.eval = args.eval_split == "test"
 
-    if hasattr(args, "prefix"):
+    if args.output_path:
+        output_path = args.output_path
+    elif hasattr(args, "prefix"):
         output_path = f"results/{args.prefix}-{args.model_path.replace('/', '_')}-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     else:
         output_path = f"results/{args.model_path.replace('/', '_')}-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -628,8 +632,9 @@ if __name__ == "__main__":
     # loc main
     stdloc = STDLoc(gaussians, config)
 
+    eval_cameras = scene.getTrainCameras() if args.eval_split == "train" else scene.getTestCameras()
     test_cameras = select_eval_cameras(
-        scene.getTestCameras(),
+        eval_cameras,
         max_cameras=getattr(args, "max_test_cameras", None),
         stride=getattr(args, "test_stride", 1),
     )
@@ -680,6 +685,9 @@ if __name__ == "__main__":
 
     results_summary = {
         "model_path": dataset.model_path,
+        "eval_split": args.eval_split,
+        "test_stride": int(getattr(args, "test_stride", 1)),
+        "max_test_cameras": getattr(args, "max_test_cameras", None),
         "sparse": {
             "median_ae": np.median(sparse_aes),
             "median_te": np.median(sparse_tes),

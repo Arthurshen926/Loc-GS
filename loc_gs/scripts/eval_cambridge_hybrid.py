@@ -31,12 +31,14 @@ from loc_gs.localization.lightglue_matcher import (
     lightglue_feature_name,
     match_lightglue_descriptors,
 )
+from loc_gs.localization.dim_image_matcher import match_loftr_images
 from loc_gs.localization.matcher_registry import (
     DENSE_MATCHERS,
     DIM_PIPELINES,
     SPARSE_MATCHERS,
     resolve_sparse_dense_matchers,
 )
+from loc_gs.localization.pose_metrics import pose_error_summary
 from loc_gs.localization.rendered_keypoints import select_rendered_keypoints
 from loc_gs.localization.stdloc_parity import (
     apply_match_prior,
@@ -294,6 +296,206 @@ def _score_ref_keypoint_maps(
 
 
 @torch.no_grad()
+def _score_ref_descriptor_maps(
+    dataset: CambridgeHybridDataset,
+    teacher: SuperPointNet,
+    device: torch.device,
+    max_views: int,
+    height: int,
+    width: int,
+) -> torch.Tensor | None:
+    ids = _score_ref_indices(len(dataset), max_views)
+    if not ids:
+        return None
+    desc_maps = []
+    for idx in ids:
+        rgb = dataset[int(idx)]["rgb"].unsqueeze(0).to(device=device, dtype=torch.float32)
+        teacher_desc, teacher_det = teacher(superpoint_gray(rgb))
+        teacher_desc_grid, _teacher_det_grid = resize_teacher_outputs_to_feature_grid(
+            teacher_desc,
+            teacher_det,
+            int(height),
+            int(width),
+        )
+        desc_maps.append(F.normalize(teacher_desc_grid[0].float(), p=2, dim=0))
+    return torch.stack(desc_maps, dim=0)
+
+
+def _axis_angle_rotation_matrix(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
+    axis = F.normalize(axis.float(), p=2, dim=0, eps=1e-8)
+    x, y, z = axis.unbind(dim=0)
+    c = torch.cos(angle.float())
+    s = torch.sin(angle.float())
+    one_c = 1.0 - c
+    return torch.stack(
+        [
+            torch.stack([c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s]),
+            torch.stack([y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s]),
+            torch.stack([z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c]),
+        ],
+        dim=0,
+    )
+
+
+def perturb_reference_poses_camera_frame(
+    poses_w2c: torch.Tensor,
+    translation_m: float,
+    rotation_deg: float,
+) -> torch.Tensor:
+    """Create deterministic camera-frame pose perturbations for rendered auxiliary views."""
+    if poses_w2c.numel() == 0:
+        return poses_w2c
+    trans_mag = float(translation_m)
+    rot_mag = math.radians(float(rotation_deg))
+    out = []
+    device = poses_w2c.device
+    dtype = poses_w2c.dtype
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    for idx, pose in enumerate(poses_w2c):
+        phase = float(idx + 1) * golden
+        delta = torch.eye(4, device=device, dtype=dtype)
+        if rot_mag > 0.0:
+            axis = torch.tensor(
+                [math.sin(phase * 0.7), math.cos(phase * 1.3), 0.5 * math.sin(phase * 1.7)],
+                device=device,
+                dtype=torch.float32,
+            )
+            angle = torch.tensor(rot_mag * math.sin(phase), device=device, dtype=torch.float32)
+            delta[:3, :3] = _axis_angle_rotation_matrix(axis, angle).to(device=device, dtype=dtype)
+        if trans_mag > 0.0:
+            delta[:3, 3] = torch.tensor(
+                [
+                    trans_mag * math.cos(phase),
+                    trans_mag * math.sin(phase),
+                    0.35 * trans_mag * math.sin(phase * 0.5),
+                ],
+                device=device,
+                dtype=dtype,
+            )
+        out.append(delta @ pose)
+    return torch.stack(out, dim=0)
+
+
+@torch.no_grad()
+def _rendered_ref_descriptor_maps(
+    model: HybridFeatureGaussian,
+    full_renderer,
+    poses_w2c: torch.Tensor,
+    teacher: SuperPointNet,
+    device: torch.device,
+    height: int,
+    width: int,
+) -> torch.Tensor | None:
+    if full_renderer is None or poses_w2c is None or poses_w2c.numel() == 0:
+        return None
+    desc_maps = []
+    for pose in poses_w2c:
+        rendered = full_renderer.render_rgb(model, pose.to(device=device, dtype=torch.float32))
+        rgb = rendered["rgb"].unsqueeze(0).to(device=device, dtype=torch.float32)
+        teacher_desc, teacher_det = teacher(superpoint_gray(rgb))
+        teacher_desc_grid, _teacher_det_grid = resize_teacher_outputs_to_feature_grid(
+            teacher_desc,
+            teacher_det,
+            int(height),
+            int(width),
+        )
+        desc_maps.append(F.normalize(teacher_desc_grid[0].float(), p=2, dim=0))
+    return torch.stack(desc_maps, dim=0) if desc_maps else None
+
+
+@torch.no_grad()
+def fuse_projected_teacher_descriptors(
+    points: torch.Tensor,
+    poses_w2c: torch.Tensor | None,
+    K: torch.Tensor,
+    descriptor_maps: torch.Tensor | None,
+    height: int,
+    width: int,
+    chunk_size: int = 2048,
+    geometry_power: float = 0.0,
+    centrality_power: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse multi-view teacher descriptors by projecting 3D landmarks into reference views.
+
+    Geometry and centrality weights are opt-in so the historical uniform-fusion
+    behavior remains the default.
+    """
+    if points.ndim != 2 or points.shape[-1] < 3:
+        raise ValueError("points must have shape [N, 3+]")
+    if descriptor_maps is None or poses_w2c is None or descriptor_maps.numel() == 0 or poses_w2c.numel() == 0:
+        dim = 0 if descriptor_maps is None or descriptor_maps.ndim != 4 else int(descriptor_maps.shape[1])
+        return points.new_zeros((points.shape[0], dim)), points.new_zeros((points.shape[0],))
+    if descriptor_maps.ndim != 4:
+        raise ValueError("descriptor_maps must have shape [V, C, H, W]")
+    view_count = min(int(poses_w2c.shape[0]), int(descriptor_maps.shape[0]))
+    if view_count <= 0:
+        return points.new_zeros((points.shape[0], int(descriptor_maps.shape[1]))), points.new_zeros((points.shape[0],))
+
+    H = int(height)
+    W = int(width)
+    desc_bchw = descriptor_maps[:view_count].to(device=points.device, dtype=torch.float32)
+    if desc_bchw.shape[-2:] != (H, W):
+        desc_bchw = F.interpolate(desc_bchw, size=(H, W), mode="bilinear", align_corners=False)
+    desc_bchw = F.normalize(desc_bchw, p=2, dim=1, eps=1e-8)
+    poses = poses_w2c[:view_count].to(device=points.device, dtype=torch.float32)
+    K = K.to(device=points.device, dtype=torch.float32)
+
+    fused_chunks = []
+    count_chunks = []
+    chunk = max(1, int(chunk_size))
+    for start in range(0, points.shape[0], chunk):
+        end = min(start + chunk, points.shape[0])
+        pts = points[start:end, :3].to(device=points.device, dtype=torch.float32)
+        pts_v = pts.unsqueeze(0).expand(view_count, -1, -1)
+        proj_yx, valid_z = project_world_to_image_yx(pts_v, poses, K)
+        in_frame = (
+            valid_z
+            & (proj_yx[..., 0] >= 0.0)
+            & (proj_yx[..., 0] <= float(H - 1))
+            & (proj_yx[..., 1] >= 0.0)
+            & (proj_yx[..., 1] <= float(W - 1))
+        )
+        grid_x = proj_yx[..., 1] / float(max(W - 1, 1)) * 2.0 - 1.0 if W > 1 else torch.zeros_like(proj_yx[..., 1])
+        grid_y = proj_yx[..., 0] / float(max(H - 1, 1)) * 2.0 - 1.0 if H > 1 else torch.zeros_like(proj_yx[..., 0])
+        grid = torch.stack([grid_x, grid_y], dim=-1).view(view_count, -1, 1, 2)
+        sampled = F.grid_sample(
+            desc_bchw,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )[..., 0]
+        sampled = F.normalize(sampled, p=2, dim=1, eps=1e-8)
+        weights = in_frame.float()
+        if float(centrality_power) > 0.0:
+            cy = float(max(H - 1, 1)) * 0.5
+            cx = float(max(W - 1, 1)) * 0.5
+            dy = (proj_yx[..., 0] - cy) / max(cy, 1.0)
+            dx = (proj_yx[..., 1] - cx) / max(cx, 1.0)
+            center_score = torch.exp(-0.5 * float(centrality_power) * (dy.square() + dx.square()))
+            weights = weights * center_score.clamp_min(0.0)
+        if float(geometry_power) > 0.0:
+            observability = projection_jacobian_observability(
+                pts_v,
+                poses,
+                K,
+                min_depth=0.05,
+            ).clamp_min(1e-8)
+            obs_center = torch.where(in_frame, observability, torch.zeros_like(observability)).sum(dim=0)
+            obs_count = in_frame.float().sum(dim=0).clamp_min(1.0)
+            obs_center = (obs_center / obs_count).clamp_min(1e-8)
+            geometry_score = (observability / obs_center[None, :]).clamp(0.05, 20.0)
+            weights = weights * geometry_score.pow(float(geometry_power))
+        desc_sum = (sampled * weights[:, None, :]).sum(dim=0).T
+        counts = in_frame.float().sum(dim=0)
+        fused = F.normalize(desc_sum, p=2, dim=-1, eps=1e-8)
+        fused = torch.where(counts[:, None] > 0.0, fused, torch.zeros_like(fused))
+        fused_chunks.append(fused)
+        count_chunks.append(counts)
+    return torch.cat(fused_chunks, dim=0), torch.cat(count_chunks, dim=0)
+
+
+@torch.no_grad()
 def _splatloc_visibility_score(
     points: torch.Tensor,
     poses_w2c: torch.Tensor | None,
@@ -436,6 +638,23 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
         "mnn": bool(args.mnn),
         "dense_iters": int(args.dense_iters),
         "dense_full_render": bool(args.dense_full_render),
+        "loftr_pretrained": str(getattr(args, "loftr_pretrained", "outdoor")),
+        "loftr_image_scale": float(getattr(args, "loftr_image_scale", 1.0)),
+        "loftr_min_confidence": float(getattr(args, "loftr_min_confidence", 0.0)),
+        "loftr_max_matches": int(getattr(args, "loftr_max_matches", 4096)),
+        "dense_sparse_consistency_gate": bool(getattr(args, "dense_sparse_consistency_gate", False)),
+        "dense_sparse_consistency_max_median_ratio": float(
+            getattr(args, "dense_sparse_consistency_max_median_ratio", 1.5)
+        ),
+        "dense_sparse_consistency_max_median_increase": float(
+            getattr(args, "dense_sparse_consistency_max_median_increase", 2.0)
+        ),
+        "dense_sparse_consistency_min_inlier_ratio_factor": float(
+            getattr(args, "dense_sparse_consistency_min_inlier_ratio_factor", 0.75)
+        ),
+        "dense_pose_delta_gate": bool(getattr(args, "dense_pose_delta_gate", False)),
+        "dense_pose_delta_max_trans_cm": float(getattr(args, "dense_pose_delta_max_trans_cm", 100.0)),
+        "dense_pose_delta_max_rot_deg": float(getattr(args, "dense_pose_delta_max_rot_deg", 5.0)),
         "subpixel_refine": bool(args.subpixel_refine),
         "subpixel_temperature": float(args.subpixel_temperature),
         "topk_refine_window": int(args.topk_refine_window),
@@ -468,6 +687,24 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
         "calibrated_matchability_path": str(getattr(args, "calibrated_matchability_path", "")),
         "landmark_score_calibrated_matchability_weight": float(
             getattr(args, "landmark_score_calibrated_matchability_weight", 0.0)
+        ),
+        "landmark_teacher_fusion_weight": float(getattr(args, "landmark_teacher_fusion_weight", 0.0)),
+        "landmark_teacher_fusion_views": int(getattr(args, "landmark_teacher_fusion_views", 0)),
+        "landmark_teacher_fusion_chunk_size": int(getattr(args, "landmark_teacher_fusion_chunk_size", 2048)),
+        "landmark_teacher_fusion_geometry_power": float(
+            getattr(args, "landmark_teacher_fusion_geometry_power", 0.0)
+        ),
+        "landmark_teacher_fusion_centrality_power": float(
+            getattr(args, "landmark_teacher_fusion_centrality_power", 0.0)
+        ),
+        "landmark_teacher_fusion_rendered_views": int(
+            getattr(args, "landmark_teacher_fusion_rendered_views", 0)
+        ),
+        "landmark_teacher_fusion_rendered_trans_noise_cm": float(
+            getattr(args, "landmark_teacher_fusion_rendered_trans_noise_cm", 0.0)
+        ),
+        "landmark_teacher_fusion_rendered_rot_noise_deg": float(
+            getattr(args, "landmark_teacher_fusion_rendered_rot_noise_deg", 0.0)
         ),
         "match_calibrated_prior_weight": float(getattr(args, "match_calibrated_prior_weight", 0.0)),
         "match_filter_mode": str(getattr(args, "match_filter_mode", "")),
@@ -833,10 +1070,64 @@ def local_geometric_consistency_scores(
     return normalize_score01(raw, valid=valid)
 
 
+def local_image_pair_geometry_scores(
+    query_yx: torch.Tensor,
+    reference_yx: torch.Tensor,
+    k: int = 6,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Score matches whose local 2D neighborhoods agree in query and rendered images."""
+    query = query_yx.float()
+    reference = reference_yx.float()
+    count = min(int(query.shape[0]), int(reference.shape[0]))
+    if count <= 0:
+        return query.new_empty((0,), dtype=torch.float32)
+    query = query[:count]
+    reference = reference[:count]
+    valid = torch.isfinite(query).all(dim=-1) & torch.isfinite(reference).all(dim=-1)
+    if count < 3 or int(valid.sum()) < 3:
+        return valid.float()
+
+    d_ref = torch.cdist(reference, reference)
+    d_query = torch.cdist(query, query)
+    eye = torch.eye(count, dtype=torch.bool, device=query.device)
+    d_ref = d_ref.masked_fill(eye, float("inf"))
+    d_query = d_query.masked_fill(eye, float("inf"))
+    neighbor_count = min(max(1, int(k)), count - 1)
+    nn = torch.topk(d_ref, k=neighbor_count, dim=-1, largest=False).indices
+
+    d_ref_nn = torch.gather(d_ref, 1, nn).clamp_min(float(eps))
+    d_query_nn = torch.gather(d_query, 1, nn).clamp_min(float(eps))
+    neighbor_valid = torch.gather(valid[None, :].expand(count, -1), 1, nn)
+    finite = torch.isfinite(d_ref_nn) & torch.isfinite(d_query_nn) & valid[:, None] & neighbor_valid
+
+    log_scale = torch.log((d_query_nn / d_ref_nn).clamp_min(float(eps)))
+    local_scale = torch.where(finite, log_scale, torch.zeros_like(log_scale)).median(dim=1, keepdim=True).values
+    scale_spread = torch.where(finite, (log_scale - local_scale).abs(), torch.zeros_like(log_scale))
+    scale_spread = scale_spread.sum(dim=1) / finite.float().sum(dim=1).clamp_min(1.0)
+    global_scale = log_scale[finite].median() if finite.any() else query.new_tensor(0.0)
+    scale_bias = (local_scale.squeeze(1) - global_scale).abs()
+
+    q_vec = query[nn] - query[:, None, :]
+    r_vec = reference[nn] - reference[:, None, :]
+    q_angle = torch.atan2(q_vec[..., 0], q_vec[..., 1])
+    r_angle = torch.atan2(r_vec[..., 0], r_vec[..., 1])
+    angle_delta = torch.atan2(torch.sin(q_angle - r_angle), torch.cos(q_angle - r_angle))
+    local_angle = torch.where(finite, angle_delta, torch.zeros_like(angle_delta)).median(dim=1, keepdim=True).values
+    angle_residual = torch.atan2(torch.sin(angle_delta - local_angle), torch.cos(angle_delta - local_angle)).abs()
+    angle_spread = torch.where(finite, angle_residual, torch.zeros_like(angle_residual))
+    angle_spread = angle_spread.sum(dim=1) / finite.float().sum(dim=1).clamp_min(1.0)
+
+    raw = torch.exp(-scale_spread) * torch.exp(-0.5 * scale_bias) * torch.exp(-0.25 * angle_spread)
+    raw = torch.where(valid, raw, torch.zeros_like(raw))
+    return normalize_score01(raw, valid=valid)
+
+
 def select_pnp_match_indices(
     query_yx: torch.Tensor,
     points3d: torch.Tensor,
     scores: torch.Tensor | None = None,
+    reference_yx: torch.Tensor | None = None,
     max_matches: int = 0,
     mode: str = "none",
     image_grid_size: int = 8,
@@ -898,6 +1189,39 @@ def select_pnp_match_indices(
         candidate_rel = torch.topk(pre_score, k=candidate_limit).indices
         candidate_idx = eligible[candidate_rel]
         geometry = local_geometric_consistency_scores(query[candidate_idx], xyz[candidate_idx], k=6)
+        combined = pre_score[candidate_rel] * geometry
+        return candidate_idx[torch.topk(combined, k=min(keep, candidate_limit)).indices]
+    if mode == "image_pair_geometry":
+        if reference_yx is None:
+            return select_pnp_match_indices(
+                query_yx,
+                points3d,
+                scores=scores,
+                max_matches=max_matches,
+                mode="local_geometry",
+                image_grid_size=image_grid_size,
+                xyz_grid_size=xyz_grid_size,
+                max_per_image_cell=max_per_image_cell,
+                max_per_xyz_cell=max_per_xyz_cell,
+                min_matches=min_matches,
+            )
+        reference = reference_yx[:count].to(device=device, dtype=torch.float32)
+        valid_pair = valid & torch.isfinite(reference).all(dim=-1)
+        eligible = torch.where(valid_pair)[0]
+        if int(eligible.numel()) <= keep:
+            return eligible[torch.argsort(score[eligible], descending=True)]
+        candidate_limit = min(
+            int(eligible.numel()),
+            max(min(keep * 4, 4096), min(keep, 4096), 64),
+        )
+        pre_score = normalize_score01(score[eligible])
+        candidate_rel = torch.topk(pre_score, k=candidate_limit).indices
+        candidate_idx = eligible[candidate_rel]
+        geometry = local_image_pair_geometry_scores(
+            query[candidate_idx],
+            reference[candidate_idx],
+            k=6,
+        )
         combined = pre_score[candidate_rel] * geometry
         return candidate_idx[torch.topk(combined, k=min(keep, candidate_limit)).indices]
     raise ValueError(f"Unsupported PnP prefilter mode: {mode}")
@@ -1184,6 +1508,90 @@ def _match_filter_scores(
     return out
 
 
+def sparse_reprojection_consistency_stats(
+    pose_w2c: torch.Tensor,
+    sparse_xyz: torch.Tensor,
+    sparse_query_yx: torch.Tensor,
+    K: torch.Tensor,
+    threshold: float,
+) -> tuple[float, float] | None:
+    if sparse_xyz.shape[0] < 4 or sparse_query_yx.shape[0] < 4:
+        return None
+    projected, valid_z = project_world_to_image_yx(
+        sparse_xyz.float().unsqueeze(0),
+        pose_w2c.float(),
+        K.float(),
+    )
+    errors = torch.linalg.norm(projected[0] - sparse_query_yx.float(), dim=-1)
+    valid = valid_z[0] & torch.isfinite(errors)
+    if int(valid.sum()) < 4:
+        return None
+    valid_errors = errors[valid]
+    median_error = float(torch.median(valid_errors).detach().cpu().item())
+    inlier_ratio = float((valid_errors <= float(threshold)).float().mean().detach().cpu().item())
+    return median_error, inlier_ratio
+
+
+def should_reject_dense_pose_by_sparse_consistency(
+    previous_pose_w2c: torch.Tensor,
+    candidate_pose_w2c: torch.Tensor,
+    sparse_xyz: torch.Tensor,
+    sparse_query_yx: torch.Tensor,
+    K: torch.Tensor,
+    threshold: float,
+    max_median_ratio: float,
+    max_median_increase: float,
+    min_inlier_ratio_factor: float,
+) -> tuple[bool, dict[str, float]]:
+    previous = sparse_reprojection_consistency_stats(
+        previous_pose_w2c,
+        sparse_xyz,
+        sparse_query_yx,
+        K,
+        threshold,
+    )
+    candidate = sparse_reprojection_consistency_stats(
+        candidate_pose_w2c,
+        sparse_xyz,
+        sparse_query_yx,
+        K,
+        threshold,
+    )
+    if previous is None or candidate is None:
+        return False, {}
+    prev_median, prev_inlier_ratio = previous
+    cand_median, cand_inlier_ratio = candidate
+    median_limit = prev_median * float(max_median_ratio) + float(max_median_increase)
+    inlier_limit = prev_inlier_ratio * float(min_inlier_ratio_factor)
+    reject = cand_median > median_limit and cand_inlier_ratio < inlier_limit
+    return reject, {
+        "prev_sparse_reproj_median": prev_median,
+        "candidate_sparse_reproj_median": cand_median,
+        "prev_sparse_reproj_inlier_ratio": prev_inlier_ratio,
+        "candidate_sparse_reproj_inlier_ratio": cand_inlier_ratio,
+        "sparse_reproj_median_limit": median_limit,
+        "sparse_reproj_inlier_limit": inlier_limit,
+    }
+
+
+def should_reject_dense_pose_by_delta(
+    previous_pose_w2c: torch.Tensor,
+    candidate_pose_w2c: torch.Tensor,
+    max_trans_cm: float,
+    max_rot_deg: float,
+) -> tuple[bool, dict[str, float]]:
+    prev_np = previous_pose_w2c[0].detach().cpu().numpy()
+    cand_np = candidate_pose_w2c[0].detach().cpu().numpy()
+    trans_cm, rot_deg = pose_error_cm_deg(cand_np, prev_np)
+    reject = trans_cm > float(max_trans_cm) or rot_deg > float(max_rot_deg)
+    return reject, {
+        "dense_pose_delta_trans_cm": float(trans_cm),
+        "dense_pose_delta_rot_deg": float(rot_deg),
+        "dense_pose_delta_max_trans_cm": float(max_trans_cm),
+        "dense_pose_delta_max_rot_deg": float(max_rot_deg),
+    }
+
+
 def apply_calibrated_matchability_prior(
     corr_matrix: torch.Tensor,
     reliability: torch.Tensor | None,
@@ -1262,6 +1670,15 @@ def build_stdloc_detector_landmark_bank(
     keypoint_consensus_radius: int = 2,
     keypoint_consensus_descriptor_maps: torch.Tensor | None = None,
     keypoint_consensus_descriptor_weight: float = 0.0,
+    teacher_fusion_poses: torch.Tensor | None = None,
+    teacher_fusion_descriptor_maps: torch.Tensor | None = None,
+    teacher_fusion_K: torch.Tensor | None = None,
+    teacher_fusion_height: int = 0,
+    teacher_fusion_width: int = 0,
+    teacher_fusion_weight: float = 0.0,
+    teacher_fusion_chunk_size: int = 2048,
+    teacher_fusion_geometry_power: float = 0.0,
+    teacher_fusion_centrality_power: float = 0.0,
     calibrated_matchability: torch.Tensor | None = None,
     calibrated_matchability_weight: float = 0.0,
     return_aux: bool = False,
@@ -1475,6 +1892,37 @@ def build_stdloc_detector_landmark_bank(
         )
     else:
         desc = decode_gaussian_center_descriptors(model, sp_head, ids)
+
+    fusion_weight = min(max(float(teacher_fusion_weight), 0.0), 1.0)
+    if (
+        fusion_weight > 0.0
+        and teacher_fusion_descriptor_maps is not None
+        and teacher_fusion_poses is not None
+        and teacher_fusion_K is not None
+    ):
+        fused_desc, fusion_counts = fuse_projected_teacher_descriptors(
+            xyz.detach(),
+            teacher_fusion_poses,
+            teacher_fusion_K,
+            teacher_fusion_descriptor_maps,
+            height=int(teacher_fusion_height),
+            width=int(teacher_fusion_width),
+            chunk_size=int(teacher_fusion_chunk_size),
+            geometry_power=float(teacher_fusion_geometry_power),
+            centrality_power=float(teacher_fusion_centrality_power),
+        )
+        usable = fusion_counts > 0.0
+        if int(usable.sum()) > 0:
+            desc = torch.where(
+                usable[:, None],
+                F.normalize((1.0 - fusion_weight) * desc.float() + fusion_weight * fused_desc.float(), p=2, dim=-1),
+                desc.float(),
+            )
+        stats["teacher_fusion_weight"] = float(fusion_weight)
+        stats["teacher_fusion_geometry_power"] = float(teacher_fusion_geometry_power)
+        stats["teacher_fusion_centrality_power"] = float(teacher_fusion_centrality_power)
+        stats["teacher_fusion_observed_mean"] = float(fusion_counts.float().mean().detach().cpu()) if fusion_counts.numel() else 0.0
+        stats["teacher_fusion_observed_ratio"] = float(usable.float().mean().detach().cpu()) if usable.numel() else 0.0
 
     result = (xyz, F.normalize(desc.float(), p=2, dim=-1), prior.float(), stats)
     if return_aux:
@@ -2060,7 +2508,11 @@ def localize_one(
 
     pose = torch.from_numpy(sparse_pose).to(device=rgb.device, dtype=torch.float32).unsqueeze(0)
     dense_inliers = 0
+    dense_rejections = 0
+    dense_rejection_stats: dict[str, float] = {}
     for _ in range(args.dense_iters):
+        previous_pose = pose
+        previous_dense_inliers = dense_inliers
         render = render_hybrid_superpoint(
             model,
             sp_head,
@@ -2150,6 +2602,7 @@ def localize_one(
                 dense_matches.query_yx[valid],
                 p3d[valid],
                 scores=dense_matches.scores[valid_ids],
+                reference_yx=dense_matches.rendered_yx[valid],
                 max_matches=_stage_match_filter_max_matches(args, "dense", getattr(args, "dense_pnp_max_matches", 0)),
                 mode=_stage_match_filter_mode(args, "dense"),
                 image_grid_size=_match_filter_image_grid_size(args),
@@ -2250,6 +2703,7 @@ def localize_one(
                 query_lg_yx[q_dense][valid],
                 dense_points3d[valid],
                 scores=_lg_scores[valid_ids],
+                reference_yx=refined_render_yx[valid],
                 max_matches=_stage_match_filter_max_matches(args, "dense", getattr(args, "dense_pnp_max_matches", 0)),
                 mode=_stage_match_filter_mode(args, "dense"),
                 image_grid_size=_match_filter_image_grid_size(args),
@@ -2265,6 +2719,85 @@ def localize_one(
                 dense_points3d_valid.detach().cpu().numpy(),
                 (query_lg_valid + dense_query_offset).detach().cpu().numpy(),
                 dense_K.detach().cpu().numpy(),
+                reprojection_error=dense_reprojection_error,
+                refine_reprojection_error=args.refine_reprojection_error,
+                confidence=args.pnp_confidence,
+                iterations=dense_pnp_iterations,
+                min_iterations=dense_pnp_min_iterations,
+                solver=args.solver,
+                refine_poselib=refine_poselib,
+                match_scores=dense_pnp_scores.detach().cpu().numpy(),
+            )
+        elif dense_matcher == "loftr_rendered":
+            if full_renderer is None:
+                break
+            full_render = render_hybrid_superpoint(
+                model,
+                sp_head,
+                full_renderer,
+                pose,
+                descriptor_source=descriptor_source,
+                ply_loc_feature_weight=ply_loc_feature_weight,
+                hybrid_residual_alpha_max=getattr(args, "hybrid_residual_alpha_max", 0.05),
+                include_rgb=True,
+            )
+            dense_depth = full_render["depth"][0].float()
+            dense_rgb = full_render.get("rgb")
+            if dense_rgb is None:
+                break
+            dense_rgb = dense_rgb.float().clamp(0.0, 1.0)
+            query_rgb_for_match = rgb.float().clamp(0.0, 1.0)
+            if query_rgb_for_match.shape[-2:] != dense_rgb.shape[-2:]:
+                break
+            try:
+                query_yx, rendered_yx, loftr_scores = match_loftr_images(
+                    query_rgb_for_match,
+                    dense_rgb,
+                    pretrained=getattr(args, "loftr_pretrained", "outdoor"),
+                    image_scale=getattr(args, "loftr_image_scale", 1.0),
+                    min_confidence=getattr(args, "loftr_min_confidence", 0.0),
+                    max_matches=getattr(args, "loftr_max_matches", 4096),
+                )
+            except (ImportError, RuntimeError, ValueError):
+                break
+            if rendered_yx.shape[0] < 4:
+                break
+            dense_points3d = unproject_positions_yx(
+                rendered_yx,
+                dense_depth,
+                pose[0].float(),
+                full_renderer.K.float(),
+                pixel_center_offset=args.render_pixel_center_offset,
+            )
+            valid = (
+                torch.isfinite(dense_points3d).all(dim=-1)
+                & torch.isfinite(query_yx).all(dim=-1)
+                & torch.isfinite(loftr_scores)
+                & (dense_points3d[:, 2].abs() < 1e8)
+            )
+            if valid.sum() < 4:
+                break
+            valid_ids = torch.where(valid)[0]
+            dense_keep = select_pnp_match_indices(
+                query_yx[valid],
+                dense_points3d[valid],
+                scores=loftr_scores[valid_ids],
+                reference_yx=rendered_yx[valid],
+                max_matches=_stage_match_filter_max_matches(args, "dense", getattr(args, "dense_pnp_max_matches", 0)),
+                mode=_stage_match_filter_mode(args, "dense"),
+                image_grid_size=_match_filter_image_grid_size(args),
+                xyz_grid_size=_match_filter_xyz_grid_size(args),
+                max_per_image_cell=getattr(args, "match_filter_max_per_image_cell", 8),
+                max_per_xyz_cell=getattr(args, "match_filter_max_per_xyz_cell", 8),
+                min_matches=getattr(args, "match_filter_min_matches", 0),
+            )
+            dense_points3d_valid = dense_points3d[valid][dense_keep]
+            query_valid = query_yx[valid][dense_keep]
+            dense_pnp_scores = loftr_scores[valid_ids][dense_keep]
+            dense_pose, dense_inliers = solve_pnp_ransac(
+                dense_points3d_valid.detach().cpu().numpy(),
+                (query_valid + dense_query_offset).detach().cpu().numpy(),
+                K_full.detach().cpu().numpy(),
                 reprojection_error=dense_reprojection_error,
                 refine_reprojection_error=args.refine_reprojection_error,
                 confidence=args.pnp_confidence,
@@ -2350,6 +2883,7 @@ def localize_one(
                 dense_query_yx[q_dense],
                 dense_points3d,
                 scores=dense_filter_scores,
+                reference_yx=refined_render_yx,
                 max_matches=_stage_match_filter_max_matches(args, "dense", getattr(args, "dense_pnp_max_matches", 0)),
                 mode=_stage_match_filter_mode(args, "dense"),
                 image_grid_size=_match_filter_image_grid_size(args),
@@ -2379,13 +2913,48 @@ def localize_one(
             )
         if dense_pose is None:
             break
-        pose = torch.from_numpy(dense_pose).to(device=rgb.device, dtype=torch.float32).unsqueeze(0)
+        candidate_pose = torch.from_numpy(dense_pose).to(device=rgb.device, dtype=torch.float32).unsqueeze(0)
+        if bool(getattr(args, "dense_pose_delta_gate", False)):
+            reject_dense, delta_stats = should_reject_dense_pose_by_delta(
+                previous_pose,
+                candidate_pose,
+                max_trans_cm=float(getattr(args, "dense_pose_delta_max_trans_cm", 100.0)),
+                max_rot_deg=float(getattr(args, "dense_pose_delta_max_rot_deg", 5.0)),
+            )
+            dense_rejection_stats = {**dense_rejection_stats, **delta_stats}
+            if reject_dense:
+                dense_rejections += 1
+                dense_inliers = previous_dense_inliers
+                break
+        if bool(getattr(args, "dense_sparse_consistency_gate", False)):
+            reject_dense, rejection_stats = should_reject_dense_pose_by_sparse_consistency(
+                previous_pose,
+                candidate_pose,
+                landmark_xyz[lm_ids],
+                sparse_query_for_pnp,
+                sparse_K,
+                threshold=float(sparse_reprojection_error),
+                max_median_ratio=float(getattr(args, "dense_sparse_consistency_max_median_ratio", 1.5)),
+                max_median_increase=float(getattr(args, "dense_sparse_consistency_max_median_increase", 2.0)),
+                min_inlier_ratio_factor=float(
+                    getattr(args, "dense_sparse_consistency_min_inlier_ratio_factor", 0.75)
+                ),
+            )
+            if rejection_stats:
+                dense_rejection_stats = rejection_stats
+            if reject_dense:
+                dense_rejections += 1
+                dense_inliers = previous_dense_inliers
+                break
+        pose = candidate_pose
 
     out = {
         "pose_w2c": pose[0].detach().cpu().numpy(),
         "sparse_pose_w2c": sparse_pose,
         "sparse_inliers": sparse_inliers,
         "dense_inliers": dense_inliers,
+        "dense_rejections": dense_rejections,
+        "dense_rejection_stats": dense_rejection_stats,
     }
     if getattr(args, "matchability_diagnostics", False):
         out["sparse_match_diagnostics"] = {
@@ -2446,6 +3015,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--landmark_score_prior_blend", type=float, default=0.25)
     parser.add_argument("--calibrated_matchability_path", default="")
     parser.add_argument("--landmark_score_calibrated_matchability_weight", type=float, default=0.0)
+    parser.add_argument("--landmark_teacher_fusion_weight", type=float, default=0.0)
+    parser.add_argument("--landmark_teacher_fusion_views", type=int, default=0)
+    parser.add_argument("--landmark_teacher_fusion_chunk_size", type=int, default=2048)
+    parser.add_argument("--landmark_teacher_fusion_geometry_power", type=float, default=0.0)
+    parser.add_argument("--landmark_teacher_fusion_centrality_power", type=float, default=0.0)
+    parser.add_argument("--landmark_teacher_fusion_rendered_views", type=int, default=0)
+    parser.add_argument("--landmark_teacher_fusion_rendered_trans_noise_cm", type=float, default=0.0)
+    parser.add_argument("--landmark_teacher_fusion_rendered_rot_noise_deg", type=float, default=0.0)
     parser.add_argument("--match_calibrated_prior_weight", type=float, default=0.0)
     parser.add_argument(
         "--descriptor_source",
@@ -2472,7 +3049,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--rendered_keypoint_source", choices=["locability", "detector", "projected_gaussian"], default="locability")
     parser.add_argument("--lightglue_max_keypoints", type=int, default=2048)
     parser.add_argument("--lightglue_filter_threshold", type=float, default=0.1)
-    parser.add_argument("--solver", choices=["poselib", "opencv", "opencv_prosac"], default="opencv")
+    parser.add_argument("--loftr_pretrained", default="outdoor")
+    parser.add_argument("--loftr_image_scale", type=float, default=1.0)
+    parser.add_argument("--loftr_min_confidence", type=float, default=0.0)
+    parser.add_argument("--loftr_max_matches", type=int, default=4096)
+    parser.add_argument("--dense_sparse_consistency_gate", action="store_true")
+    parser.add_argument("--dense_sparse_consistency_max_median_ratio", type=float, default=1.5)
+    parser.add_argument("--dense_sparse_consistency_max_median_increase", type=float, default=2.0)
+    parser.add_argument("--dense_sparse_consistency_min_inlier_ratio_factor", type=float, default=0.75)
+    parser.add_argument("--dense_pose_delta_gate", action="store_true")
+    parser.add_argument("--dense_pose_delta_max_trans_cm", type=float, default=100.0)
+    parser.add_argument("--dense_pose_delta_max_rot_deg", type=float, default=5.0)
+    parser.add_argument("--solver", choices=["poselib", "opencv", "opencv_prosac", "opencv_prosac_magsac"], default="opencv")
     parser.add_argument("--poselib_refine", action="store_true")
     parser.add_argument("--sparse_dual_softmax", action="store_true")
     parser.add_argument("--sparse_dual_softmax_temp", type=float, default=0.1)
@@ -2503,7 +3091,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dense_pnp_min_iterations", type=int, default=None)
     parser.add_argument(
         "--pnp_prefilter",
-        choices=["none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry"],
+        choices=["none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry"],
         default="none",
     )
     parser.add_argument("--sparse_pnp_max_matches", type=int, default=0)
@@ -2512,7 +3100,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--pnp_prefilter_xyz_grid_size", type=int, default=4)
     parser.add_argument(
         "--match_filter_mode",
-        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "calibrated_coverage"],
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage"],
         default="",
     )
     parser.add_argument("--match_filter_calibrated_score_weight", type=float, default=0.0)
@@ -2522,12 +3110,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--match_filter_xyz_grid_size", type=int, default=8)
     parser.add_argument(
         "--sparse_match_filter_mode",
-        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "calibrated_coverage"],
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage"],
         default="",
     )
     parser.add_argument(
         "--dense_match_filter_mode",
-        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "calibrated_coverage"],
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage"],
         default="",
     )
     parser.add_argument("--sparse_match_filter_top_m", type=int, default=0)
@@ -2550,17 +3138,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def _summary(errors_te: list[float], errors_ae: list[float], inliers: list[int]) -> dict[str, float]:
-    te = np.asarray(errors_te, dtype=np.float64)
-    ae = np.asarray(errors_ae, dtype=np.float64)
-    return {
-        "median_te": float(np.median(te)) if len(te) else float("inf"),
-        "median_ae": float(np.median(ae)) if len(ae) else float("inf"),
-        "recall_5m_10d": float(((te <= 500.0) & (ae <= 10.0)).mean()) if len(te) else 0.0,
-        "recall_2m_5d": float(((te <= 200.0) & (ae <= 5.0)).mean()) if len(te) else 0.0,
-        "recall_5cm_5d": float(((te <= 5.0) & (ae <= 5.0)).mean()) if len(te) else 0.0,
-        "recall_2cm_2d": float(((te <= 2.0) & (ae <= 2.0)).mean()) if len(te) else 0.0,
-        "avg_inliers": float(np.mean(inliers)) if inliers else 0.0,
-    }
+    return pose_error_summary(errors_te, errors_ae, inliers)
 
 
 def main(args: Optional[argparse.Namespace] = None) -> None:
@@ -2616,7 +3194,11 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     ).to(device)
     _, dense_matcher_name = resolve_matchers(args)
     full_renderer = None
-    if args.dense_full_render or dense_matcher_name == "lightglue_rendered":
+    if (
+        args.dense_full_render
+        or dense_matcher_name in {"lightglue_rendered", "loftr_rendered"}
+        or int(getattr(args, "landmark_teacher_fusion_rendered_views", 0)) > 0
+    ):
         use_stdloc_render = dense_matcher_name == "stdloc_parity"
         full_renderer = FeatureFieldRenderer(
             image_height=train_args["image_height"],
@@ -2686,7 +3268,17 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     score_ref_poses = None
     score_ref_keypoint_maps = None
     score_ref_keypoint_descriptor_maps = None
-    if landmark_score_weights and int(args.landmark_score_ref_views) > 0:
+    teacher_fusion_poses = None
+    teacher_fusion_descriptor_maps = None
+    teacher_fusion_weight = float(getattr(args, "landmark_teacher_fusion_weight", 0.0))
+    teacher_fusion_views = int(getattr(args, "landmark_teacher_fusion_views", 0))
+    if teacher_fusion_views <= 0:
+        teacher_fusion_views = int(args.landmark_score_ref_views)
+    need_score_refs = (
+        (landmark_score_weights and int(args.landmark_score_ref_views) > 0)
+        or (teacher_fusion_weight > 0.0 and teacher_fusion_views > 0)
+    )
+    if need_score_refs:
         score_ref_dataset = CambridgeHybridDataset(
             scene_root=scene_root,
             cameras_json=train_args["cameras_json"],
@@ -2696,7 +3288,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             image_width=train_args["image_width"],
             max_frames=0,
         )
-        score_ref_poses = _score_ref_poses(score_ref_dataset, device, args.landmark_score_ref_views)
+        if landmark_score_weights and int(args.landmark_score_ref_views) > 0:
+            score_ref_poses = _score_ref_poses(score_ref_dataset, device, args.landmark_score_ref_views)
         if landmark_score_weights.get("keypoint_consensus", 0.0) > 0.0:
             score_ref_keypoint_maps, score_ref_keypoint_descriptor_maps = _score_ref_keypoint_maps(
                 score_ref_dataset,
@@ -2710,6 +3303,43 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 nms_radius=args.nms_radius,
                 include_descriptors=args.landmark_score_keypoint_consensus_descriptor_weight > 0.0,
             )
+        if teacher_fusion_weight > 0.0 and teacher_fusion_views > 0:
+            teacher_fusion_descriptor_maps = _score_ref_descriptor_maps(
+                score_ref_dataset,
+                teacher,
+                device,
+                max_views=teacher_fusion_views,
+                height=train_args["feature_height"],
+                width=train_args["feature_width"],
+            )
+            teacher_fusion_poses = _score_ref_poses(score_ref_dataset, device, teacher_fusion_views)
+        rendered_fusion_views = int(getattr(args, "landmark_teacher_fusion_rendered_views", 0))
+        if teacher_fusion_weight > 0.0 and rendered_fusion_views > 0:
+            rendered_base_poses = _score_ref_poses(score_ref_dataset, device, rendered_fusion_views)
+            rendered_poses = perturb_reference_poses_camera_frame(
+                rendered_base_poses,
+                translation_m=float(getattr(args, "landmark_teacher_fusion_rendered_trans_noise_cm", 0.0)) / 100.0,
+                rotation_deg=float(getattr(args, "landmark_teacher_fusion_rendered_rot_noise_deg", 0.0)),
+            )
+            rendered_descriptor_maps = _rendered_ref_descriptor_maps(
+                model,
+                full_renderer,
+                rendered_poses,
+                teacher,
+                device,
+                height=train_args["feature_height"],
+                width=train_args["feature_width"],
+            )
+            if rendered_descriptor_maps is not None:
+                if teacher_fusion_descriptor_maps is None:
+                    teacher_fusion_descriptor_maps = rendered_descriptor_maps
+                    teacher_fusion_poses = rendered_poses
+                else:
+                    teacher_fusion_descriptor_maps = torch.cat(
+                        [teacher_fusion_descriptor_maps, rendered_descriptor_maps],
+                        dim=0,
+                    )
+                    teacher_fusion_poses = torch.cat([teacher_fusion_poses, rendered_poses], dim=0)
 
     landmark_filter_reliability = None
     if args.landmark_source == "rendered":
@@ -2790,6 +3420,15 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             keypoint_consensus_radius=args.landmark_score_keypoint_consensus_radius,
             keypoint_consensus_descriptor_maps=score_ref_keypoint_descriptor_maps,
             keypoint_consensus_descriptor_weight=args.landmark_score_keypoint_consensus_descriptor_weight,
+            teacher_fusion_poses=teacher_fusion_poses,
+            teacher_fusion_descriptor_maps=teacher_fusion_descriptor_maps,
+            teacher_fusion_K=renderer.K.float(),
+            teacher_fusion_height=train_args["feature_height"],
+            teacher_fusion_width=train_args["feature_width"],
+            teacher_fusion_weight=args.landmark_teacher_fusion_weight,
+            teacher_fusion_chunk_size=args.landmark_teacher_fusion_chunk_size,
+            teacher_fusion_geometry_power=args.landmark_teacher_fusion_geometry_power,
+            teacher_fusion_centrality_power=args.landmark_teacher_fusion_centrality_power,
             calibrated_matchability=calibrated_matchability,
             calibrated_matchability_weight=args.landmark_score_calibrated_matchability_weight,
             return_aux=True,
@@ -2876,6 +3515,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "dense_te": dense_te_i,
                 "dense_ae": dense_ae_i,
                 "dense_inliers": int(result["dense_inliers"]),
+                "dense_rejections": int(result.get("dense_rejections", 0)),
+                "dense_rejection_stats": result.get("dense_rejection_stats", {}),
                 "localized": result["pose_w2c"] is not None,
                 "matchability": matchability_i,
             }

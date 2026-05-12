@@ -93,7 +93,17 @@ def test_merge_eval_shards_recomputes_summary_and_results(tmp_path):
 
 def test_reliability_eval_launcher_exposes_query_shards_argument():
     parser = build_argparser()
-    args = parser.parse_args(["--query_shards", "2", "--query_stride", "2"])
+    args = parser.parse_args(
+        [
+            "--query_shards",
+            "2",
+            "--query_stride",
+            "2",
+            "--calibrated_matchability_template",
+            "output/calib/{scene}/stdloc_bank_query_like.pt",
+        ]
+    )
 
     assert args.query_shards == 2
     assert args.query_stride == 2
+    assert args.calibrated_matchability_template == "output/calib/{scene}/stdloc_bank_query_like.pt"

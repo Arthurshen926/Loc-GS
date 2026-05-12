@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from loc_gs.localization.pose_metrics import POSE_RECALL_THRESHOLDS
 from loc_gs.scripts.select_cambridge_branch import (
     _branch_path,
     load_branch_manifest,
@@ -74,11 +75,11 @@ def evaluate_selected_branches(
     macro = {
         "mean_median_te": float(np.mean([row["median_te"] for row in rows])) if rows else float("inf"),
         "mean_median_ae": float(np.mean([row["median_ae"] for row in rows])) if rows else float("inf"),
-        "macro_recall_5cm_5d": float(np.mean([row["recall_5cm_5d"] for row in rows])) if rows else 0.0,
-        "macro_recall_2cm_2d": float(np.mean([row["recall_2cm_2d"] for row in rows])) if rows else 0.0,
         "queries": int(sum(row["queries"] for row in rows)),
         "localized": int(sum(row["localized"] for row in rows)),
     }
+    for key, _te_thr, _ae_thr in POSE_RECALL_THRESHOLDS:
+        macro[f"macro_{key}"] = float(np.mean([row[key] for row in rows])) if rows else 0.0
     return {
         "stage": stage,
         "selected_branch_file": str(selected_path),
@@ -91,13 +92,13 @@ def evaluate_selected_branches(
 def write_table_csv(summary: dict[str, Any], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    recall_fields = [key for key, _te_thr, _ae_thr in POSE_RECALL_THRESHOLDS]
     fieldnames = [
         "scene",
         "selected_branch",
         "median_te",
         "median_ae",
-        "recall_5cm_5d",
-        "recall_2cm_2d",
+        *recall_fields,
         "avg_inliers",
         "localized",
         "queries",
@@ -114,8 +115,7 @@ def write_table_csv(summary: dict[str, Any], path: str | Path) -> None:
                 "selected_branch": "",
                 "median_te": summary["macro"]["mean_median_te"],
                 "median_ae": summary["macro"]["mean_median_ae"],
-                "recall_5cm_5d": summary["macro"]["macro_recall_5cm_5d"],
-                "recall_2cm_2d": summary["macro"]["macro_recall_2cm_2d"],
+                **{key: summary["macro"][f"macro_{key}"] for key in recall_fields},
                 "avg_inliers": "",
                 "localized": summary["macro"]["localized"],
                 "queries": summary["macro"]["queries"],

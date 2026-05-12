@@ -5,22 +5,11 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-import numpy as np
+from loc_gs.localization.pose_metrics import pose_error_summary
 
 
 def _summary(errors_te: Iterable[float], errors_ae: Iterable[float], inliers: Iterable[int]) -> dict[str, float]:
-    te = np.asarray(list(errors_te), dtype=np.float64)
-    ae = np.asarray(list(errors_ae), dtype=np.float64)
-    inl = np.asarray(list(inliers), dtype=np.float64)
-    return {
-        "median_te": float(np.median(te)) if len(te) else float("inf"),
-        "median_ae": float(np.median(ae)) if len(ae) else float("inf"),
-        "recall_5m_10d": float(((te <= 500.0) & (ae <= 10.0)).mean()) if len(te) else 0.0,
-        "recall_2m_5d": float(((te <= 200.0) & (ae <= 5.0)).mean()) if len(te) else 0.0,
-        "recall_5cm_5d": float(((te <= 5.0) & (ae <= 5.0)).mean()) if len(te) else 0.0,
-        "recall_2cm_2d": float(((te <= 2.0) & (ae <= 2.0)).mean()) if len(te) else 0.0,
-        "avg_inliers": float(inl.mean()) if len(inl) else 0.0,
-    }
+    return pose_error_summary(errors_te, errors_ae, inliers)
 
 
 def merge_eval_dirs(input_dirs: list[Path], output_dir: Path) -> dict[str, object]:

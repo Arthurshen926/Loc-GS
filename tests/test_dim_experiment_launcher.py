@@ -174,3 +174,60 @@ def test_build_reliability_eval_command_can_use_covisibility_prosac_recipe():
     assert cmd[cmd.index("--match_filter_calibrated_score_weight") + 1] == "0.25"
     assert cmd[cmd.index("--match_filter_margin_weight") + 1] == "0.25"
     assert "--ply_loc_feature_weight" not in cmd
+
+
+def test_build_reliability_eval_command_can_attach_calibrated_matchability():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=1,
+        scene="OldHospital",
+        checkpoint="output/stdloc_hybrid/OldHospital_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/OldHospital_reliability_recipe/eval_reliability_covisibility_prosac",
+        recipe="covisibility_prosac",
+        calibrated_matchability_path="output/calib/OldHospital/stdloc_bank_query_like.pt",
+        calibrated_matchability_weight=0.4,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert cmd[cmd.index("--calibrated_matchability_path") + 1] == "output/calib/OldHospital/stdloc_bank_query_like.pt"
+    assert cmd[cmd.index("--landmark_score_calibrated_matchability_weight") + 1] == "0.4"
+
+
+def test_build_reliability_eval_command_can_use_covisibility_prosac_magsac_recipe():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=0,
+        scene="GreatCourt",
+        checkpoint="output/stdloc_hybrid/GreatCourt_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/GreatCourt_reliability_recipe/eval_reliability_covisibility_prosac_magsac",
+        recipe="covisibility_prosac_magsac",
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac_magsac"
+    assert cmd[cmd.index("--landmark_score_mode") + 1] == "matchability_prior"
+    assert cmd[cmd.index("--match_filter_calibrated_score_weight") + 1] == "0.25"
+    assert cmd[cmd.index("--match_filter_margin_weight") + 1] == "0.25"
+    assert "--dense_matcher" not in cmd
+
+
+def test_build_reliability_eval_command_can_use_covisibility_prosac_loftr_recipe():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=2,
+        scene="ShopFacade",
+        checkpoint="output/stdloc_hybrid/ShopFacade_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/ShopFacade_reliability_recipe/eval_reliability_covisibility_prosac_loftr",
+        recipe="covisibility_prosac_loftr",
+    )
+
+    dense_iters = [idx for idx, item in enumerate(cmd) if item == "--dense_iters"]
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac"
+    assert cmd[cmd.index("--landmark_score_mode") + 1] == "matchability_prior"
+    assert cmd[cmd.index("--dense_matcher") + 1] == "loftr_rendered"
+    assert cmd[cmd.index("--dim_pipeline") + 1] == "loftr"
+    assert cmd[dense_iters[-1] + 1] == "1"
+    assert cmd[cmd.index("--loftr_image_scale") + 1] == "1.0"
+    assert cmd[cmd.index("--loftr_min_confidence") + 1] == "0.0"
+    assert cmd[cmd.index("--loftr_max_matches") + 1] == "4096"
+    assert "--dense_match_filter_mode" not in cmd
+    assert "--dense_match_filter_top_m" not in cmd
