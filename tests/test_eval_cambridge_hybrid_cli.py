@@ -197,6 +197,8 @@ def test_eval_parser_exposes_stdloc_parity_options():
             "512",
             "--dense_pnp_max_matches",
             "4096",
+            "--oracle_match_order",
+            "sparse_reprojection",
         ]
     )
 
@@ -279,6 +281,7 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert args.pnp_prefilter == "image_xyz_grid"
     assert args.sparse_pnp_max_matches == 512
     assert args.dense_pnp_max_matches == 4096
+    assert args.oracle_match_order == "sparse_reprojection"
 
     config = effective_eval_config(args)
     assert config["sparse_reprojection_error"] == 2.0
@@ -314,6 +317,7 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert config["pnp_cluster_mode"] == "xyz_voxel"
     assert config["pnp_dense_verify_topk"] == 4
     assert config["pnp_hypothesis_min_score_gain"] == 5.0
+    assert config["oracle_match_order"] == "sparse_reprojection"
     assert config["hybrid_residual_alpha_max"] == 0.05
     assert config["match_filter_min_matches"] == 64
 
@@ -325,11 +329,62 @@ def test_eval_parser_defaults_are_baseline_preserving():
     assert args.landmark_source == "stdloc_detector"
     assert args.descriptor_source == "ply_loc"
     assert args.query_detector == "stdloc"
+    assert args.feedback_detector_path == ""
     assert args.query_feature_source == "original"
     assert args.matcher == "stdloc_parity"
 
     config = effective_eval_config(args)
     assert config["eval_split"] == "test"
+    assert config["oracle_match_order"] == "none"
+
+
+def test_eval_parser_accepts_feedback_query_detector():
+    args = build_argparser().parse_args(
+        [
+            "--checkpoint",
+            "output/model/latest.pth",
+            "--query_detector",
+            "feedback",
+            "--feedback_detector_path",
+            "output/model/feedback_detector.pth",
+            "--feedback_detector_full_res",
+        ]
+    )
+
+    assert args.query_detector == "feedback"
+    assert args.feedback_detector_path == "output/model/feedback_detector.pth"
+    assert args.feedback_detector_full_res is True
+
+
+def test_eval_parser_exposes_scene_matcher_single_path_rerank():
+    args = build_argparser().parse_args(
+        [
+            "--checkpoint",
+            "output/model/latest.pth",
+            "--scene_matcher_path",
+            "output/scenematch/ShopFacade/best.pt",
+            "--scene_matcher_weight",
+            "0.4",
+            "--scene_matcher_topk",
+            "4",
+            "--scene_matcher_logit_norm",
+            "zscore",
+            "--match_filter_query_score_weight",
+            "0.2",
+        ]
+    )
+
+    assert args.scene_matcher_path == "output/scenematch/ShopFacade/best.pt"
+    assert args.scene_matcher_weight == 0.4
+    assert args.scene_matcher_topk == 4
+    assert args.scene_matcher_logit_norm == "zscore"
+    assert args.match_filter_query_score_weight == 0.2
+    config = effective_eval_config(args)
+    assert config["scene_matcher_path"] == "output/scenematch/ShopFacade/best.pt"
+    assert config["scene_matcher_weight"] == 0.4
+    assert config["scene_matcher_topk"] == 4
+    assert config["scene_matcher_logit_norm"] == "zscore"
+    assert config["match_filter_query_score_weight"] == 0.2
 
 
 def test_detector_prior_for_all_gaussians_maps_sampled_scores_to_sampled_ids():
@@ -467,6 +522,30 @@ def test_sparse_matchability_metrics_reports_pose_information_for_four_points():
     assert np.isfinite(metrics["sparse_xyz_cov_logdet"])
     assert np.isfinite(metrics["sparse_all_pose_info_logdet"])
     assert metrics["sparse_inlier8_pose_info_min_eig"] > 0.0
+
+
+def test_oracle_reprojection_match_scores_rank_existing_matches_only():
+    K = np.eye(3, dtype=np.float64)
+    K[0, 0] = 100.0
+    K[1, 1] = 100.0
+    pose = np.eye(4, dtype=np.float64)
+    xyz = np.array(
+        [
+            [0.0, 0.0, 10.0],
+            [0.1, 0.0, 10.0],
+            [0.2, 0.0, -10.0],
+        ],
+        dtype=np.float64,
+    )
+    perfect = eval_cambridge_hybrid.project_world_points_yx_np(xyz[:2], pose, K)
+    query_yx = np.vstack([perfect[0], perfect[1] + np.array([3.0, 0.0]), [1.0, 1.0]])
+
+    scores, stats = eval_cambridge_hybrid.oracle_reprojection_match_scores_np(query_yx, xyz, pose, K)
+
+    assert scores[0] > scores[1]
+    assert scores[2] < -1.0e5
+    assert stats["oracle_valid_count"] == 2.0
+    assert stats["oracle_inlier2_ratio"] == 0.5
 
 
 def test_select_view_landmark_indices_enforces_spatial_diversity_before_topup():

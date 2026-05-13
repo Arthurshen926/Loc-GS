@@ -38,11 +38,33 @@ def test_calibration_parser_defaults_to_baseline_preserving_descriptor_and_rende
     )
 
     assert args.descriptor_source == "ply_loc"
+    assert args.query_detector == "stdloc"
+    assert args.feedback_detector_path == ""
     assert args.rendered_rehearsal_views == 8
     assert args.rendered_query_source == "rendered_rgb_teacher"
     assert args.rendered_rehearsal_pose_mode == "mixed"
     assert args.rendered_rehearsal_interpolation_min == -0.15
     assert args.rendered_rehearsal_interpolation_max == 1.15
+    assert args.scene_match_pair_sample_limit == 200000
+    assert args.scene_match_pair_train_fraction == 1.0
+
+
+def test_calibration_parser_accepts_feedback_detector():
+    args = build_argparser().parse_args(
+        [
+            "--checkpoint",
+            "output/stdloc_hybrid/KingsCollege/latest.pth",
+            "--query_detector",
+            "feedback",
+            "--feedback_detector_path",
+            "output/stdloc_hybrid/KingsCollege/feedback_detector.pth",
+            "--feedback_detector_full_res",
+        ]
+    )
+
+    assert args.query_detector == "feedback"
+    assert args.feedback_detector_path == "output/stdloc_hybrid/KingsCollege/feedback_detector.pth"
+    assert args.feedback_detector_full_res is True
 
 
 def test_query_like_calibration_launcher_uses_rendered_rgb_teacher():
@@ -53,6 +75,9 @@ def test_query_like_calibration_launcher_uses_rendered_rgb_teacher():
         output_path="output/calib/OldHospital/stdloc_bank.pt",
         max_views=32,
         rendered_rehearsal_views=64,
+        scene_match_pair_output_path="output/scenematch_pairs/OldHospital/pairs.pt",
+        scene_match_pair_sample_limit=1234,
+        scene_match_pair_train_fraction=0.5,
     )
 
     assert env["CUDA_VISIBLE_DEVICES"] == "2"
@@ -60,6 +85,30 @@ def test_query_like_calibration_launcher_uses_rendered_rgb_teacher():
     assert cmd[cmd.index("--rendered_rehearsal_views") + 1] == "64"
     assert cmd[cmd.index("--max_views") + 1] == "32"
     assert cmd[cmd.index("--rendered_rehearsal_pose_mode") + 1] == "mixed"
+    assert cmd[cmd.index("--scene_match_pair_output_path") + 1] == "output/scenematch_pairs/OldHospital/pairs.pt"
+    assert cmd[cmd.index("--scene_match_pair_sample_limit") + 1] == "1234"
+    assert cmd[cmd.index("--scene_match_pair_train_fraction") + 1] == "0.5"
+
+
+def test_query_like_calibration_launcher_can_follow_lff_feedback_distribution():
+    cmd, env = build_calibration_command(
+        gpu_id=1,
+        scene="ShopFacade",
+        checkpoint="output/stdloc_hybrid/ShopFacade_lff/latest.pth",
+        output_path="output/calib/ShopFacade/stdloc_bank.pt",
+        query_detector="feedback",
+        descriptor_source="hybrid_ply_gated_residual",
+        hybrid_residual_alpha_max=0.03,
+        rendered_query_source="feature_field",
+        feedback_detector_full_res=True,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert cmd[cmd.index("--query_detector") + 1] == "feedback"
+    assert "--feedback_detector_full_res" in cmd
+    assert cmd[cmd.index("--descriptor_source") + 1] == "hybrid_ply_gated_residual"
+    assert cmd[cmd.index("--hybrid_residual_alpha_max") + 1] == "0.03"
+    assert cmd[cmd.index("--rendered_query_source") + 1] == "feature_field"
 
 
 def test_accumulate_matchability_counts_marks_topk_projection_inliers():

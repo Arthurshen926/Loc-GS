@@ -11,6 +11,8 @@ from loc_gs.scripts.train_cambridge_hybrid import (
     make_feature_renderer_intrinsics,
     normalize_position_map,
     pair_candidate_indices,
+    pnp_feedback_detector_loss,
+    pnp_feedback_detector_target,
     perturb_pose_batch,
     pose_delta_trans_rot,
     resize_teacher_outputs_to_feature_grid,
@@ -200,6 +202,8 @@ def test_training_parser_defaults_to_conservative_reliability_recipe():
     assert args.pnp_weight == 0.1
     assert args.pnp_pose_loss_weight == 0.0
     assert args.pnp_reprojection_loss_weight == 0.0
+    assert args.localization_descriptor_source == "hybrid_ply_gated_residual"
+    assert args.hybrid_residual_alpha_max == 0.03
     assert args.same_view_match_weight == 1.0
     assert args.rehearsal_pose_mode == "perturb"
     assert args.rehearsal_pair_probability == 0.5
@@ -247,6 +251,15 @@ def test_training_parser_exposes_sota_extension_options():
             "0.05",
             "--ply_residual_reg_samples",
             "512",
+            "--pnp_feedback_detector_weight",
+            "0.07",
+            "--pnp_feedback_detector_sigma_px",
+            "1.5",
+            "--pnp_feedback_detector_init_path",
+            "output/stdloc/map/scene/detector/30000_detector.pth",
+            "--pnp_feedback_detector_anchor_weight",
+            "0.2",
+            "--pnp_feedback_detector_full_res",
             "--train_scaling",
             "--lr_scaling",
             "3e-7",
@@ -293,6 +306,11 @@ def test_training_parser_exposes_sota_extension_options():
     assert args.key_gaussian_isotropy_weight == 0.01
     assert args.ply_residual_reg_weight == 0.05
     assert args.ply_residual_reg_samples == 512
+    assert args.pnp_feedback_detector_weight == 0.07
+    assert args.pnp_feedback_detector_sigma_px == 1.5
+    assert args.pnp_feedback_detector_init_path == "output/stdloc/map/scene/detector/30000_detector.pth"
+    assert args.pnp_feedback_detector_anchor_weight == 0.2
+    assert args.pnp_feedback_detector_full_res is True
     assert args.train_scaling is True
     assert args.lr_scaling == 3e-7
     assert args.external_match_supervision_weight == 0.4
@@ -395,3 +413,32 @@ def test_locability_prior_alignment_loss_rewards_matching_prior():
     inverted_loss = locability_prior_alignment_loss(inverted, target)
 
     assert aligned_loss < inverted_loss
+
+
+def test_pnp_feedback_detector_target_marks_inliers_and_hard_negatives():
+    keypoints = torch.tensor([[[1.0, 1.0], [2.0, 3.0]]])
+    scores = torch.tensor([[0.9, 0.0]])
+    mask = torch.tensor([[True, True]])
+
+    target, weight = pnp_feedback_detector_target(keypoints, scores, mask, height=4, width=5, sigma_px=0.5)
+
+    assert target.shape == (1, 1, 4, 5)
+    assert weight.shape == target.shape
+    assert target[0, 0, 1, 1] > 0.8
+    assert target[0, 0, 2, 3] < 0.1
+    assert weight[0, 0, 2, 3] > 0.2
+
+
+def test_pnp_feedback_detector_loss_rewards_feedback_aligned_scores():
+    keypoints = torch.tensor([[[1.0, 1.0], [2.0, 2.0]]])
+    scores = torch.tensor([[1.0, 0.0]])
+    mask = torch.tensor([[True, True]])
+    good = torch.full((1, 1, 4, 4), 0.05)
+    bad = torch.full((1, 1, 4, 4), 0.05)
+    good[0, 0, 1, 1] = 0.95
+    bad[0, 0, 1, 1] = 0.05
+
+    good_loss = pnp_feedback_detector_loss(good, keypoints, scores, mask, sigma_px=0.5)
+    bad_loss = pnp_feedback_detector_loss(bad, keypoints, scores, mask, sigma_px=0.5)
+
+    assert good_loss < bad_loss

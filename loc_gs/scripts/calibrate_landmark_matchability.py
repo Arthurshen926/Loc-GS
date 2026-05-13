@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from loc_gs.data.cambridge_dataset import CambridgeHybridDataset
 from loc_gs.localization.stdloc_detector import StdlocKeypointDetector, extract_stdloc_detector_keypoints
+from loc_gs.localization.scene_matcher import label_scene_match_pairs
 from loc_gs.localization.stdloc_parity import apply_match_prior
 from loc_gs.losses.cross_view import projective_view_overlap
 from loc_gs.losses.localization_loss import project_world_to_image_yx
@@ -193,8 +194,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--visibility_alpha_threshold", type=float, default=0.05)
     parser.add_argument("--visibility_depth_abs_tolerance", type=float, default=0.25)
     parser.add_argument("--visibility_depth_rel_tolerance", type=float, default=0.02)
-    parser.add_argument("--query_detector", choices=["superpoint", "stdloc"], default="stdloc")
+    parser.add_argument("--query_detector", choices=["superpoint", "stdloc", "feedback"], default="stdloc")
     parser.add_argument("--query_feature_source", choices=["resized", "original"], default="original")
+    parser.add_argument("--feedback_detector_full_res", action="store_true")
     parser.add_argument("--query_keypoints", type=int, default=2048)
     parser.add_argument("--keypoint_threshold", type=float, default=0.015)
     parser.add_argument("--nms_radius", type=int, default=4)
@@ -206,6 +208,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--ply_loc_feature_weight", type=float, default=0.9)
     parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.05)
     parser.add_argument("--locability_prior_weight", type=float, default=0.05)
+    parser.add_argument("--scene_match_pair_output_path", default="")
+    parser.add_argument("--scene_match_pair_sample_limit", type=int, default=200000)
+    parser.add_argument(
+        "--scene_match_pair_train_fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of the pair cache reserved for real train-view labels; the rest is reserved for rendered rehearsal views.",
+    )
     parser.add_argument("--rendered_rehearsal_views", type=int, default=0)
     parser.add_argument(
         "--rendered_query_source",
@@ -227,6 +237,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--rendered_pair_jitter_rot_deg", type=float, default=5.0)
     parser.add_argument("--rendered_view_pair_min_overlap", type=float, default=0.15)
     parser.add_argument("--stdloc_detector_path", default="")
+    parser.add_argument("--feedback_detector_path", default="")
     parser.add_argument("--stdloc_detector_dir", default="")
     parser.add_argument("--device", default="cuda:0")
     return parser
@@ -271,6 +282,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     teacher.eval()
 
     stdloc_detector = None
+    feedback_detector = None
     if args.query_detector == "stdloc":
         detector_path = (
             Path(args.stdloc_detector_path)
@@ -280,6 +292,17 @@ def main(args: argparse.Namespace | None = None) -> None:
         stdloc_detector = StdlocKeypointDetector(in_dim=256).to(device)
         stdloc_detector.load_state_dict(torch.load(detector_path, map_location=device))
         stdloc_detector.eval()
+    elif args.query_detector == "feedback":
+        feedback_detector = StdlocKeypointDetector(in_dim=256).to(device)
+        if args.feedback_detector_path:
+            feedback_detector.load_state_dict(torch.load(Path(args.feedback_detector_path), map_location=device))
+        elif "feedback_detector_state_dict" in ckpt:
+            feedback_detector.load_state_dict(ckpt["feedback_detector_state_dict"], strict=False)
+        else:
+            raise FileNotFoundError(
+                "query_detector=feedback requires --feedback_detector_path or feedback_detector_state_dict in checkpoint"
+            )
+        feedback_detector.eval()
 
     detector_dir = (
         Path(args.stdloc_detector_dir)
@@ -347,24 +370,132 @@ def main(args: argparse.Namespace | None = None) -> None:
     tp = torch.zeros(landmark_xyz.shape[0], device=device, dtype=torch.float32)
     fp = torch.zeros_like(tp)
     landmark_desc = F.normalize(landmark_desc.float(), p=2, dim=-1)
+    collect_scene_pairs = bool(args.scene_match_pair_output_path)
+    pair_sample_limit = max(0, int(args.scene_match_pair_sample_limit))
+    train_pair_limit = int(round(pair_sample_limit * min(max(float(args.scene_match_pair_train_fraction), 0.0), 1.0)))
+    rendered_pair_limit = pair_sample_limit - train_pair_limit
+    pair_phase_limits = {"train": train_pair_limit, "rendered": rendered_pair_limit}
+    pair_phase_counts = {"train": 0, "rendered": 0}
+    pair_chunks: dict[str, list[torch.Tensor]] = {
+        "query_desc": [],
+        "landmark_desc": [],
+        "cosine": [],
+        "margin": [],
+        "query_score": [],
+        "landmark_prior": [],
+        "label": [],
+    }
+    pair_sample_count = 0
+
+    def should_collect_scene_match_pairs(phase: str) -> bool:
+        if not collect_scene_pairs:
+            return False
+        phase = str(phase)
+        if phase not in pair_phase_limits:
+            raise ValueError(f"unsupported scene match pair phase: {phase}")
+        phase_limit = int(pair_phase_limits[phase])
+        return phase_limit > 0 and int(pair_phase_counts[phase]) < phase_limit
+
+    def append_scene_match_pairs(
+        *,
+        phase: str,
+        query_desc_all: torch.Tensor,
+        q_ids: torch.Tensor,
+        lm_ids: torch.Tensor,
+        scores: torch.Tensor,
+        labels: torch.Tensor,
+        margins: torch.Tensor,
+        query_scores_all: torch.Tensor | None = None,
+    ) -> None:
+        nonlocal pair_sample_count
+        phase = str(phase)
+        if phase not in pair_phase_limits:
+            raise ValueError(f"unsupported scene match pair phase: {phase}")
+        phase_limit = int(pair_phase_limits[phase])
+        phase_count = int(pair_phase_counts[phase])
+        if not should_collect_scene_match_pairs(phase):
+            return
+        remaining = phase_limit - phase_count
+        labels = labels.bool().reshape(-1)
+        scores = scores.float().reshape(-1)
+        pos = torch.where(labels)[0]
+        neg = torch.where(~labels)[0]
+        selected = []
+        pos_budget = min(int(pos.numel()), max(1, remaining // 2)) if pos.numel() else 0
+        if pos_budget > 0:
+            selected.append(pos[torch.argsort(scores[pos], descending=True)[:pos_budget]])
+        neg_budget = min(int(neg.numel()), remaining - pos_budget)
+        if neg_budget > 0:
+            selected.append(neg[torch.argsort(scores[neg], descending=True)[:neg_budget]])
+        if not selected:
+            return
+        keep = torch.cat(selected, dim=0)
+        if keep.numel() > remaining:
+            keep = keep[:remaining]
+        pair_chunks["query_desc"].append(query_desc_all[q_ids[keep]].detach().cpu().half())
+        pair_chunks["landmark_desc"].append(landmark_desc[lm_ids[keep]].detach().cpu().half())
+        pair_chunks["cosine"].append(scores[keep].detach().cpu().float())
+        pair_chunks["margin"].append(margins[keep].detach().cpu().float())
+        if query_scores_all is None:
+            query_scores = torch.ones_like(scores)
+        else:
+            query_scores = query_scores_all.to(device=scores.device, dtype=scores.dtype).reshape(-1)[q_ids]
+        pair_chunks["query_score"].append(query_scores[keep].detach().cpu().float())
+        pair_chunks["landmark_prior"].append(landmark_prior[lm_ids[keep]].detach().cpu().float())
+        pair_chunks["label"].append(labels[keep].detach().cpu().float())
+        added = int(keep.numel())
+        pair_sample_count += added
+        pair_phase_counts[phase] = phase_count + added
 
     def accumulate_query(
         *,
+        phase: str,
         query_desc: torch.Tensor,
         query_yx: torch.Tensor,
         pose_w2c: torch.Tensor,
         K: torch.Tensor,
+        query_scores: torch.Tensor | None = None,
         depth_map: torch.Tensor | None = None,
         alpha_map: torch.Tensor | None = None,
     ) -> None:
         if query_desc.numel() == 0:
             return
-        corr = F.normalize(query_desc.float(), p=2, dim=-1) @ landmark_desc.T
-        corr = apply_match_prior(corr.unsqueeze(0), landmark_prior, weight=args.locability_prior_weight)[0]
+        raw_corr = F.normalize(query_desc.float(), p=2, dim=-1) @ landmark_desc.T
+        corr = apply_match_prior(raw_corr.unsqueeze(0), landmark_prior, weight=args.locability_prior_weight)[0]
         k = min(max(1, int(args.topk)), int(corr.shape[-1]))
         _vals, lm_topk = torch.topk(corr, k=k, dim=-1)
         q_ids = torch.arange(lm_topk.shape[0], device=device).view(-1, 1).expand_as(lm_topk).reshape(-1)
         lm_ids = lm_topk.reshape(-1)
+        top2 = torch.topk(corr, k=min(2, int(corr.shape[-1])), dim=-1).values
+        if top2.shape[-1] == 2:
+            margin_by_query = top2[:, 0] - top2[:, 1]
+        else:
+            margin_by_query = torch.zeros(corr.shape[0], device=device, dtype=corr.dtype)
+        if should_collect_scene_match_pairs(phase):
+            pair_labels = label_scene_match_pairs(
+                query_yx=query_yx,
+                landmark_xyz=landmark_xyz,
+                q_ids=q_ids,
+                lm_ids=lm_ids,
+                pose_w2c=pose_w2c.to(device),
+                K=K,
+                reprojection_threshold_px=args.reprojection_threshold_px,
+                depth_map=depth_map,
+                alpha_map=alpha_map,
+                depth_abs_tolerance=args.visibility_depth_abs_tolerance,
+                depth_rel_tolerance=args.visibility_depth_rel_tolerance,
+                alpha_threshold=args.visibility_alpha_threshold,
+            )
+            append_scene_match_pairs(
+                phase=phase,
+                query_desc_all=query_desc,
+                q_ids=q_ids,
+                lm_ids=lm_ids,
+                scores=raw_corr[q_ids, lm_ids],
+                labels=pair_labels,
+                margins=margin_by_query[q_ids],
+                query_scores_all=query_scores,
+            )
         accumulate_matchability_counts(
             tp,
             fp,
@@ -415,6 +546,31 @@ def main(args: argparse.Namespace | None = None) -> None:
             query_desc = sample_descriptors_bilinear(query_feature_map, keypoints)
             K = item["K"].to(device)
             query_for_label = keypoints + 0.5
+        elif args.query_detector == "feedback":
+            if feedback_detector is None:
+                raise RuntimeError("query_detector=feedback requires a detector")
+            if bool(args.feedback_detector_full_res):
+                full_h, full_w = calibration_query_canvas_hw(resized_rgb, teacher_rgb)
+                query_feature_map = F.normalize(upsample_feature_map(teacher_desc_raw, full_h, full_w), p=2, dim=0)
+                keypoints, _scores = extract_stdloc_detector_keypoints(
+                    query_feature_map,
+                    feedback_detector,
+                    max_keypoints=args.query_keypoints,
+                    nms_radius=args.nms_radius,
+                )
+                query_desc = sample_descriptors_bilinear(query_feature_map, keypoints)
+                K = item["K"].to(device)
+                query_for_label = keypoints + 0.5
+            else:
+                keypoints, _scores = extract_stdloc_detector_keypoints(
+                    teacher_desc,
+                    feedback_detector,
+                    max_keypoints=args.query_keypoints,
+                    nms_radius=args.nms_radius,
+                )
+                query_desc = sample_descriptors_bilinear(teacher_desc, keypoints)
+                K = item["feature_K"].to(device)
+                query_for_label = keypoints
         else:
             keypoints, _scores = extract_keypoints_from_detector_logits(
                 teacher_det,
@@ -439,10 +595,12 @@ def main(args: argparse.Namespace | None = None) -> None:
             depth_map = vis_render["depth_map"][0]
             alpha_map = vis_render["alpha_map"][0]
         accumulate_query(
+            phase="train",
             query_desc=query_desc,
             query_yx=query_for_label,
             pose_w2c=item["pose_w2c"].to(device),
             K=K,
+            query_scores=_scores,
             depth_map=depth_map,
             alpha_map=alpha_map,
         )
@@ -452,24 +610,40 @@ def main(args: argparse.Namespace | None = None) -> None:
     rendered_rot_deltas: list[float] = []
     rendered_overlap_values: list[float] = []
     if rendered_rehearsal_views > 0:
-        if args.query_detector != "stdloc":
-            raise ValueError("--rendered_rehearsal_views currently requires --query_detector stdloc")
-        if stdloc_detector is None:
+        if args.query_detector not in {"stdloc", "feedback"}:
+            raise ValueError("--rendered_rehearsal_views requires --query_detector stdloc or feedback")
+        if args.query_detector == "stdloc" and stdloc_detector is None:
             raise RuntimeError("rendered rehearsal calibration requires a STDLoc detector")
+        if args.query_detector == "feedback" and feedback_detector is None:
+            raise RuntimeError("rendered rehearsal calibration requires a feedback detector")
+        if args.query_detector == "feedback" and args.rendered_query_source != "feature_field":
+            raise ValueError("feedback rendered rehearsal currently requires --rendered_query_source feature_field")
         from loc_gs.rendering.feature_renderer import FeatureFieldRenderer
 
+        rendered_full_res = args.query_detector == "stdloc" or bool(args.feedback_detector_full_res)
+        rendered_height = train_args["image_height"] if rendered_full_res else train_args["feature_height"]
+        rendered_width = train_args["image_width"] if rendered_full_res else train_args["feature_width"]
+        rendered_fx = full_fx if rendered_full_res else feature_intr["fx"]
+        rendered_fy = full_fy if rendered_full_res else feature_intr["fy"]
+        rendered_cx = full_cx if rendered_full_res else feature_intr["cx"]
+        rendered_cy = full_cy if rendered_full_res else feature_intr["cy"]
         rendered_renderer = FeatureFieldRenderer(
-            image_height=train_args["image_height"],
-            image_width=train_args["image_width"],
-            fx=full_fx,
-            fy=full_fy,
-            cx=full_cx,
-            cy=full_cy,
+            image_height=rendered_height,
+            image_width=rendered_width,
+            fx=rendered_fx,
+            fy=rendered_fy,
+            cx=rendered_cx,
+            cy=rendered_cy,
             max_channels_per_chunk=32,
             far_plane=10000.0,
             packed=False,
             rasterize_mode="antialiased",
         ).to(device)
+        rendered_K = torch.tensor(
+            [[rendered_fx, 0.0, rendered_cx], [0.0, rendered_fy, rendered_cy], [0.0, 0.0, 1.0]],
+            device=device,
+            dtype=torch.float32,
+        )
         full_K = torch.tensor(
             [[full_fx, 0.0, full_cx], [0.0, full_fy, full_cy], [0.0, 0.0, 1.0]],
             device=device,
@@ -547,18 +721,23 @@ def main(args: argparse.Namespace | None = None) -> None:
                 query_feature_map = F.normalize(rendered["descriptor"][0].float(), p=2, dim=0)
                 depth_map = rendered["depth"][0]
                 alpha_map = rendered["alpha"][0]
+            rendered_detector = stdloc_detector if args.query_detector == "stdloc" else feedback_detector
+            if rendered_detector is None:
+                raise RuntimeError("rendered rehearsal detector is not loaded")
             keypoints, _scores = extract_stdloc_detector_keypoints(
                 query_feature_map,
-                stdloc_detector,
+                rendered_detector,
                 max_keypoints=args.query_keypoints,
                 nms_radius=args.nms_radius,
             )
             query_desc = sample_descriptors_bilinear(query_feature_map, keypoints)
             accumulate_query(
+                phase="rendered",
                 query_desc=query_desc,
-                query_yx=keypoints + 0.5,
+                query_yx=keypoints + (0.5 if rendered_full_res else 0.0),
                 pose_w2c=loc_pose[0],
-                K=full_K,
+                K=rendered_K,
+                query_scores=_scores,
                 depth_map=depth_map,
                 alpha_map=alpha_map,
             )
@@ -613,6 +792,7 @@ def main(args: argparse.Namespace | None = None) -> None:
             "reprojection_threshold_px": float(args.reprojection_threshold_px),
             "max_landmarks": int(args.max_landmarks),
             "query_detector": args.query_detector,
+            "feedback_detector_path": args.feedback_detector_path,
             "query_feature_source": args.query_feature_source,
             "visibility_check": args.visibility_check,
             "visibility_alpha_threshold": float(args.visibility_alpha_threshold),
@@ -622,6 +802,40 @@ def main(args: argparse.Namespace | None = None) -> None:
         },
     }
     write_matchability_calibration(payload, output_path)
+    if collect_scene_pairs:
+        pair_output_path = Path(args.scene_match_pair_output_path)
+        pair_output_path.parent.mkdir(parents=True, exist_ok=True)
+        pair_payload = {
+            key: torch.cat(chunks, dim=0) if chunks else torch.empty(0)
+            for key, chunks in pair_chunks.items()
+        }
+        pair_payload["metadata"] = {
+            "scene": scene,
+            "checkpoint": str(args.checkpoint),
+            "samples": int(pair_sample_count),
+            "sample_limit": int(pair_sample_limit),
+            "train_fraction": float(args.scene_match_pair_train_fraction),
+            "phase_limits": {key: int(value) for key, value in pair_phase_limits.items()},
+            "phase_counts": {key: int(value) for key, value in pair_phase_counts.items()},
+            "topk": int(args.topk),
+            "reprojection_threshold_px": float(args.reprojection_threshold_px),
+            "source": "calibrate_landmark_matchability",
+        }
+        torch.save(pair_payload, pair_output_path)
+        pair_sidecar = pair_output_path.with_suffix(".json")
+        positives = pair_payload["label"].float().sum() if pair_payload["label"].numel() else torch.tensor(0.0)
+        pair_sidecar.write_text(
+            json.dumps(
+                {
+                    **pair_payload["metadata"],
+                    "positives": float(positives.item()),
+                    "positive_ratio": float(positives.item() / max(1, int(pair_sample_count))),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"[calibrate] wrote {pair_output_path}")
     sidecar = output_path.with_suffix(".json")
     print(f"[calibrate] wrote {output_path}")
     print(f"[calibrate] wrote {sidecar}")

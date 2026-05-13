@@ -15,14 +15,34 @@ from loc_gs.scripts.launch_dim_matcher_experiments import query_gpus, select_idl
 
 
 EVAL_RECIPES = (
+    "covisibility_prosac",
+    "scene_matcher_prosac",
+    "scene_matcher_residual_prosac",
+    "scene_matcher_prosac_magsac",
+    "scene_matcher_coverage_prosac",
+    "lff_feedback_prosac",
+    "lff_residual_prosac",
+    "oracle_prosac",
     "protected",
     "learned_blend",
     "covisibility_select",
     "covisibility_soft_select",
-    "covisibility_prosac",
     "covisibility_prosac_magsac",
     "covisibility_prosac_loftr",
+    "lff_residual_prosac_loftr",
 )
+
+ARCHIVED_RECIPES = {
+    "protected",
+    "learned_blend",
+    "covisibility_select",
+    "covisibility_soft_select",
+    "covisibility_prosac_loftr",
+    "lff_residual_prosac_loftr",
+    "scene_matcher_prosac_magsac",
+    "scene_matcher_coverage_prosac",
+    "oracle_prosac",
+}
 
 
 @dataclass(frozen=True)
@@ -52,15 +72,46 @@ def build_eval_command(
     pnp_reprojection_error: float = 8.0,
     calibrated_matchability_path: str = "",
     calibrated_matchability_weight: float = 0.25,
+    scene_matcher_path: str = "",
+    scene_matcher_weight: float = 0.35,
+    scene_matcher_topk: int = 4,
+    scene_matcher_logit_norm: str = "none",
+    match_filter_query_score_weight: float = 0.0,
+    hybrid_residual_alpha_max: float = 0.03,
 ) -> tuple[list[str], dict[str, str]]:
     recipe = str(recipe)
     if recipe not in EVAL_RECIPES:
         raise ValueError(f"unsupported reliability eval recipe: {recipe}")
-    descriptor_source = "hybrid_ply_blend" if recipe == "learned_blend" else "ply_loc"
-    if recipe == "covisibility_prosac_magsac":
+    if recipe == "learned_blend":
+        descriptor_source = "hybrid_ply_blend"
+    elif recipe in {
+        "lff_feedback_prosac",
+        "lff_residual_prosac",
+        "lff_residual_prosac_loftr",
+        "scene_matcher_residual_prosac",
+    }:
+        descriptor_source = "hybrid_ply_gated_residual"
+    else:
+        descriptor_source = "ply_loc"
+    if recipe in {"covisibility_prosac_magsac", "scene_matcher_prosac_magsac"}:
         solver = "opencv_prosac_magsac"
     else:
-        solver = "opencv_prosac" if recipe in {"covisibility_prosac", "covisibility_prosac_loftr"} else "opencv"
+        solver = (
+            "opencv_prosac"
+            if recipe in {
+                "covisibility_prosac",
+                "scene_matcher_prosac",
+                "scene_matcher_residual_prosac",
+                "scene_matcher_prosac_magsac",
+                "scene_matcher_coverage_prosac",
+                "covisibility_prosac_loftr",
+                "lff_residual_prosac_loftr",
+                "lff_feedback_prosac",
+                "lff_residual_prosac",
+                "oracle_prosac",
+            }
+            else "opencv"
+        )
     cmd = [
         sys.executable,
         "-m",
@@ -80,7 +131,7 @@ def build_eval_command(
         "--descriptor_source",
         descriptor_source,
         "--query_detector",
-        "stdloc",
+        "feedback" if recipe == "lff_feedback_prosac" else "stdloc",
         "--query_feature_source",
         "original",
         "--matcher",
@@ -102,6 +153,15 @@ def build_eval_command(
     ]
     if recipe == "learned_blend":
         cmd.extend(["--ply_loc_feature_weight", "0.9"])
+    if recipe in {
+        "lff_feedback_prosac",
+        "lff_residual_prosac",
+        "lff_residual_prosac_loftr",
+        "scene_matcher_residual_prosac",
+    }:
+        cmd.extend(["--hybrid_residual_alpha_max", str(float(hybrid_residual_alpha_max))])
+    if recipe == "lff_feedback_prosac":
+        cmd.append("--feedback_detector_full_res")
     if recipe == "covisibility_select":
         cmd.extend(
             [
@@ -160,7 +220,19 @@ def build_eval_command(
                 "8",
             ]
         )
-    if recipe in {"covisibility_prosac", "covisibility_prosac_magsac", "covisibility_prosac_loftr"}:
+    if recipe in {
+        "covisibility_prosac",
+        "scene_matcher_prosac",
+        "scene_matcher_residual_prosac",
+        "scene_matcher_prosac_magsac",
+        "scene_matcher_coverage_prosac",
+        "covisibility_prosac_magsac",
+        "covisibility_prosac_loftr",
+        "lff_residual_prosac_loftr",
+        "lff_feedback_prosac",
+        "lff_residual_prosac",
+        "oracle_prosac",
+    }:
         cmd.extend(
             [
                 "--landmark_candidate_source",
@@ -189,6 +261,43 @@ def build_eval_command(
                 "0.25",
             ]
         )
+        if float(match_filter_query_score_weight) != 0.0:
+            cmd.extend(["--match_filter_query_score_weight", str(float(match_filter_query_score_weight))])
+    if recipe == "scene_matcher_coverage_prosac":
+        cmd.extend(
+            [
+                "--sparse_match_filter_mode",
+                "calibrated_coverage",
+                "--sparse_match_filter_top_m",
+                "2048",
+                "--dense_match_filter_mode",
+                "calibrated_coverage",
+                "--dense_match_filter_top_m",
+                "2048",
+                "--match_filter_min_matches",
+                "1024",
+            ]
+        )
+    if recipe in {
+        "scene_matcher_prosac",
+        "scene_matcher_residual_prosac",
+        "scene_matcher_prosac_magsac",
+        "scene_matcher_coverage_prosac",
+    }:
+        if not scene_matcher_path:
+            raise ValueError("scene_matcher_prosac requires --scene_matcher_template or scene_matcher_path")
+        cmd.extend(
+            [
+                "--scene_matcher_path",
+                scene_matcher_path,
+                "--scene_matcher_weight",
+                str(float(scene_matcher_weight)),
+                "--scene_matcher_topk",
+                str(int(scene_matcher_topk)),
+            ]
+        )
+        if str(scene_matcher_logit_norm) != "none":
+            cmd.extend(["--scene_matcher_logit_norm", str(scene_matcher_logit_norm)])
     if calibrated_matchability_path:
         cmd.extend(
             [
@@ -198,7 +307,7 @@ def build_eval_command(
                 str(float(calibrated_matchability_weight)),
             ]
         )
-    if recipe == "covisibility_prosac_loftr":
+    if recipe in {"covisibility_prosac_loftr", "lff_residual_prosac_loftr"}:
         cmd.extend(
             [
                 "--dense_matcher",
@@ -215,6 +324,8 @@ def build_eval_command(
                 "4096",
             ]
         )
+    if recipe == "oracle_prosac":
+        cmd.extend(["--oracle_match_order", "sparse_reprojection"])
     if max_queries > 0:
         cmd.extend(["--max_queries", str(int(max_queries))])
     if query_stride != 1:
@@ -251,7 +362,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint_name", default="latest.pth")
     parser.add_argument("--checkpoint_template", default="")
     parser.add_argument("--output_suffix", default="eval_reliability")
-    parser.add_argument("--recipes", default="protected,learned_blend")
+    parser.add_argument("--recipes", default="covisibility_prosac")
     parser.add_argument("--eval_split", choices=["train", "test"], default="test")
     parser.add_argument("--max_queries", type=int, default=0)
     parser.add_argument("--query_stride", type=int, default=1)
@@ -264,6 +375,16 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Optional per-scene template such as output/calib/{scene}/stdloc_bank_query_like.pt.",
     )
     parser.add_argument("--calibrated_matchability_weight", type=float, default=0.25)
+    parser.add_argument(
+        "--scene_matcher_template",
+        default="",
+        help="Per-scene template for SceneMatchNet checkpoints, e.g. output/scenematch/{scene}/best.pt.",
+    )
+    parser.add_argument("--scene_matcher_weight", type=float, default=0.35)
+    parser.add_argument("--scene_matcher_topk", type=int, default=4)
+    parser.add_argument("--scene_matcher_logit_norm", choices=["none", "center", "zscore"], default="none")
+    parser.add_argument("--match_filter_query_score_weight", type=float, default=0.0)
+    parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.03)
     parser.add_argument("--gpus", default="")
     parser.add_argument("--max_memory_used_mb", type=int, default=1000)
     parser.add_argument("--max_utilization", type=int, default=10)
@@ -274,7 +395,7 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argparser().parse_args()
     scenes = parse_csv(args.scenes) or list(DEFAULT_SCENES)
-    recipes = parse_csv(args.recipes) or ["protected"]
+    recipes = parse_csv(args.recipes) or ["covisibility_prosac"]
     for recipe in recipes:
         if recipe not in EVAL_RECIPES:
             raise ValueError(f"unsupported recipe {recipe}; expected one of {', '.join(EVAL_RECIPES)}")
@@ -336,8 +457,22 @@ def main() -> None:
             if args.calibrated_matchability_template
             else ""
         )
+        scene_matcher_path = (
+            args.scene_matcher_template.format(scene=job.scene, tag=args.tag, recipe=job.recipe)
+            if args.scene_matcher_template
+            else ""
+        )
         if calibrated_path and not args.dry_run and not Path(calibrated_path).exists():
             raise FileNotFoundError(f"calibrated matchability not found for {job.scene}: {calibrated_path}")
+        if job.recipe in {
+            "scene_matcher_prosac",
+            "scene_matcher_residual_prosac",
+            "scene_matcher_prosac_magsac",
+            "scene_matcher_coverage_prosac",
+        } and not scene_matcher_path:
+            raise ValueError("scene_matcher_prosac requires --scene_matcher_template")
+        if scene_matcher_path and not args.dry_run and not Path(scene_matcher_path).exists():
+            raise FileNotFoundError(f"scene matcher checkpoint not found for {job.scene}: {scene_matcher_path}")
         cmd, env = build_eval_command(
             gpu_id=gpu_id,
             scene=job.scene,
@@ -351,6 +486,12 @@ def main() -> None:
             pnp_reprojection_error=args.pnp_reprojection_error,
             calibrated_matchability_path=calibrated_path,
             calibrated_matchability_weight=args.calibrated_matchability_weight,
+            scene_matcher_path=scene_matcher_path,
+            scene_matcher_weight=args.scene_matcher_weight,
+            scene_matcher_topk=args.scene_matcher_topk,
+            scene_matcher_logit_norm=args.scene_matcher_logit_norm,
+            match_filter_query_score_weight=args.match_filter_query_score_weight,
+            hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
         )
         print(" ".join(cmd), f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
         if args.dry_run:

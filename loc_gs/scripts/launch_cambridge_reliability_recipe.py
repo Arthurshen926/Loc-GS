@@ -30,6 +30,10 @@ def build_train_command(
     max_train_batches: int = 0,
     image_width: int = 640,
     image_height: int = 360,
+    localization_batch_size: int = 0,
+    feedback_detector_init_from_stdloc: bool = True,
+    feedback_detector_anchor_weight: float = 0.1,
+    feedback_detector_full_res: bool = True,
     amp: bool = True,
     superpoint_weights: str = "third_party/stdloc/encoders/sp_encoder/weights/superpoint_v1.pth",
 ) -> tuple[list[str], dict[str, str]]:
@@ -65,6 +69,20 @@ def build_train_command(
         "0.1",
         "--pnp_locability_target_prior_weight",
         "0.5",
+        "--localization_batch_size",
+        str(int(localization_batch_size)),
+        "--localization_descriptor_source",
+        "hybrid_ply_gated_residual",
+        "--hybrid_residual_alpha_max",
+        "0.03",
+        "--pnp_feedback_detector_weight",
+        "0.05",
+        "--pnp_feedback_detector_start_epoch",
+        "1",
+        "--pnp_feedback_detector_warmup_epochs",
+        "2",
+        "--pnp_feedback_detector_sigma_px",
+        "1.0",
         "--same_view_match_weight",
         "1.0",
         "--locability_prior_target_weight",
@@ -98,6 +116,12 @@ def build_train_command(
         "--device",
         "cuda:0",
     ]
+    if feedback_detector_init_from_stdloc:
+        cmd.append("--pnp_feedback_detector_init_from_stdloc")
+    if float(feedback_detector_anchor_weight) > 0.0:
+        cmd.extend(["--pnp_feedback_detector_anchor_weight", str(float(feedback_detector_anchor_weight))])
+    if feedback_detector_full_res:
+        cmd.append("--pnp_feedback_detector_full_res")
     if amp:
         cmd.append("--amp")
     if max_frames > 0:
@@ -133,6 +157,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--image_height", type=int, default=360)
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--max_train_batches", type=int, default=0)
+    parser.add_argument("--localization_batch_size", type=int, default=0)
+    parser.add_argument("--no_feedback_detector_init_from_stdloc", action="store_true")
+    parser.add_argument("--feedback_detector_anchor_weight", type=float, default=0.1)
+    parser.add_argument("--no_feedback_detector_full_res", action="store_true")
     parser.add_argument("--gpus", default="")
     parser.add_argument("--max_memory_used_mb", type=int, default=1000)
     parser.add_argument("--max_utilization", type=int, default=10)
@@ -165,6 +193,10 @@ def main() -> None:
             max_train_batches=args.max_train_batches,
             image_width=args.image_width,
             image_height=args.image_height,
+            localization_batch_size=args.localization_batch_size,
+            feedback_detector_init_from_stdloc=not args.no_feedback_detector_init_from_stdloc,
+            feedback_detector_anchor_weight=args.feedback_detector_anchor_weight,
+            feedback_detector_full_res=not args.no_feedback_detector_full_res,
             amp=not args.no_amp,
             superpoint_weights=args.superpoint_weights,
         )

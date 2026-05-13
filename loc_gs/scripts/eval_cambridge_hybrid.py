@@ -40,6 +40,11 @@ from loc_gs.localization.matcher_registry import (
 )
 from loc_gs.localization.pose_metrics import pose_error_summary
 from loc_gs.localization.rendered_keypoints import select_rendered_keypoints
+from loc_gs.localization.scene_matcher import (
+    best_pair_per_query_indices,
+    load_scene_matcher,
+    score_scene_match_pairs,
+)
 from loc_gs.localization.stdloc_parity import (
     apply_match_prior,
     coarse_to_fine_dense_matches,
@@ -623,6 +628,9 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
         "eval_split": getattr(args, "eval_split", "test"),
         "poselib_refine": bool(args.poselib_refine),
         "query_keypoints": int(args.query_keypoints),
+        "query_detector": str(getattr(args, "query_detector", "superpoint")),
+        "feedback_detector_path": str(getattr(args, "feedback_detector_path", "")),
+        "feedback_detector_full_res": bool(getattr(args, "feedback_detector_full_res", False)),
         "keypoint_threshold": float(args.keypoint_threshold),
         "nms_radius": int(args.nms_radius),
         "sparse_match_threshold": float(args.sparse_match_threshold),
@@ -707,9 +715,14 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
             getattr(args, "landmark_teacher_fusion_rendered_rot_noise_deg", 0.0)
         ),
         "match_calibrated_prior_weight": float(getattr(args, "match_calibrated_prior_weight", 0.0)),
+        "scene_matcher_path": str(getattr(args, "scene_matcher_path", "")),
+        "scene_matcher_weight": float(getattr(args, "scene_matcher_weight", 0.0)),
+        "scene_matcher_topk": int(getattr(args, "scene_matcher_topk", 1)),
+        "scene_matcher_logit_norm": str(getattr(args, "scene_matcher_logit_norm", "none")),
         "match_filter_mode": str(getattr(args, "match_filter_mode", "")),
         "match_filter_calibrated_score_weight": float(getattr(args, "match_filter_calibrated_score_weight", 0.0)),
         "match_filter_margin_weight": float(getattr(args, "match_filter_margin_weight", 0.0)),
+        "match_filter_query_score_weight": float(getattr(args, "match_filter_query_score_weight", 0.0)),
         "match_filter_top_m": int(getattr(args, "match_filter_top_m", 0)),
         "match_filter_image_grid_size": int(getattr(args, "match_filter_image_grid_size", 8)),
         "match_filter_xyz_grid_size": int(getattr(args, "match_filter_xyz_grid_size", 8)),
@@ -725,6 +738,7 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
         "pnp_cluster_grid_size": int(getattr(args, "pnp_cluster_grid_size", 4)),
         "pnp_dense_verify_topk": int(getattr(args, "pnp_dense_verify_topk", 1)),
         "pnp_hypothesis_min_score_gain": float(getattr(args, "pnp_hypothesis_min_score_gain", 0.0)),
+        "oracle_match_order": str(getattr(args, "oracle_match_order", "none")),
         "hybrid_residual_alpha_max": float(getattr(args, "hybrid_residual_alpha_max", 0.05)),
     }
 
@@ -873,6 +887,46 @@ def sparse_matchability_metrics(
             out["sparse_top2_margin_mean"] = float(np.mean(margin_arr))
             out["sparse_top2_margin_median"] = float(np.median(margin_arr))
     return out
+
+
+def oracle_reprojection_match_scores_np(
+    query_yx: np.ndarray,
+    points_world: np.ndarray,
+    pose_w2c: np.ndarray,
+    K: np.ndarray,
+    *,
+    invalid_score: float = -1.0e6,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Score existing sparse correspondences by their GT reprojection error.
+
+    This analysis-only upper bound does not create new matches. It only asks
+    whether a better reliability selector could recover a pose from the
+    candidate pool already produced by the feature field.
+    """
+    query = np.asarray(query_yx, dtype=np.float64).reshape(-1, 2)
+    points = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+    count = min(query.shape[0], points.shape[0])
+    scores = np.full((query.shape[0],), float(invalid_score), dtype=np.float32)
+    stats: dict[str, float] = {"oracle_match_count": float(count), "oracle_valid_count": 0.0}
+    if count == 0:
+        return scores, stats
+
+    pose = np.asarray(pose_w2c, dtype=np.float64)
+    points_count = points[:count]
+    points_cam = points_count @ pose[:3, :3].T + pose[:3, 3][None, :]
+    projected = project_world_points_yx_np(points_count, pose, K)
+    errors = np.linalg.norm(projected - query[:count], axis=-1)
+    valid = np.isfinite(errors) & np.isfinite(points_cam).all(axis=1) & (points_cam[:, 2] > 1.0e-9)
+    stats["oracle_valid_count"] = float(valid.sum())
+    if valid.any():
+        valid_errors = errors[valid]
+        valid_ids = np.where(valid)[0]
+        scores[valid_ids] = (-valid_errors).astype(np.float32)
+        stats["oracle_reproj_median_px"] = float(np.median(valid_errors))
+        stats["oracle_reproj_mean_px"] = float(np.mean(valid_errors))
+        stats["oracle_inlier2_ratio"] = float(np.mean(valid_errors <= 2.0))
+        stats["oracle_inlier8_ratio"] = float(np.mean(valid_errors <= 8.0))
+    return scores, stats
 
 
 def _balanced_topk_by_coords(
@@ -1506,6 +1560,25 @@ def _match_filter_scores(
             m = m - m.mean()
             out = out + float(margin_weight) * m
     return out
+
+
+def _normalize_scene_match_logits(logits: torch.Tensor, mode: str = "none") -> torch.Tensor:
+    mode = str(mode or "none").lower()
+    if mode == "none" or logits.numel() == 0:
+        return logits.float()
+    out = logits.float().clone()
+    finite = torch.isfinite(out)
+    if int(finite.sum().item()) == 0:
+        return out
+    values = out[finite]
+    centered = values - values.mean()
+    if mode == "center":
+        out[finite] = centered
+        return out
+    if mode == "zscore":
+        out[finite] = centered / values.std(unbiased=False).clamp_min(1e-6)
+        return out
+    raise ValueError(f"unsupported scene matcher logit norm: {mode}")
 
 
 def sparse_reprojection_consistency_stats(
@@ -2167,8 +2240,10 @@ def localize_one(
     teacher_cache: SuperPointTeacherCache | None = None,
     full_renderer=None,
     stdloc_detector: StdlocKeypointDetector | None = None,
+    feedback_detector: StdlocKeypointDetector | None = None,
     teacher_rgb: torch.Tensor | None = None,
     landmark_filter_reliability: torch.Tensor | None = None,
+    gt_pose_w2c: np.ndarray | None = None,
 ) -> dict[str, object]:
     if hasattr(renderer, "K"):
         renderer.K.copy_(K_feature.to(device=renderer.K.device, dtype=renderer.K.dtype))
@@ -2217,6 +2292,35 @@ def localize_one(
         sparse_K = K_full
         sparse_query_offset = 0.5
         query_keypoints_are_full_res = True
+    elif query_detector == "feedback":
+        if feedback_detector is None:
+            raise ValueError("query_detector=feedback requires a feedback detector in the Loc-GS checkpoint")
+        if bool(getattr(args, "feedback_detector_full_res", False)):
+            full_h = int(rgb.shape[-2])
+            full_w = int(rgb.shape[-1])
+            query_feature_map = F.normalize(
+                upsample_feature_map(teacher_desc_raw, full_h, full_w),
+                p=2,
+                dim=0,
+            )
+            keypoints, kp_scores = extract_stdloc_detector_keypoints(
+                query_feature_map,
+                feedback_detector,
+                max_keypoints=args.query_keypoints,
+                nms_radius=args.nms_radius,
+            )
+            query_desc = sample_descriptors_bilinear(query_feature_map, keypoints)
+            sparse_K = K_full
+            sparse_query_offset = 0.5
+            query_keypoints_are_full_res = True
+        else:
+            keypoints, kp_scores = extract_stdloc_detector_keypoints(
+                teacher_desc,
+                feedback_detector,
+                max_keypoints=args.query_keypoints,
+                nms_radius=args.nms_radius,
+            )
+            query_desc = sample_descriptors_bilinear(teacher_desc, keypoints)
     else:
         keypoints, kp_scores = extract_keypoints_from_detector_logits(
             teacher_det,
@@ -2259,6 +2363,14 @@ def localize_one(
     ply_loc_feature_weight = float(getattr(args, "ply_loc_feature_weight", 0.5))
     match_filter_margin_weight = float(getattr(args, "match_filter_margin_weight", 0.0))
     match_calibrated_prior_weight = float(getattr(args, "match_calibrated_prior_weight", 0.0))
+    scene_matcher = getattr(args, "scene_matcher_model", None)
+    scene_matcher_weight = float(getattr(args, "scene_matcher_weight", 0.0))
+    use_scene_matcher = scene_matcher is not None and scene_matcher_weight != 0.0
+    sparse_candidate_topk = (
+        max(1, int(getattr(args, "scene_matcher_topk", 1)))
+        if use_scene_matcher and not bool(getattr(args, "mnn", False))
+        else 1
+    )
     sparse_reprojection_error = (
         args.sparse_reprojection_error
         if args.sparse_reprojection_error is not None
@@ -2288,14 +2400,18 @@ def localize_one(
             dual_softmax_temp=args.sparse_dual_softmax_temp,
             use_dual_softmax=args.sparse_dual_softmax,
             use_mnn=args.mnn,
-            topk=1,
+            topk=sparse_candidate_topk,
             second_best_margin=sparse_margin,
         )
     elif sparse_matcher in {"lightglue", "dim"}:
         # LightGlue needs two 2D feature sets.  The global 3D landmark bank has no
         # query-view 2D layout, so sparse initialization remains top-k and the
         # learned matcher is applied in the rendered refinement stage.
-        if getattr(args, "matchability_diagnostics", False) or match_filter_margin_weight != 0.0:
+        if (
+            getattr(args, "matchability_diagnostics", False)
+            or match_filter_margin_weight != 0.0
+            or use_scene_matcher
+        ):
             sparse_diag_corr = (
                 F.normalize(query_desc.float(), dim=-1)
                 @ F.normalize(landmark_desc.float(), dim=-1).T
@@ -2326,11 +2442,15 @@ def localize_one(
             dual_softmax_temp=args.sparse_dual_softmax_temp,
             use_dual_softmax=False,
             use_mnn=False,
-            topk=1,
+            topk=sparse_candidate_topk,
             second_best_margin=sparse_margin,
         )
     else:
-        if getattr(args, "matchability_diagnostics", False) or match_filter_margin_weight != 0.0:
+        if (
+            getattr(args, "matchability_diagnostics", False)
+            or match_filter_margin_weight != 0.0
+            or use_scene_matcher
+        ):
             sparse_diag_corr = (
                 F.normalize(query_desc.float(), dim=-1)
                 @ F.normalize(landmark_desc.float(), dim=-1).T
@@ -2361,17 +2481,56 @@ def localize_one(
             dual_softmax_temp=args.sparse_dual_softmax_temp,
             use_dual_softmax=False,
             use_mnn=False,
-            topk=1,
+            topk=sparse_candidate_topk,
             second_best_margin=sparse_margin,
         )
     if (
-        (getattr(args, "matchability_diagnostics", False) or match_filter_margin_weight != 0.0)
+        (getattr(args, "matchability_diagnostics", False) or match_filter_margin_weight != 0.0 or use_scene_matcher)
         and sparse_diag_corr is not None
         and sparse_diag_corr.shape[1] >= 2
         and q_ids.numel() > 0
     ):
         top2 = torch.topk(sparse_diag_corr, k=2, dim=-1).values
         sparse_margin_by_query = (top2[:, 0] - top2[:, 1])[q_ids]
+    sparse_scene_match_logits = None
+    if use_scene_matcher and q_ids.numel() > 0:
+        pair_prior = landmark_prior[lm_ids] if landmark_prior is not None else None
+        pair_calibrated = (
+            calibrated_sparse_reliability[lm_ids]
+            if calibrated_sparse_reliability is not None
+            else None
+        )
+        raw_pair_cosine = (
+            F.normalize(query_desc[q_ids].float(), p=2, dim=-1)
+            * F.normalize(landmark_desc[lm_ids].float(), p=2, dim=-1)
+        ).sum(dim=-1)
+        scene_extra = None
+        matcher_scalar_dim = int(getattr(scene_matcher, "config", {}).get("scalar_dim", 4))
+        if matcher_scalar_dim > 4:
+            scene_extra = kp_scores[q_ids].float().reshape(-1, 1)
+        sparse_scene_match_logits = score_scene_match_pairs(
+            scene_matcher,
+            query_desc[q_ids],
+            landmark_desc[lm_ids],
+            cosine=raw_pair_cosine,
+            margin=sparse_margin_by_query,
+            landmark_prior=pair_prior,
+            calibrated_prior=pair_calibrated,
+            extra_scalar_features=scene_extra,
+        )
+        sparse_scene_match_logits = _normalize_scene_match_logits(
+            sparse_scene_match_logits,
+            getattr(args, "scene_matcher_logit_norm", "none"),
+        )
+        _scores = _scores.float() + scene_matcher_weight * sparse_scene_match_logits
+        if sparse_candidate_topk > 1:
+            best = best_pair_per_query_indices(q_ids, _scores, num_queries=query_desc.shape[0])
+            q_ids = q_ids[best]
+            lm_ids = lm_ids[best]
+            _scores = _scores[best]
+            sparse_scene_match_logits = sparse_scene_match_logits[best]
+            if sparse_margin_by_query is not None:
+                sparse_margin_by_query = sparse_margin_by_query[best]
     sparse_reliability = None
     if lm_ids.numel() > 0:
         reliability_source = landmark_filter_reliability if landmark_filter_reliability is not None else landmark_prior
@@ -2383,6 +2542,13 @@ def localize_one(
         margin=sparse_margin_by_query,
         margin_weight=match_filter_margin_weight,
     )
+    query_score_weight = float(getattr(args, "match_filter_query_score_weight", 0.0))
+    if query_score_weight != 0.0 and kp_scores is not None and q_ids.numel() > 0:
+        sparse_query_scores = kp_scores[q_ids].to(device=sparse_filter_scores.device, dtype=sparse_filter_scores.dtype)
+        if sparse_query_scores.numel() == sparse_filter_scores.numel():
+            sparse_query_scores = sparse_query_scores.reshape(-1)
+            sparse_query_scores = sparse_query_scores - sparse_query_scores.mean()
+            sparse_filter_scores = sparse_filter_scores + query_score_weight * sparse_query_scores
     sparse_keep = select_pnp_match_indices(
         keypoints[q_ids] + sparse_query_offset,
         landmark_xyz[lm_ids],
@@ -2403,12 +2569,30 @@ def localize_one(
         if sparse_margin_by_query is not None:
             sparse_margin_by_query = sparse_margin_by_query[sparse_keep]
     sparse_query_for_pnp = keypoints[q_ids] + sparse_query_offset
+    sparse_pnp_scores = sparse_filter_scores
+    oracle_match_stats = None
+    oracle_match_order = str(getattr(args, "oracle_match_order", "none"))
+    if oracle_match_order == "sparse_reprojection" and q_ids.numel() > 0:
+        if gt_pose_w2c is None:
+            raise ValueError("oracle_match_order=sparse_reprojection requires gt_pose_w2c")
+        oracle_scores_np, oracle_match_stats = oracle_reprojection_match_scores_np(
+            sparse_query_for_pnp.detach().cpu().numpy(),
+            landmark_xyz[lm_ids].detach().cpu().numpy(),
+            gt_pose_w2c,
+            sparse_K.detach().cpu().numpy(),
+        )
+        sparse_pnp_scores = torch.from_numpy(oracle_scores_np).to(
+            device=sparse_filter_scores.device,
+            dtype=sparse_filter_scores.dtype,
+        )
+    elif oracle_match_order != "none":
+        raise ValueError(f"unsupported oracle_match_order: {oracle_match_order}")
     if int(getattr(args, "pnp_hypotheses", 1)) > 1:
         sparse_hypotheses = generate_pnp_hypotheses(
             landmark_xyz[lm_ids],
             sparse_query_for_pnp,
             sparse_K,
-            scores=sparse_filter_scores,
+            scores=sparse_pnp_scores,
             max_hypotheses=int(getattr(args, "pnp_hypotheses", 1)),
             cluster_mode=str(getattr(args, "pnp_cluster_mode", "none")),
             cluster_grid_size=int(getattr(args, "pnp_cluster_grid_size", 4)),
@@ -2490,10 +2674,12 @@ def localize_one(
             min_iterations=sparse_pnp_min_iterations,
             solver=args.solver,
             refine_poselib=refine_poselib,
-            match_scores=sparse_filter_scores.detach().cpu().numpy(),
+            match_scores=sparse_pnp_scores.detach().cpu().numpy(),
         )
     if sparse_pose is None:
         out = {"pose_w2c": None, "sparse_pose_w2c": None, "sparse_inliers": 0, "dense_inliers": 0}
+        if oracle_match_stats is not None:
+            out["oracle_match_stats"] = oracle_match_stats
         if getattr(args, "matchability_diagnostics", False):
             out["sparse_match_diagnostics"] = {
                 "query_yx": (keypoints[q_ids] + sparse_query_offset).detach().cpu().numpy(),
@@ -2502,6 +2688,9 @@ def localize_one(
                 "margins": None
                 if sparse_margin_by_query is None
                 else sparse_margin_by_query.detach().cpu().numpy(),
+                "scene_match_logits": None
+                if sparse_scene_match_logits is None
+                else sparse_scene_match_logits.detach().cpu().numpy(),
                 "coord_space": "full" if query_keypoints_are_full_res else "feature",
             }
         return out
@@ -2956,6 +3145,8 @@ def localize_one(
         "dense_rejections": dense_rejections,
         "dense_rejection_stats": dense_rejection_stats,
     }
+    if oracle_match_stats is not None:
+        out["oracle_match_stats"] = oracle_match_stats
     if getattr(args, "matchability_diagnostics", False):
         out["sparse_match_diagnostics"] = {
             "query_yx": (keypoints[q_ids] + sparse_query_offset).detach().cpu().numpy(),
@@ -2964,6 +3155,9 @@ def localize_one(
             "margins": None
             if sparse_margin_by_query is None
             else sparse_margin_by_query.detach().cpu().numpy(),
+            "scene_match_logits": None
+            if sparse_scene_match_logits is None
+            else sparse_scene_match_logits.detach().cpu().numpy(),
             "coord_space": "full" if query_keypoints_are_full_res else "feature",
         }
     return out
@@ -3024,6 +3218,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--landmark_teacher_fusion_rendered_trans_noise_cm", type=float, default=0.0)
     parser.add_argument("--landmark_teacher_fusion_rendered_rot_noise_deg", type=float, default=0.0)
     parser.add_argument("--match_calibrated_prior_weight", type=float, default=0.0)
+    parser.add_argument("--scene_matcher_path", default="")
+    parser.add_argument("--scene_matcher_weight", type=float, default=0.0)
+    parser.add_argument("--scene_matcher_topk", type=int, default=1)
+    parser.add_argument("--scene_matcher_logit_norm", choices=["none", "center", "zscore"], default="none")
     parser.add_argument(
         "--descriptor_source",
         choices=["hybrid", "ply_loc", "hybrid_ply_blend", "hybrid_ply_gated_residual"],
@@ -3033,9 +3231,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.05)
     parser.add_argument("--alpha_threshold", type=float, default=0.05)
     parser.add_argument("--query_keypoints", type=int, default=2048)
-    parser.add_argument("--query_detector", choices=["superpoint", "stdloc"], default="stdloc")
+    parser.add_argument("--query_detector", choices=["superpoint", "stdloc", "feedback"], default="stdloc")
     parser.add_argument("--query_feature_source", choices=["resized", "original"], default="original")
     parser.add_argument("--stdloc_detector_path", default="")
+    parser.add_argument("--feedback_detector_path", default="")
+    parser.add_argument("--feedback_detector_full_res", action="store_true")
     parser.add_argument("--keypoint_threshold", type=float, default=0.015)
     parser.add_argument("--nms_radius", type=int, default=4)
     parser.add_argument("--sparse_match_threshold", type=float, default=0.0)
@@ -3105,6 +3305,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--match_filter_calibrated_score_weight", type=float, default=0.0)
     parser.add_argument("--match_filter_margin_weight", type=float, default=0.0)
+    parser.add_argument("--match_filter_query_score_weight", type=float, default=0.0)
     parser.add_argument("--match_filter_top_m", type=int, default=0)
     parser.add_argument("--match_filter_image_grid_size", type=int, default=8)
     parser.add_argument("--match_filter_xyz_grid_size", type=int, default=8)
@@ -3132,6 +3333,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--pnp_cluster_grid_size", type=int, default=4)
     parser.add_argument("--pnp_dense_verify_topk", type=int, default=1)
     parser.add_argument("--pnp_hypothesis_min_score_gain", type=float, default=0.0)
+    parser.add_argument(
+        "--oracle_match_order",
+        choices=["none", "sparse_reprojection"],
+        default="none",
+        help="Analysis-only PROSAC ordering upper bound using GT reprojection error.",
+    )
     parser.add_argument("--matchability_diagnostics", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     return parser
@@ -3237,6 +3444,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     teacher.load_state_dict(torch.load(train_args["superpoint_weights"], map_location=device), strict=False)
     teacher.eval()
     stdloc_detector = None
+    feedback_detector = None
     if args.query_detector == "stdloc":
         detector_path = (
             Path(args.stdloc_detector_path)
@@ -3248,6 +3456,17 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         stdloc_detector = StdlocKeypointDetector(in_dim=256).to(device)
         stdloc_detector.load_state_dict(torch.load(detector_path, map_location=device))
         stdloc_detector.eval()
+    elif args.query_detector == "feedback":
+        feedback_detector = StdlocKeypointDetector(in_dim=256).to(device)
+        if args.feedback_detector_path:
+            feedback_detector.load_state_dict(torch.load(Path(args.feedback_detector_path), map_location=device))
+        elif "feedback_detector_state_dict" in ckpt:
+            feedback_detector.load_state_dict(ckpt["feedback_detector_state_dict"], strict=False)
+        else:
+            raise FileNotFoundError(
+                "query_detector=feedback requires --feedback_detector_path or feedback_detector_state_dict in checkpoint"
+            )
+        feedback_detector.eval()
     teacher_cache = None
     if not args.disable_superpoint_cache:
         cache_split = eval_split if args.query_feature_source == "resized" else f"{eval_split}_{args.query_feature_source}"
@@ -3262,6 +3481,11 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         if not calibration_path.exists():
             raise FileNotFoundError(f"Calibrated matchability cache not found: {calibration_path}")
         calibrated_matchability = _load_calibrated_matchability(calibration_path, device)
+    if args.scene_matcher_path:
+        scene_matcher_path = Path(args.scene_matcher_path)
+        if not scene_matcher_path.exists():
+            raise FileNotFoundError(f"Scene matcher checkpoint not found: {scene_matcher_path}")
+        args.scene_matcher_model = load_scene_matcher(scene_matcher_path, device)
 
     landmark_score_stats: dict[str, float] = {}
     landmark_score_weights = _score_weights(args, rendered=args.landmark_source == "rendered")
@@ -3442,6 +3666,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     dense_ae: list[float] = []
     dense_inliers: list[int] = []
     matchability_rows: list[dict[str, float]] = []
+    oracle_match_rows: list[dict[str, float]] = []
     details = []
 
     for item in tqdm(dataset, desc="Evaluating Cambridge hybrid", dynamic_ncols=True):
@@ -3472,11 +3697,16 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             teacher_cache=teacher_cache,
             full_renderer=full_renderer,
             stdloc_detector=stdloc_detector,
+            feedback_detector=feedback_detector,
             teacher_rgb=teacher_rgb,
             landmark_filter_reliability=landmark_filter_reliability,
+            gt_pose_w2c=gt_pose,
         )
         matchability_i = None
         sparse_diag = result.pop("sparse_match_diagnostics", None)
+        oracle_match_i = result.pop("oracle_match_stats", None)
+        if oracle_match_i is not None:
+            oracle_match_rows.append(oracle_match_i)
         if sparse_diag is not None:
             diag_K_tensor = item["K"] if sparse_diag["coord_space"] == "full" else K_feature
             matchability_i = sparse_matchability_metrics(
@@ -3519,6 +3749,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "dense_rejection_stats": result.get("dense_rejection_stats", {}),
                 "localized": result["pose_w2c"] is not None,
                 "matchability": matchability_i,
+                "oracle_match": oracle_match_i,
             }
         )
 
@@ -3543,7 +3774,12 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         "calibrated_matchability_path": str(args.calibrated_matchability_path),
         "landmark_score_calibrated_matchability_weight": float(args.landmark_score_calibrated_matchability_weight),
         "match_calibrated_prior_weight": float(args.match_calibrated_prior_weight),
+        "scene_matcher_path": str(args.scene_matcher_path),
+        "scene_matcher_weight": float(args.scene_matcher_weight),
+        "scene_matcher_topk": int(args.scene_matcher_topk),
+        "scene_matcher_logit_norm": str(args.scene_matcher_logit_norm),
         "query_detector": args.query_detector,
+        "feedback_detector_path": args.feedback_detector_path,
         "query_feature_source": args.query_feature_source,
         "descriptor_source": args.descriptor_source,
         "ply_loc_feature_weight": float(args.ply_loc_feature_weight),
@@ -3553,11 +3789,13 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         "dim_pipeline": args.dim_pipeline,
         "rendered_keypoint_source": args.rendered_keypoint_source,
         "match_filter_margin_weight": float(args.match_filter_margin_weight),
+        "match_filter_query_score_weight": float(args.match_filter_query_score_weight),
         "pnp_hypothesis_min_score_gain": float(args.pnp_hypothesis_min_score_gain),
         "landmarks": int(landmark_xyz.shape[0]),
         "sparse": _summary(sparse_te, sparse_ae, sparse_inliers),
         "dense": _summary(dense_te, dense_ae, dense_inliers),
         "matchability": _mean_metric_dict(matchability_rows),
+        "oracle_match": _mean_metric_dict(oracle_match_rows),
         "localized": len(dense_te),
         "queries": len(dataset),
     }

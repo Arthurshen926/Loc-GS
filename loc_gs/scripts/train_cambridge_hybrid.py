@@ -21,6 +21,7 @@ from loc_gs.data.cambridge_dataset import CambridgeHybridDataset
 from loc_gs.data.external_match_cache import ExternalMatchCache
 from loc_gs.data.superpoint_cache import SuperPointTeacherCache
 from loc_gs.localization.descriptor_blend import gated_residual_descriptor_blend
+from loc_gs.localization.stdloc_detector import StdlocKeypointDetector
 from loc_gs.losses.cross_view import (
     DescriptorMemoryBank,
     cross_view_projective_contrastive_loss,
@@ -297,6 +298,33 @@ def scheduled_loss_weight(
     return weight * min(max(progress, 0.0), 1.0)
 
 
+def _scale_keypoints_yx(
+    keypoints_yx: torch.Tensor,
+    *,
+    src_height: int,
+    src_width: int,
+    dst_height: int,
+    dst_width: int,
+) -> torch.Tensor:
+    """Scale y/x keypoint coordinates between detector canvases."""
+
+    if int(src_height) == int(dst_height) and int(src_width) == int(dst_width):
+        return keypoints_yx
+    scale_y = (float(dst_height) - 1.0) / max(float(src_height) - 1.0, 1.0)
+    scale_x = (float(dst_width) - 1.0) / max(float(src_width) - 1.0, 1.0)
+    scale = keypoints_yx.new_tensor([scale_y, scale_x])
+    return keypoints_yx * scale
+
+
+def _upsample_descriptor_batch(desc: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    return F.interpolate(
+        desc.float(),
+        size=(int(height), int(width)),
+        mode="bilinear",
+        align_corners=False,
+    )
+
+
 def default_ply_path(output_root: Path, scene: str) -> Path:
     map_root = output_root / "stdloc" / "map_cambridge_spgs"
     scene_variants = {
@@ -451,6 +479,93 @@ def locability_prior_alignment_loss(
             loc.clamp(1e-4, 1.0 - 1e-4).float(),
             target.clamp(0.0, 1.0).float(),
         )
+
+
+def pnp_feedback_detector_target(
+    keypoints_yx: torch.Tensor,
+    inlier_score: torch.Tensor,
+    query_mask: torch.Tensor,
+    height: int,
+    width: int,
+    sigma_px: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rasterize query-level PnP feedback into a coarse detector target.
+
+    Coordinates are in the same coarse feature grid as the SuperPoint
+    descriptors. Positive scores come from differentiable self-localization;
+    valid low-score query points become hard negatives through the weight map.
+    """
+
+    if keypoints_yx.dim() != 3:
+        raise ValueError("keypoints_yx must have shape [B, K, 2]")
+    B, Kp, _ = keypoints_yx.shape
+    device = keypoints_yx.device
+    dtype = torch.float32
+    h = int(height)
+    w = int(width)
+    target = torch.zeros(B, 1, h, w, device=device, dtype=dtype)
+    weight = torch.zeros_like(target)
+    if Kp == 0 or h <= 0 or w <= 0:
+        return target, weight
+
+    y_grid, x_grid = torch.meshgrid(
+        torch.arange(h, device=device, dtype=dtype),
+        torch.arange(w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    sigma = max(float(sigma_px), 1e-4)
+    scores = inlier_score.to(device=device, dtype=dtype).reshape(B, Kp).clamp(0.0, 1.0)
+    valid = query_mask.to(device=device, dtype=torch.bool).reshape(B, Kp)
+    coords = keypoints_yx.to(device=device, dtype=dtype)
+    for b in range(B):
+        valid_ids = torch.where(valid[b])[0]
+        if valid_ids.numel() == 0:
+            continue
+        for idx in valid_ids:
+            yx = coords[b, idx]
+            if not torch.isfinite(yx).all():
+                continue
+            y = yx[0].clamp(0.0, float(h - 1))
+            x = yx[1].clamp(0.0, float(w - 1))
+            kernel = torch.exp(-0.5 * ((y_grid - y).square() + (x_grid - x).square()) / (sigma * sigma))
+            score = scores[b, idx]
+            target[b, 0] = torch.maximum(target[b, 0], kernel * score)
+            # Hard negatives still receive supervision near the queried point.
+            weight[b, 0] = torch.maximum(weight[b, 0], kernel * (0.25 + 0.75 * score))
+    return target.clamp(0.0, 1.0), weight.clamp(0.0, 1.0)
+
+
+def pnp_feedback_detector_loss(
+    detector_score: torch.Tensor,
+    keypoints_yx: torch.Tensor,
+    inlier_score: torch.Tensor,
+    query_mask: torch.Tensor,
+    *,
+    sigma_px: float = 1.0,
+    negative_weight: float = 0.25,
+) -> torch.Tensor:
+    """Train a scene-specific query detector from self-localization feedback."""
+
+    if detector_score.dim() == 3:
+        detector_score = detector_score.unsqueeze(1)
+    if detector_score.dim() != 4 or detector_score.shape[1] != 1:
+        raise ValueError("detector_score must have shape [B,1,H,W] or [B,H,W]")
+    target, point_weight = pnp_feedback_detector_target(
+        keypoints_yx,
+        inlier_score,
+        query_mask,
+        detector_score.shape[-2],
+        detector_score.shape[-1],
+        sigma_px=sigma_px,
+    )
+    pred = detector_score.float().clamp(1e-4, 1.0 - 1e-4)
+    target = target.to(device=pred.device, dtype=pred.dtype)
+    point_weight = point_weight.to(device=pred.device, dtype=pred.dtype)
+    dense_weight = torch.full_like(point_weight, max(float(negative_weight), 0.0))
+    weights = torch.maximum(dense_weight, point_weight)
+    with torch.cuda.amp.autocast(enabled=False):
+        loss = F.binary_cross_entropy(pred.float(), target.float(), weight=weights.float(), reduction="sum")
+    return loss / weights.sum().clamp_min(1.0)
 
 
 @torch.no_grad()
@@ -815,9 +930,48 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--pnp_locability_target_prior_start_epoch", type=int, default=1)
     parser.add_argument("--pnp_locability_target_prior_warmup_epochs", type=int, default=1)
     parser.add_argument("--pnp_topk", type=int, default=16)
+    parser.add_argument(
+        "--localization_batch_size",
+        type=int,
+        default=0,
+        help="Optional sub-batch size for localization rehearsal losses; 0 uses the full batch.",
+    )
     parser.add_argument("--pnp_occlusion_depth_tolerance", type=float, default=0.05)
     parser.add_argument("--pnp_occlusion_depth_rel_tolerance", type=float, default=0.02)
     parser.add_argument("--pnp_gt_alpha_threshold", type=float, default=0.05)
+    parser.add_argument(
+        "--localization_descriptor_source",
+        choices=["hybrid", "ply_loc", "hybrid_ply_blend", "hybrid_ply_gated_residual"],
+        default="hybrid_ply_gated_residual",
+        help="Descriptor used by localization rehearsal; base reconstruction still trains the hybrid descriptor.",
+    )
+    parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.03)
+    parser.add_argument("--pnp_feedback_detector_weight", type=float, default=0.0)
+    parser.add_argument("--pnp_feedback_detector_start_epoch", type=int, default=1)
+    parser.add_argument("--pnp_feedback_detector_warmup_epochs", type=int, default=1)
+    parser.add_argument("--pnp_feedback_detector_sigma_px", type=float, default=1.0)
+    parser.add_argument("--pnp_feedback_detector_negative_weight", type=float, default=0.25)
+    parser.add_argument(
+        "--pnp_feedback_detector_init_path",
+        default="",
+        help="Optional STDLoc detector checkpoint used to initialize the feedback detector.",
+    )
+    parser.add_argument(
+        "--pnp_feedback_detector_init_from_stdloc",
+        action="store_true",
+        help="Initialize the feedback detector from the STDLoc detector next to the input PLY.",
+    )
+    parser.add_argument(
+        "--pnp_feedback_detector_anchor_weight",
+        type=float,
+        default=0.0,
+        help="Keep the feedback detector close to its initialization to make it a safe fine-tune.",
+    )
+    parser.add_argument(
+        "--pnp_feedback_detector_full_res",
+        action="store_true",
+        help="Train feedback detector on the full-resolution STDLoc dense feature canvas.",
+    )
     parser.add_argument("--locability_target_detector_weight", type=float, default=1.0)
     parser.add_argument("--locability_target_alpha_weight", type=float, default=0.25)
     parser.add_argument("--locability_target_depth_weight", type=float, default=0.5)
@@ -968,12 +1122,32 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         num_res_blocks=2,
         use_3x3=True,
     ).to(device)
+    feedback_detector = StdlocKeypointDetector(in_dim=256).to(device)
+    feedback_detector_anchor = None
+
+    feedback_init_path = Path(args.pnp_feedback_detector_init_path) if args.pnp_feedback_detector_init_path else None
+    if feedback_init_path is None and bool(args.pnp_feedback_detector_init_from_stdloc):
+        feedback_init_path = Path(ply_path).parents[2] / "detector" / "30000_detector.pth"
+    if feedback_init_path is not None:
+        if not feedback_init_path.exists():
+            raise FileNotFoundError(f"feedback detector init checkpoint not found: {feedback_init_path}")
+        feedback_detector.load_state_dict(torch.load(feedback_init_path, map_location=device), strict=False)
+        print(f"[train] initialized feedback detector from {feedback_init_path}")
 
     if args.init_checkpoint:
         init_ckpt = torch.load(args.init_checkpoint, map_location=device)
         model.load_state_dict(init_ckpt["model_state_dict"], strict=False)
         sp_head.load_state_dict(init_ckpt["sp_head_state_dict"], strict=False)
+        if "feedback_detector_state_dict" in init_ckpt:
+            feedback_detector.load_state_dict(init_ckpt["feedback_detector_state_dict"], strict=False)
         print(f"[train] initialized hybrid field/head from {args.init_checkpoint}")
+
+    if float(args.pnp_feedback_detector_anchor_weight) > 0.0:
+        feedback_detector_anchor = StdlocKeypointDetector(in_dim=256).to(device)
+        feedback_detector_anchor.load_state_dict(feedback_detector.state_dict())
+        feedback_detector_anchor.eval()
+        for param in feedback_detector_anchor.parameters():
+            param.requires_grad_(False)
 
     if args.freeze_feature_field:
         model._latent.requires_grad_(False)
@@ -1035,6 +1209,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         + list(model.fusion_head.parameters())
     )
     sp_head_params = trainable_params(sp_head.parameters())
+    feedback_detector_params = trainable_params(feedback_detector.parameters())
     if latent_params:
         params.append({"params": latent_params, "lr": args.lr_latent})
     if locability_params:
@@ -1045,6 +1220,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         params.append({"params": decoder_params, "lr": args.lr_decoder})
     if sp_head_params:
         params.append({"params": sp_head_params, "lr": args.lr_head})
+    if feedback_detector_params:
+        params.append({"params": feedback_detector_params, "lr": args.lr_head})
     if args.train_xyz:
         params.append({"params": [model._xyz], "lr": args.lr_xyz})
     if args.train_opacity:
@@ -1090,6 +1267,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         sp_head.train()
+        feedback_detector.train()
         if args.train_xyz and epoch >= args.geometry_unfreeze_epoch:
             model._xyz.requires_grad_(True)
         if args.train_opacity and epoch >= args.geometry_unfreeze_epoch:
@@ -1204,10 +1382,31 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     gt_locability_prior,
                 )
 
+                localization_batch_size = int(getattr(args, "localization_batch_size", 0))
+                if 0 < localization_batch_size < int(rgb.shape[0]):
+                    loc_batch_ids = torch.randperm(int(rgb.shape[0]), device=device)[:localization_batch_size]
+                    loc_pose_base = pose[loc_batch_ids]
+                    loc_frame_indices = batch["frame_idx"].to(device=device, dtype=torch.long)[loc_batch_ids]
+                    loc_query_descs = query_descs[loc_batch_ids]
+                    loc_query_keypoints = query_keypoints[loc_batch_ids]
+                    loc_query_mask = query_mask[loc_batch_ids]
+                    loc_gt_depth = gt_render["depth"][loc_batch_ids]
+                    loc_gt_alpha = gt_render["alpha"][loc_batch_ids]
+                    loc_teacher_desc = teacher_desc[loc_batch_ids]
+                else:
+                    loc_pose_base = pose
+                    loc_frame_indices = batch["frame_idx"].to(device=device, dtype=torch.long)
+                    loc_query_descs = query_descs
+                    loc_query_keypoints = query_keypoints
+                    loc_query_mask = query_mask
+                    loc_gt_depth = gt_render["depth"]
+                    loc_gt_alpha = gt_render["alpha"]
+                    loc_teacher_desc = teacher_desc
+
                 loc_pose = sample_rehearsal_pose_batch(
                     dataset=dataset,
-                    frame_indices=batch["frame_idx"],
-                    base_pose_w2c=pose,
+                    frame_indices=loc_frame_indices,
+                    base_pose_w2c=loc_pose_base,
                     model=model,
                     renderer=renderer,
                     mode=args.rehearsal_pose_mode,
@@ -1221,7 +1420,14 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     min_overlap=args.view_pair_min_overlap,
                     device=device,
                 ).detach()
-                loc_render = render_hybrid_superpoint(model, sp_head, renderer, loc_pose)
+                loc_render = render_hybrid_superpoint(
+                    model,
+                    sp_head,
+                    renderer,
+                    loc_pose,
+                    descriptor_source=args.localization_descriptor_source,
+                    hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
+                )
                 active_locability_target_prior_weight = scheduled_loss_weight(
                     epoch,
                     args.pnp_locability_target_prior_weight,
@@ -1239,19 +1445,57 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                         depth_window=args.locability_target_depth_window,
                     )
                 pnp_out = pnp_loss_fn(
-                    query_descs=query_descs,
-                    query_keypoints_yx=query_keypoints,
-                    query_mask=query_mask,
+                    query_descs=loc_query_descs,
+                    query_keypoints_yx=loc_query_keypoints,
+                    query_mask=loc_query_mask,
                     rendered_desc=loc_render["descriptor"],
                     depth_map=loc_render["depth"],
                     render_pose_w2c=loc_pose,
-                    gt_pose_w2c=pose,
+                    gt_pose_w2c=loc_pose_base,
                     K=renderer.K.float(),
                     locability_map=loc_render["locability"],
                     locability_target_prior_map=locability_target_prior,
-                    gt_depth_map=gt_render["depth"],
-                    gt_alpha_map=gt_render["alpha"],
+                    gt_depth_map=loc_gt_depth,
+                    gt_alpha_map=loc_gt_alpha,
                 )
+                active_feedback_detector_weight = scheduled_loss_weight(
+                    epoch,
+                    args.pnp_feedback_detector_weight,
+                    start_epoch=args.pnp_feedback_detector_start_epoch,
+                    warmup_epochs=args.pnp_feedback_detector_warmup_epochs,
+                )
+                feedback_detector_loss = pred_desc.new_tensor(0.0)
+                if active_feedback_detector_weight > 0.0:
+                    detector_input = loc_teacher_desc.float()
+                    detector_keypoints = loc_query_keypoints
+                    if bool(args.pnp_feedback_detector_full_res):
+                        full_h = int(rgb.shape[-2])
+                        full_w = int(rgb.shape[-1])
+                        detector_input = _upsample_descriptor_batch(detector_input, full_h, full_w)
+                        detector_keypoints = _scale_keypoints_yx(
+                            loc_query_keypoints,
+                            src_height=int(loc_teacher_desc.shape[-2]),
+                            src_width=int(loc_teacher_desc.shape[-1]),
+                            dst_height=full_h,
+                            dst_width=full_w,
+                        )
+                    feedback_score = feedback_detector(detector_input)
+                    feedback_detector_loss = pnp_feedback_detector_loss(
+                        feedback_score,
+                        detector_keypoints,
+                        pnp_out["query_inlier_score"],
+                        loc_query_mask & pnp_out["query_valid_mask"],
+                        sigma_px=args.pnp_feedback_detector_sigma_px,
+                        negative_weight=args.pnp_feedback_detector_negative_weight,
+                    )
+                    if feedback_detector_anchor is not None and float(args.pnp_feedback_detector_anchor_weight) > 0.0:
+                        with torch.no_grad():
+                            anchor_score = feedback_detector_anchor(detector_input)
+                        anchor_loss = F.mse_loss(feedback_score.float(), anchor_score.float())
+                        feedback_detector_loss = (
+                            feedback_detector_loss
+                            + float(args.pnp_feedback_detector_anchor_weight) * anchor_loss
+                        )
 
                 locability_sparse = (
                     loc_render["locability"].mean()
@@ -1276,7 +1520,14 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                         device,
                     )
                     pair_pose = pair_batch["pose_w2c"].to(device, non_blocking=True).float()
-                    pair_render = render_hybrid_superpoint(model, sp_head, renderer, pair_pose)
+                    pair_render = render_hybrid_superpoint(
+                        model,
+                        sp_head,
+                        renderer,
+                        pair_pose,
+                        descriptor_source=args.localization_descriptor_source,
+                        hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
+                    )
                     positive_desc_b = None
                     if args.xview_positive_source == "teacher":
                         with torch.no_grad():
@@ -1350,7 +1601,14 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                         )
                     if pair_render is None:
                         pair_pose = pair_batch["pose_w2c"].to(device, non_blocking=True).float()
-                        pair_render = render_hybrid_superpoint(model, sp_head, renderer, pair_pose)
+                        pair_render = render_hybrid_superpoint(
+                            model,
+                            sp_head,
+                            renderer,
+                            pair_pose,
+                            descriptor_source=args.localization_descriptor_source,
+                            hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
+                        )
                     match_batch = load_external_match_training_batch(
                         external_match_cache,
                         image_names,
@@ -1461,6 +1719,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     + args.same_view_match_weight * same_match["total"]
                     + args.sp_recon_weight * sp_recon
                     + args.detector_recon_weight * det_recon
+                    + active_feedback_detector_weight * feedback_detector_loss
                     + args.locability_sparse_weight * locability_sparse
                     + active_locability_prior_target_weight * locability_prior_target
                     + args.geometry_reg_weight * geometry_reg
@@ -1491,6 +1750,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             metrics = {
                 "loss": float(loss.detach()),
                 "pnp_weight": float(active_pnp_weight),
+                "pnp_feedback_detector_weight": float(active_feedback_detector_weight),
                 "locability_target_prior_weight": float(active_locability_target_prior_weight),
                 "locability_prior_target_weight": float(active_locability_prior_target_weight),
                 "pnp": float(pnp_out["total"].detach()),
@@ -1504,6 +1764,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "same_locability": float(same_match["locability"].detach()),
                 "sp_recon": float(sp_recon.detach()),
                 "det_recon": float(det_recon.detach()),
+                "feedback_detector": float(feedback_detector_loss.detach()),
                 "locability": float(locability_sparse.detach()),
                 "locability_prior_target": float(locability_prior_target.detach()),
                 "geometry_reg": float(geometry_reg.detach()),
@@ -1536,6 +1797,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "args": config_snapshot,
                 "model_state_dict": model.state_dict(),
                 "sp_head_state_dict": sp_head.state_dict(),
+                "feedback_detector_state_dict": feedback_detector.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
             }
             torch.save(ckpt, out_dir / f"checkpoint_epoch_{epoch:04d}.pth")

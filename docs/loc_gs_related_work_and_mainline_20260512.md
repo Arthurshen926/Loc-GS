@@ -2,6 +2,10 @@
 
 Date: 2026-05-12
 
+Status: superseded by `docs/loc_gs_lff_scenematch_mainline_20260512.md` for
+new experiments. The static-prior and guarded-selector sections below are kept
+as experiment history and negative/diagnostic ablations.
+
 ## Paper-Facing Position
 
 The defensible mainline is not learned descriptor replacement. It is

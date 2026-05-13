@@ -107,3 +107,9 @@ def test_reliability_eval_launcher_exposes_query_shards_argument():
     assert args.query_shards == 2
     assert args.query_stride == 2
     assert args.calibrated_matchability_template == "output/calib/{scene}/stdloc_bank_query_like.pt"
+
+
+def test_reliability_eval_launcher_defaults_to_single_path_prosac():
+    args = build_argparser().parse_args([])
+
+    assert args.recipes == "covisibility_prosac"

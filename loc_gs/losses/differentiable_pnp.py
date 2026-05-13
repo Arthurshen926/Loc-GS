@@ -427,5 +427,7 @@ class DifferentiablePnPMatchLoss(nn.Module):
             "entropy": entropy_loss,
             "pose_w2c": pose_w2c,
             "match_prob": probs,
+            "query_inlier_score": (geom_confidence * valid_queries.float()).detach(),
+            "query_valid_mask": valid_queries.detach(),
             "valid_queries": valid_queries.float().sum(),
         }

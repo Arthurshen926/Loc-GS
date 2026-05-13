@@ -22,6 +22,14 @@ def build_calibration_command(
     rendered_rehearsal_views: int = 256,
     max_landmarks: int = 16384,
     topk: int = 8,
+    query_detector: str = "stdloc",
+    feedback_detector_full_res: bool = False,
+    descriptor_source: str = "ply_loc",
+    hybrid_residual_alpha_max: float = 0.05,
+    rendered_query_source: str = "rendered_rgb_teacher",
+    scene_match_pair_output_path: str = "",
+    scene_match_pair_sample_limit: int = 200000,
+    scene_match_pair_train_fraction: float = 1.0,
 ) -> tuple[list[str], dict[str, str]]:
     cmd = [
         sys.executable,
@@ -40,15 +48,17 @@ def build_calibration_command(
         "--topk",
         str(int(topk)),
         "--query_detector",
-        "stdloc",
+        str(query_detector),
         "--query_feature_source",
         "original",
         "--descriptor_source",
-        "ply_loc",
+        str(descriptor_source),
+        "--hybrid_residual_alpha_max",
+        str(float(hybrid_residual_alpha_max)),
         "--rendered_rehearsal_views",
         str(int(rendered_rehearsal_views)),
         "--rendered_query_source",
-        "rendered_rgb_teacher",
+        str(rendered_query_source),
         "--rendered_rehearsal_pose_mode",
         "mixed",
         "--rendered_rehearsal_interpolation_min",
@@ -70,6 +80,19 @@ def build_calibration_command(
         "--device",
         "cuda:0",
     ]
+    if feedback_detector_full_res:
+        cmd.append("--feedback_detector_full_res")
+    if scene_match_pair_output_path:
+        cmd.extend(
+            [
+                "--scene_match_pair_output_path",
+                scene_match_pair_output_path,
+                "--scene_match_pair_sample_limit",
+                str(int(scene_match_pair_sample_limit)),
+                "--scene_match_pair_train_fraction",
+                str(float(scene_match_pair_train_fraction)),
+            ]
+        )
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(int(gpu_id))
     return cmd, env
@@ -98,6 +121,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--rendered_rehearsal_views", type=int, default=256)
     parser.add_argument("--max_landmarks", type=int, default=16384)
     parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument("--query_detector", choices=["superpoint", "stdloc", "feedback"], default="stdloc")
+    parser.add_argument("--feedback_detector_full_res", action="store_true")
+    parser.add_argument(
+        "--descriptor_source",
+        choices=["hybrid", "ply_loc", "hybrid_ply_blend", "hybrid_ply_gated_residual"],
+        default="ply_loc",
+    )
+    parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.05)
+    parser.add_argument("--rendered_query_source", choices=["rendered_rgb_teacher", "feature_field"], default="rendered_rgb_teacher")
+    parser.add_argument("--scene_match_pair_output_root", default="")
+    parser.add_argument("--scene_match_pair_sample_limit", type=int, default=200000)
+    parser.add_argument("--scene_match_pair_train_fraction", type=float, default=1.0)
     parser.add_argument("--gpus", default="")
     parser.add_argument("--max_memory_used_mb", type=int, default=1000)
     parser.add_argument("--max_utilization", type=int, default=10)
@@ -124,6 +159,13 @@ def main() -> None:
         output_dir = output_root / scene
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / "stdloc_bank_query_like.pt"
+        pair_output_path = (
+            Path(args.scene_match_pair_output_root) / scene / "scene_match_pairs.pt"
+            if args.scene_match_pair_output_root
+            else None
+        )
+        if pair_output_path is not None:
+            pair_output_path.parent.mkdir(parents=True, exist_ok=True)
         if not args.dry_run and not checkpoint.exists():
             raise FileNotFoundError(f"checkpoint not found for {scene}: {checkpoint}")
         cmd, env = build_calibration_command(
@@ -135,6 +177,14 @@ def main() -> None:
             rendered_rehearsal_views=args.rendered_rehearsal_views,
             max_landmarks=args.max_landmarks,
             topk=args.topk,
+            query_detector=args.query_detector,
+            feedback_detector_full_res=args.feedback_detector_full_res,
+            descriptor_source=args.descriptor_source,
+            hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
+            rendered_query_source=args.rendered_query_source,
+            scene_match_pair_output_path="" if pair_output_path is None else str(pair_output_path),
+            scene_match_pair_sample_limit=args.scene_match_pair_sample_limit,
+            scene_match_pair_train_fraction=args.scene_match_pair_train_fraction,
         )
         print(" ".join(cmd), f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
         if args.dry_run:

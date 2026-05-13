@@ -47,6 +47,7 @@ def test_build_train_command_uses_large_batch_and_conservative_pnp_recipe():
         num_workers=4,
         max_frames=8,
         max_train_batches=1,
+        localization_batch_size=4,
     )
 
     assert env["CUDA_VISIBLE_DEVICES"] == "2"
@@ -54,8 +55,15 @@ def test_build_train_command_uses_large_batch_and_conservative_pnp_recipe():
     assert cmd[cmd.index("--batch_size") + 1] == "6"
     assert cmd[cmd.index("--pnp_weight") + 1] == "0.05"
     assert cmd[cmd.index("--pnp_pose_loss_weight") + 1] == "0.0"
+    assert cmd[cmd.index("--localization_batch_size") + 1] == "4"
     assert cmd[cmd.index("--pnp_locability_loss_weight") + 1] == "0.1"
     assert cmd[cmd.index("--pnp_locability_target_prior_weight") + 1] == "0.5"
+    assert cmd[cmd.index("--localization_descriptor_source") + 1] == "hybrid_ply_gated_residual"
+    assert cmd[cmd.index("--hybrid_residual_alpha_max") + 1] == "0.03"
+    assert cmd[cmd.index("--pnp_feedback_detector_weight") + 1] == "0.05"
+    assert "--pnp_feedback_detector_init_from_stdloc" in cmd
+    assert cmd[cmd.index("--pnp_feedback_detector_anchor_weight") + 1] == "0.1"
+    assert "--pnp_feedback_detector_full_res" in cmd
     assert cmd[cmd.index("--same_view_match_weight") + 1] == "1.0"
     assert cmd[cmd.index("--locability_prior_target_weight") + 1] == "0.02"
     assert cmd[cmd.index("--rehearsal_pose_mode") + 1] == "mixed"
@@ -176,6 +184,150 @@ def test_build_reliability_eval_command_can_use_covisibility_prosac_recipe():
     assert "--ply_loc_feature_weight" not in cmd
 
 
+def test_build_reliability_eval_command_can_use_oracle_prosac_recipe():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=2,
+        scene="KingsCollege",
+        checkpoint="output/stdloc_hybrid/KingsCollege_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/KingsCollege_reliability_recipe/eval_oracle_prosac",
+        recipe="oracle_prosac",
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert cmd[cmd.index("--descriptor_source") + 1] == "ply_loc"
+    assert cmd[cmd.index("--query_detector") + 1] == "stdloc"
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac"
+    assert cmd[cmd.index("--oracle_match_order") + 1] == "sparse_reprojection"
+    assert cmd[cmd.index("--landmark_score_mode") + 1] == "matchability_prior"
+
+
+def test_build_reliability_eval_command_can_use_scene_matcher_prosac_recipe():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=0,
+        scene="GreatCourt",
+        checkpoint="output/stdloc_hybrid/GreatCourt_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/GreatCourt_reliability_recipe/eval_scene_matcher",
+        recipe="scene_matcher_prosac",
+        scene_matcher_path="output/scenematch/GreatCourt/best.pt",
+        scene_matcher_weight=0.45,
+        scene_matcher_topk=6,
+        scene_matcher_logit_norm="zscore",
+        match_filter_query_score_weight=0.2,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac"
+    assert cmd[cmd.index("--descriptor_source") + 1] == "ply_loc"
+    assert cmd[cmd.index("--scene_matcher_path") + 1] == "output/scenematch/GreatCourt/best.pt"
+    assert cmd[cmd.index("--scene_matcher_weight") + 1] == "0.45"
+    assert cmd[cmd.index("--scene_matcher_topk") + 1] == "6"
+    assert cmd[cmd.index("--scene_matcher_logit_norm") + 1] == "zscore"
+    assert cmd[cmd.index("--match_filter_query_score_weight") + 1] == "0.2"
+    assert "--max_landmarks" not in cmd
+
+
+def test_build_reliability_eval_command_can_use_scene_matcher_residual_recipe():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=2,
+        scene="OldHospital",
+        checkpoint="output/stdloc_hybrid/OldHospital_lff/latest.pth",
+        output_dir="output/stdloc_hybrid/OldHospital_lff/eval_scene_matcher_residual",
+        recipe="scene_matcher_residual_prosac",
+        scene_matcher_path="output/scenematch/OldHospital/best.pt",
+        scene_matcher_weight=0.1,
+        scene_matcher_topk=4,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert cmd[cmd.index("--query_detector") + 1] == "stdloc"
+    assert cmd[cmd.index("--descriptor_source") + 1] == "hybrid_ply_gated_residual"
+    assert cmd[cmd.index("--hybrid_residual_alpha_max") + 1] == "0.03"
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac"
+    assert cmd[cmd.index("--scene_matcher_path") + 1] == "output/scenematch/OldHospital/best.pt"
+    assert cmd[cmd.index("--scene_matcher_weight") + 1] == "0.1"
+    assert cmd[cmd.index("--scene_matcher_topk") + 1] == "4"
+
+
+def test_build_reliability_eval_command_can_use_lff_feedback_recipe():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=0,
+        scene="ShopFacade",
+        checkpoint="output/stdloc_hybrid/ShopFacade_lff/latest.pth",
+        output_dir="output/stdloc_hybrid/ShopFacade_lff/eval_lff_feedback",
+        recipe="lff_feedback_prosac",
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert cmd[cmd.index("--query_detector") + 1] == "feedback"
+    assert "--feedback_detector_full_res" in cmd
+    assert cmd[cmd.index("--descriptor_source") + 1] == "hybrid_ply_gated_residual"
+    assert cmd[cmd.index("--hybrid_residual_alpha_max") + 1] == "0.03"
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac"
+
+
+def test_build_reliability_eval_command_can_use_lff_residual_with_stdloc_detector():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=1,
+        scene="GreatCourt",
+        checkpoint="output/stdloc_hybrid/GreatCourt_lff/latest.pth",
+        output_dir="output/stdloc_hybrid/GreatCourt_lff/eval_lff_residual",
+        recipe="lff_residual_prosac",
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert cmd[cmd.index("--query_detector") + 1] == "stdloc"
+    assert cmd[cmd.index("--descriptor_source") + 1] == "hybrid_ply_gated_residual"
+    assert cmd[cmd.index("--hybrid_residual_alpha_max") + 1] == "0.03"
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac"
+
+
+def test_build_reliability_eval_command_can_override_lff_residual_alpha():
+    cmd, _env = build_reliability_eval_command(
+        gpu_id=1,
+        scene="GreatCourt",
+        checkpoint="output/stdloc_hybrid/GreatCourt_lff/latest.pth",
+        output_dir="output/stdloc_hybrid/GreatCourt_lff/eval_lff_residual_alpha005",
+        recipe="lff_residual_prosac",
+        hybrid_residual_alpha_max=0.05,
+    )
+
+    assert cmd[cmd.index("--descriptor_source") + 1] == "hybrid_ply_gated_residual"
+    assert cmd[cmd.index("--hybrid_residual_alpha_max") + 1] == "0.05"
+
+
+def test_build_reliability_eval_command_can_use_scene_matcher_coverage_recipe():
+    cmd, _env = build_reliability_eval_command(
+        gpu_id=0,
+        scene="GreatCourt",
+        checkpoint="output/stdloc_hybrid/GreatCourt_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/GreatCourt_reliability_recipe/eval_scene_matcher_coverage",
+        recipe="scene_matcher_coverage_prosac",
+        scene_matcher_path="output/scenematch/GreatCourt/best.pt",
+    )
+
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac"
+    assert cmd[cmd.index("--sparse_match_filter_mode") + 1] == "calibrated_coverage"
+    assert cmd[cmd.index("--sparse_match_filter_top_m") + 1] == "2048"
+    assert cmd[cmd.index("--dense_match_filter_mode") + 1] == "calibrated_coverage"
+    assert cmd[cmd.index("--dense_match_filter_top_m") + 1] == "2048"
+    assert cmd[cmd.index("--match_filter_min_matches") + 1] == "1024"
+    assert cmd[cmd.index("--scene_matcher_path") + 1] == "output/scenematch/GreatCourt/best.pt"
+
+
+def test_build_reliability_eval_command_can_use_scene_matcher_magsac_recipe():
+    cmd, _env = build_reliability_eval_command(
+        gpu_id=0,
+        scene="GreatCourt",
+        checkpoint="output/stdloc_hybrid/GreatCourt_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/GreatCourt_reliability_recipe/eval_scene_matcher_magsac",
+        recipe="scene_matcher_prosac_magsac",
+        scene_matcher_path="output/scenematch/GreatCourt/best.pt",
+    )
+
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac_magsac"
+    assert cmd[cmd.index("--scene_matcher_path") + 1] == "output/scenematch/GreatCourt/best.pt"
+
+
 def test_build_reliability_eval_command_can_attach_calibrated_matchability():
     cmd, env = build_reliability_eval_command(
         gpu_id=1,
@@ -231,3 +383,25 @@ def test_build_reliability_eval_command_can_use_covisibility_prosac_loftr_recipe
     assert cmd[cmd.index("--loftr_max_matches") + 1] == "4096"
     assert "--dense_match_filter_mode" not in cmd
     assert "--dense_match_filter_top_m" not in cmd
+
+
+def test_build_reliability_eval_command_can_use_lff_residual_prosac_loftr_recipe():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=1,
+        scene="ShopFacade",
+        checkpoint="output/stdloc_hybrid/ShopFacade_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/ShopFacade_reliability_recipe/eval_lff_residual_prosac_loftr",
+        recipe="lff_residual_prosac_loftr",
+    )
+
+    dense_iters = [idx for idx, item in enumerate(cmd) if item == "--dense_iters"]
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert cmd[cmd.index("--descriptor_source") + 1] == "hybrid_ply_gated_residual"
+    assert cmd[cmd.index("--hybrid_residual_alpha_max") + 1] == "0.03"
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac"
+    assert cmd[cmd.index("--landmark_score_mode") + 1] == "matchability_prior"
+    assert cmd[cmd.index("--dense_matcher") + 1] == "loftr_rendered"
+    assert cmd[cmd.index("--dim_pipeline") + 1] == "loftr"
+    assert cmd[dense_iters[-1] + 1] == "1"
+    assert cmd[cmd.index("--loftr_max_matches") + 1] == "4096"
