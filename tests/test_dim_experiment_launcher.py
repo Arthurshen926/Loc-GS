@@ -201,6 +201,24 @@ def test_build_reliability_eval_command_can_use_oracle_prosac_recipe():
     assert cmd[cmd.index("--landmark_score_mode") + 1] == "matchability_prior"
 
 
+def test_build_reliability_eval_command_can_use_topk_candidate_oracle_recipe():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=0,
+        scene="KingsCollege",
+        checkpoint="output/stdloc_hybrid/KingsCollege_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/KingsCollege_reliability_recipe/eval_candidate_oracle_top8",
+        recipe="candidate_oracle_top8",
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert cmd[cmd.index("--descriptor_source") + 1] == "ply_loc"
+    assert cmd[cmd.index("--query_detector") + 1] == "stdloc"
+    assert cmd[cmd.index("--solver") + 1] == "opencv_prosac"
+    assert cmd[cmd.index("--sparse_candidate_topk") + 1] == "8"
+    assert cmd[cmd.index("--sparse_candidate_oracle_topk") + 1] == "8"
+    assert cmd[cmd.index("--landmark_score_mode") + 1] == "matchability_prior"
+
+
 def test_build_reliability_eval_command_can_use_scene_matcher_prosac_recipe():
     cmd, env = build_reliability_eval_command(
         gpu_id=0,
@@ -212,6 +230,7 @@ def test_build_reliability_eval_command_can_use_scene_matcher_prosac_recipe():
         scene_matcher_weight=0.45,
         scene_matcher_topk=6,
         scene_matcher_logit_norm="zscore",
+        scene_matcher_listwise_dustbin="drop",
         match_filter_query_score_weight=0.2,
     )
 
@@ -222,6 +241,7 @@ def test_build_reliability_eval_command_can_use_scene_matcher_prosac_recipe():
     assert cmd[cmd.index("--scene_matcher_weight") + 1] == "0.45"
     assert cmd[cmd.index("--scene_matcher_topk") + 1] == "6"
     assert cmd[cmd.index("--scene_matcher_logit_norm") + 1] == "zscore"
+    assert cmd[cmd.index("--scene_matcher_listwise_dustbin") + 1] == "drop"
     assert cmd[cmd.index("--match_filter_query_score_weight") + 1] == "0.2"
     assert "--max_landmarks" not in cmd
 
@@ -246,6 +266,25 @@ def test_build_reliability_eval_command_can_use_scene_matcher_residual_recipe():
     assert cmd[cmd.index("--scene_matcher_path") + 1] == "output/scenematch/OldHospital/best.pt"
     assert cmd[cmd.index("--scene_matcher_weight") + 1] == "0.1"
     assert cmd[cmd.index("--scene_matcher_topk") + 1] == "4"
+
+
+def test_build_reliability_eval_command_can_attach_selfmap_reliability_summary():
+    cmd, env = build_reliability_eval_command(
+        gpu_id=1,
+        scene="ShopFacade",
+        checkpoint="output/stdloc_hybrid/ShopFacade_lff/latest.pth",
+        output_dir="output/stdloc_hybrid/ShopFacade_lff/eval_unified_soft",
+        recipe="scene_matcher_residual_prosac",
+        scene_matcher_path="output/scenematch/ShopFacade/best.pt",
+        selfmap_reliability_path="output/selfmap/ShopFacade/summary.json",
+        selfmap_reliability_center_cm=9.5,
+        selfmap_reliability_temperature_cm=1.5,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert cmd[cmd.index("--selfmap_reliability_path") + 1] == "output/selfmap/ShopFacade/summary.json"
+    assert cmd[cmd.index("--selfmap_reliability_center_cm") + 1] == "9.5"
+    assert cmd[cmd.index("--selfmap_reliability_temperature_cm") + 1] == "1.5"
 
 
 def test_build_reliability_eval_command_can_use_lff_feedback_recipe():

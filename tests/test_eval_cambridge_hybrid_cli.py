@@ -1,3 +1,4 @@
+import json
 import pickle
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from loc_gs.scripts.eval_cambridge_hybrid import (
     prepare_query_teacher_maps,
     select_pnp_match_indices,
     select_view_landmark_indices,
+    sparse_candidate_oracle_matches,
     sparse_matchability_metrics,
 )
 
@@ -199,6 +201,12 @@ def test_eval_parser_exposes_stdloc_parity_options():
             "4096",
             "--oracle_match_order",
             "sparse_reprojection",
+            "--sparse_candidate_topk",
+            "8",
+            "--sparse_candidate_oracle_topk",
+            "8",
+            "--sparse_candidate_oracle_threshold_px",
+            "4",
         ]
     )
 
@@ -282,6 +290,9 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert args.sparse_pnp_max_matches == 512
     assert args.dense_pnp_max_matches == 4096
     assert args.oracle_match_order == "sparse_reprojection"
+    assert args.sparse_candidate_topk == 8
+    assert args.sparse_candidate_oracle_topk == 8
+    assert args.sparse_candidate_oracle_threshold_px == 4.0
 
     config = effective_eval_config(args)
     assert config["sparse_reprojection_error"] == 2.0
@@ -318,6 +329,9 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert config["pnp_dense_verify_topk"] == 4
     assert config["pnp_hypothesis_min_score_gain"] == 5.0
     assert config["oracle_match_order"] == "sparse_reprojection"
+    assert config["sparse_candidate_topk"] == 8
+    assert config["sparse_candidate_oracle_topk"] == 8
+    assert config["sparse_candidate_oracle_threshold_px"] == 4.0
     assert config["hybrid_residual_alpha_max"] == 0.05
     assert config["match_filter_min_matches"] == 64
 
@@ -336,6 +350,93 @@ def test_eval_parser_defaults_are_baseline_preserving():
     config = effective_eval_config(args)
     assert config["eval_split"] == "test"
     assert config["oracle_match_order"] == "none"
+
+
+def test_selfmap_reliability_weight_is_continuous_and_quality_ordered():
+    good = eval_cambridge_hybrid.selfmap_reliability_weight(3.0, center_cm=10.0, temperature_cm=1.0)
+    border = eval_cambridge_hybrid.selfmap_reliability_weight(10.0, center_cm=10.0, temperature_cm=1.0)
+    bad = eval_cambridge_hybrid.selfmap_reliability_weight(13.0, center_cm=10.0, temperature_cm=1.0)
+
+    assert 0.95 < good < 1.0
+    assert abs(border - 0.5) < 1e-12
+    assert 0.0 < bad < 0.1
+
+
+def test_apply_selfmap_reliability_softens_lff_knobs_without_branch_switching():
+    args = build_argparser().parse_args(
+        [
+            "--checkpoint",
+            "output/model/latest.pth",
+            "--descriptor_source",
+            "hybrid_ply_blend",
+            "--ply_loc_feature_weight",
+            "0.9",
+            "--hybrid_residual_alpha_max",
+            "0.03",
+            "--landmark_score_calibrated_matchability_weight",
+            "0.4",
+            "--match_calibrated_prior_weight",
+            "0.2",
+            "--match_filter_calibrated_score_weight",
+            "0.25",
+            "--scene_matcher_weight",
+            "0.3",
+        ]
+    )
+
+    meta = eval_cambridge_hybrid.apply_selfmap_reliability(args, 0.25)
+
+    assert args.descriptor_source == "hybrid_ply_blend"
+    assert abs(args.ply_loc_feature_weight - 0.975) < 1e-12
+    assert abs(args.hybrid_residual_alpha_max - 0.0075) < 1e-12
+    assert abs(args.landmark_score_calibrated_matchability_weight - 0.1) < 1e-12
+    assert abs(args.match_calibrated_prior_weight - 0.05) < 1e-12
+    assert abs(args.match_filter_calibrated_score_weight - 0.0625) < 1e-12
+    assert abs(args.scene_matcher_weight - 0.075) < 1e-12
+    assert meta["rho"] == 0.25
+    assert meta["original"]["descriptor_source"] == "hybrid_ply_blend"
+
+
+def test_selfmap_reliability_can_be_loaded_from_eval_summary(tmp_path):
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(json.dumps({"dense": {"median_te": 13.0, "recall_5cm_5d": 0.2}}))
+
+    meta = eval_cambridge_hybrid.load_selfmap_reliability(
+        summary_path,
+        stage="dense",
+        center_cm=10.0,
+        temperature_cm=1.0,
+    )
+
+    assert meta["path"] == str(summary_path)
+    assert meta["stage"] == "dense"
+    assert meta["median_te_cm"] == 13.0
+    assert 0.0 < meta["rho"] < 0.1
+
+
+def test_eval_parser_exposes_selfmap_reliability_options():
+    args = build_argparser().parse_args(
+        [
+            "--checkpoint",
+            "output/model/latest.pth",
+            "--selfmap_reliability_path",
+            "output/selfmap/ShopFacade/summary.json",
+            "--selfmap_reliability_stage",
+            "sparse",
+            "--selfmap_reliability_center_cm",
+            "9",
+            "--selfmap_reliability_temperature_cm",
+            "2",
+        ]
+    )
+
+    assert args.selfmap_reliability_path == "output/selfmap/ShopFacade/summary.json"
+    assert args.selfmap_reliability_stage == "sparse"
+    assert args.selfmap_reliability_center_cm == 9.0
+    assert args.selfmap_reliability_temperature_cm == 2.0
+    config = effective_eval_config(args)
+    assert config["selfmap_reliability_path"] == "output/selfmap/ShopFacade/summary.json"
+    assert config["selfmap_reliability_stage"] == "sparse"
 
 
 def test_eval_parser_accepts_feedback_query_detector():
@@ -369,6 +470,8 @@ def test_eval_parser_exposes_scene_matcher_single_path_rerank():
             "4",
             "--scene_matcher_logit_norm",
             "zscore",
+            "--scene_matcher_listwise_dustbin",
+            "drop",
             "--match_filter_query_score_weight",
             "0.2",
         ]
@@ -378,12 +481,14 @@ def test_eval_parser_exposes_scene_matcher_single_path_rerank():
     assert args.scene_matcher_weight == 0.4
     assert args.scene_matcher_topk == 4
     assert args.scene_matcher_logit_norm == "zscore"
+    assert args.scene_matcher_listwise_dustbin == "drop"
     assert args.match_filter_query_score_weight == 0.2
     config = effective_eval_config(args)
     assert config["scene_matcher_path"] == "output/scenematch/ShopFacade/best.pt"
     assert config["scene_matcher_weight"] == 0.4
     assert config["scene_matcher_topk"] == 4
     assert config["scene_matcher_logit_norm"] == "zscore"
+    assert config["scene_matcher_listwise_dustbin"] == "drop"
     assert config["match_filter_query_score_weight"] == 0.2
 
 
@@ -546,6 +651,82 @@ def test_oracle_reprojection_match_scores_rank_existing_matches_only():
     assert scores[2] < -1.0e5
     assert stats["oracle_valid_count"] == 2.0
     assert stats["oracle_inlier2_ratio"] == 0.5
+
+
+def test_sparse_candidate_oracle_chooses_best_gt_candidate_inside_topk():
+    K = torch.eye(3, dtype=torch.float32)
+    K[0, 0] = 100.0
+    K[1, 1] = 100.0
+    pose = np.eye(4, dtype=np.float32)
+    landmark_xyz = torch.tensor(
+        [
+            [1.0, 0.0, 10.0],
+            [0.0, 0.0, 10.0],
+            [0.0, 0.2, 10.0],
+        ],
+        dtype=torch.float32,
+    )
+    query_yx = torch.tensor(
+        [
+            [0.0, 0.0],
+            [2.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    corr = torch.tensor(
+        [
+            [0.99, 0.98, 0.10],
+            [0.20, 0.10, 0.95],
+        ],
+        dtype=torch.float32,
+    )
+
+    q_ids, lm_ids, scores, stats = sparse_candidate_oracle_matches(
+        corr,
+        query_yx,
+        landmark_xyz,
+        pose,
+        K,
+        topk=2,
+        reprojection_threshold_px=1.0,
+    )
+
+    assert q_ids.tolist() == [0, 1]
+    assert lm_ids.tolist() == [1, 2]
+    assert torch.all(scores > 0.0)
+    assert stats["candidate_oracle_topk"] == 2.0
+    assert stats["candidate_oracle_positive_ratio"] == 1.0
+    assert stats["candidate_oracle_top1_positive_ratio"] == 0.5
+
+
+def test_sparse_candidate_oracle_drops_queries_without_positive_candidate():
+    K = torch.eye(3, dtype=torch.float32)
+    K[0, 0] = 100.0
+    K[1, 1] = 100.0
+    landmark_xyz = torch.tensor(
+        [
+            [1.0, 0.0, 10.0],
+            [0.0, 0.2, 10.0],
+        ],
+        dtype=torch.float32,
+    )
+    query_yx = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+    corr = torch.tensor([[0.9, 0.8]], dtype=torch.float32)
+
+    q_ids, lm_ids, scores, stats = sparse_candidate_oracle_matches(
+        corr,
+        query_yx,
+        landmark_xyz,
+        np.eye(4, dtype=np.float32),
+        K,
+        topk=2,
+        reprojection_threshold_px=1.0,
+    )
+
+    assert q_ids.numel() == 0
+    assert lm_ids.numel() == 0
+    assert scores.numel() == 0
+    assert stats["candidate_oracle_positive_count"] == 0.0
 
 
 def test_select_view_landmark_indices_enforces_spatial_diversity_before_topup():

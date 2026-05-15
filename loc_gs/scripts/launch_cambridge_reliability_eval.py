@@ -23,6 +23,10 @@ EVAL_RECIPES = (
     "lff_feedback_prosac",
     "lff_residual_prosac",
     "oracle_prosac",
+    "candidate_oracle_top1",
+    "candidate_oracle_top4",
+    "candidate_oracle_top8",
+    "candidate_oracle_top16",
     "protected",
     "learned_blend",
     "covisibility_select",
@@ -42,6 +46,10 @@ ARCHIVED_RECIPES = {
     "scene_matcher_prosac_magsac",
     "scene_matcher_coverage_prosac",
     "oracle_prosac",
+    "candidate_oracle_top1",
+    "candidate_oracle_top4",
+    "candidate_oracle_top8",
+    "candidate_oracle_top16",
 }
 
 
@@ -56,6 +64,13 @@ class EvalJob:
     query_offset: int
     group_key: str = ""
     final_output_dir: Path | None = None
+
+
+def _candidate_oracle_topk(recipe: str) -> int:
+    prefix = "candidate_oracle_top"
+    if not str(recipe).startswith(prefix):
+        return 0
+    return int(str(recipe)[len(prefix) :])
 
 
 def build_eval_command(
@@ -76,12 +91,18 @@ def build_eval_command(
     scene_matcher_weight: float = 0.35,
     scene_matcher_topk: int = 4,
     scene_matcher_logit_norm: str = "none",
+    scene_matcher_listwise_dustbin: str = "score",
     match_filter_query_score_weight: float = 0.0,
     hybrid_residual_alpha_max: float = 0.03,
+    selfmap_reliability_path: str = "",
+    selfmap_reliability_stage: str = "dense",
+    selfmap_reliability_center_cm: float = 10.0,
+    selfmap_reliability_temperature_cm: float = 1.0,
 ) -> tuple[list[str], dict[str, str]]:
     recipe = str(recipe)
     if recipe not in EVAL_RECIPES:
         raise ValueError(f"unsupported reliability eval recipe: {recipe}")
+    candidate_oracle_topk = _candidate_oracle_topk(recipe)
     if recipe == "learned_blend":
         descriptor_source = "hybrid_ply_blend"
     elif recipe in {
@@ -109,6 +130,10 @@ def build_eval_command(
                 "lff_feedback_prosac",
                 "lff_residual_prosac",
                 "oracle_prosac",
+                "candidate_oracle_top1",
+                "candidate_oracle_top4",
+                "candidate_oracle_top8",
+                "candidate_oracle_top16",
             }
             else "opencv"
         )
@@ -232,6 +257,10 @@ def build_eval_command(
         "lff_feedback_prosac",
         "lff_residual_prosac",
         "oracle_prosac",
+        "candidate_oracle_top1",
+        "candidate_oracle_top4",
+        "candidate_oracle_top8",
+        "candidate_oracle_top16",
     }:
         cmd.extend(
             [
@@ -294,6 +323,8 @@ def build_eval_command(
                 str(float(scene_matcher_weight)),
                 "--scene_matcher_topk",
                 str(int(scene_matcher_topk)),
+                "--scene_matcher_listwise_dustbin",
+                str(scene_matcher_listwise_dustbin),
             ]
         )
         if str(scene_matcher_logit_norm) != "none":
@@ -305,6 +336,19 @@ def build_eval_command(
                 calibrated_matchability_path,
                 "--landmark_score_calibrated_matchability_weight",
                 str(float(calibrated_matchability_weight)),
+            ]
+        )
+    if selfmap_reliability_path:
+        cmd.extend(
+            [
+                "--selfmap_reliability_path",
+                selfmap_reliability_path,
+                "--selfmap_reliability_stage",
+                str(selfmap_reliability_stage),
+                "--selfmap_reliability_center_cm",
+                str(float(selfmap_reliability_center_cm)),
+                "--selfmap_reliability_temperature_cm",
+                str(float(selfmap_reliability_temperature_cm)),
             ]
         )
     if recipe in {"covisibility_prosac_loftr", "lff_residual_prosac_loftr"}:
@@ -326,6 +370,15 @@ def build_eval_command(
         )
     if recipe == "oracle_prosac":
         cmd.extend(["--oracle_match_order", "sparse_reprojection"])
+    if candidate_oracle_topk > 0:
+        cmd.extend(
+            [
+                "--sparse_candidate_topk",
+                str(candidate_oracle_topk),
+                "--sparse_candidate_oracle_topk",
+                str(candidate_oracle_topk),
+            ]
+        )
     if max_queries > 0:
         cmd.extend(["--max_queries", str(int(max_queries))])
     if query_stride != 1:
@@ -383,8 +436,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--scene_matcher_weight", type=float, default=0.35)
     parser.add_argument("--scene_matcher_topk", type=int, default=4)
     parser.add_argument("--scene_matcher_logit_norm", choices=["none", "center", "zscore"], default="none")
+    parser.add_argument("--scene_matcher_listwise_dustbin", choices=["score", "drop"], default="score")
     parser.add_argument("--match_filter_query_score_weight", type=float, default=0.0)
     parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.03)
+    parser.add_argument(
+        "--selfmap_reliability_template",
+        default="",
+        help="Per-scene self-map eval summary template used for soft LFF reliability.",
+    )
+    parser.add_argument("--selfmap_reliability_stage", choices=["sparse", "dense"], default="dense")
+    parser.add_argument("--selfmap_reliability_center_cm", type=float, default=10.0)
+    parser.add_argument("--selfmap_reliability_temperature_cm", type=float, default=1.0)
     parser.add_argument("--gpus", default="")
     parser.add_argument("--max_memory_used_mb", type=int, default=1000)
     parser.add_argument("--max_utilization", type=int, default=10)
@@ -462,6 +524,11 @@ def main() -> None:
             if args.scene_matcher_template
             else ""
         )
+        selfmap_reliability_path = (
+            args.selfmap_reliability_template.format(scene=job.scene, tag=args.tag, recipe=job.recipe)
+            if args.selfmap_reliability_template
+            else ""
+        )
         if calibrated_path and not args.dry_run and not Path(calibrated_path).exists():
             raise FileNotFoundError(f"calibrated matchability not found for {job.scene}: {calibrated_path}")
         if job.recipe in {
@@ -473,6 +540,10 @@ def main() -> None:
             raise ValueError("scene_matcher_prosac requires --scene_matcher_template")
         if scene_matcher_path and not args.dry_run and not Path(scene_matcher_path).exists():
             raise FileNotFoundError(f"scene matcher checkpoint not found for {job.scene}: {scene_matcher_path}")
+        if selfmap_reliability_path and not args.dry_run and not Path(selfmap_reliability_path).exists():
+            raise FileNotFoundError(
+                f"self-map reliability summary not found for {job.scene}: {selfmap_reliability_path}"
+            )
         cmd, env = build_eval_command(
             gpu_id=gpu_id,
             scene=job.scene,
@@ -490,8 +561,13 @@ def main() -> None:
             scene_matcher_weight=args.scene_matcher_weight,
             scene_matcher_topk=args.scene_matcher_topk,
             scene_matcher_logit_norm=args.scene_matcher_logit_norm,
+            scene_matcher_listwise_dustbin=args.scene_matcher_listwise_dustbin,
             match_filter_query_score_weight=args.match_filter_query_score_weight,
             hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
+            selfmap_reliability_path=selfmap_reliability_path,
+            selfmap_reliability_stage=args.selfmap_reliability_stage,
+            selfmap_reliability_center_cm=args.selfmap_reliability_center_cm,
+            selfmap_reliability_temperature_cm=args.selfmap_reliability_temperature_cm,
         )
         print(" ".join(cmd), f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
         if args.dry_run:

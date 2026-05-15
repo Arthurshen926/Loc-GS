@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from loc_gs.data.cambridge_dataset import CambridgeHybridDataset
 from loc_gs.localization.stdloc_detector import StdlocKeypointDetector, extract_stdloc_detector_keypoints
-from loc_gs.localization.scene_matcher import label_scene_match_pairs
+from loc_gs.localization.scene_matcher import label_scene_match_pairs, label_scene_match_topk_candidates
 from loc_gs.localization.stdloc_parity import apply_match_prior
 from loc_gs.losses.cross_view import projective_view_overlap
 from loc_gs.losses.localization_loss import project_world_to_image_yx
@@ -209,6 +209,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.05)
     parser.add_argument("--locability_prior_weight", type=float, default=0.05)
     parser.add_argument("--scene_match_pair_output_path", default="")
+    parser.add_argument("--scene_match_pair_format", choices=["pair", "listwise"], default="pair")
     parser.add_argument("--scene_match_pair_sample_limit", type=int, default=200000)
     parser.add_argument(
         "--scene_match_pair_train_fraction",
@@ -371,20 +372,36 @@ def main(args: argparse.Namespace | None = None) -> None:
     fp = torch.zeros_like(tp)
     landmark_desc = F.normalize(landmark_desc.float(), p=2, dim=-1)
     collect_scene_pairs = bool(args.scene_match_pair_output_path)
+    pair_format = str(getattr(args, "scene_match_pair_format", "pair"))
     pair_sample_limit = max(0, int(args.scene_match_pair_sample_limit))
     train_pair_limit = int(round(pair_sample_limit * min(max(float(args.scene_match_pair_train_fraction), 0.0), 1.0)))
     rendered_pair_limit = pair_sample_limit - train_pair_limit
     pair_phase_limits = {"train": train_pair_limit, "rendered": rendered_pair_limit}
     pair_phase_counts = {"train": 0, "rendered": 0}
-    pair_chunks: dict[str, list[torch.Tensor]] = {
-        "query_desc": [],
-        "landmark_desc": [],
-        "cosine": [],
-        "margin": [],
-        "query_score": [],
-        "landmark_prior": [],
-        "label": [],
-    }
+    if pair_format == "listwise":
+        pair_chunks: dict[str, list[torch.Tensor]] = {
+            "query_desc": [],
+            "landmark_desc": [],
+            "cosine": [],
+            "margin": [],
+            "query_score": [],
+            "landmark_prior": [],
+            "candidate_mask": [],
+            "reprojection_error": [],
+            "query_yx": [],
+            "landmark_id": [],
+            "label": [],
+        }
+    else:
+        pair_chunks = {
+            "query_desc": [],
+            "landmark_desc": [],
+            "cosine": [],
+            "margin": [],
+            "query_score": [],
+            "landmark_prior": [],
+            "label": [],
+        }
     pair_sample_count = 0
 
     def should_collect_scene_match_pairs(phase: str) -> bool:
@@ -447,6 +464,56 @@ def main(args: argparse.Namespace | None = None) -> None:
         pair_sample_count += added
         pair_phase_counts[phase] = phase_count + added
 
+    def append_scene_match_listwise_groups(
+        *,
+        phase: str,
+        query_desc_all: torch.Tensor,
+        lm_topk: torch.Tensor,
+        scores_topk: torch.Tensor,
+        labels: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        reprojection_error: torch.Tensor,
+        margins: torch.Tensor,
+        query_yx_all: torch.Tensor | None = None,
+        query_scores_all: torch.Tensor | None = None,
+    ) -> None:
+        nonlocal pair_sample_count
+        phase = str(phase)
+        if phase not in pair_phase_limits:
+            raise ValueError(f"unsupported scene match pair phase: {phase}")
+        phase_limit = int(pair_phase_limits[phase])
+        phase_count = int(pair_phase_counts[phase])
+        if not should_collect_scene_match_pairs(phase):
+            return
+        remaining = phase_limit - phase_count
+        topk = int(lm_topk.shape[1])
+        labels = labels.long().reshape(-1)
+        group_score = scores_topk.float().amax(dim=1)
+        if labels.numel() == 0:
+            return
+        keep = torch.argsort(group_score, descending=True)[:remaining]
+        if query_scores_all is None:
+            query_scores = torch.ones(query_desc_all.shape[0], device=scores_topk.device, dtype=scores_topk.dtype)
+        else:
+            query_scores = query_scores_all.to(device=scores_topk.device, dtype=scores_topk.dtype).reshape(-1)
+        pair_chunks["query_desc"].append(query_desc_all[keep].detach().cpu().half())
+        pair_chunks["landmark_desc"].append(landmark_desc[lm_topk[keep]].detach().cpu().half())
+        pair_chunks["cosine"].append(scores_topk[keep].detach().cpu().float())
+        pair_chunks["margin"].append(margins[keep].detach().cpu().float())
+        pair_chunks["query_score"].append(query_scores[keep].detach().cpu().float())
+        pair_chunks["landmark_prior"].append(landmark_prior[lm_topk[keep]].detach().cpu().float())
+        pair_chunks["candidate_mask"].append(candidate_mask[keep].detach().cpu().bool())
+        pair_chunks["reprojection_error"].append(reprojection_error[keep].detach().cpu().float())
+        if query_yx_all is None:
+            pair_chunks["query_yx"].append(torch.empty((int(keep.numel()), 2), dtype=torch.float32))
+        else:
+            pair_chunks["query_yx"].append(query_yx_all[keep].detach().cpu().float())
+        pair_chunks["landmark_id"].append(lm_topk[keep].detach().cpu().long())
+        pair_chunks["label"].append(labels[keep].detach().cpu().long())
+        added = int(keep.numel())
+        pair_sample_count += added
+        pair_phase_counts[phase] = phase_count + added
+
     def accumulate_query(
         *,
         phase: str,
@@ -464,6 +531,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         corr = apply_match_prior(raw_corr.unsqueeze(0), landmark_prior, weight=args.locability_prior_weight)[0]
         k = min(max(1, int(args.topk)), int(corr.shape[-1]))
         _vals, lm_topk = torch.topk(corr, k=k, dim=-1)
+        raw_scores_topk = raw_corr.gather(dim=-1, index=lm_topk)
         q_ids = torch.arange(lm_topk.shape[0], device=device).view(-1, 1).expand_as(lm_topk).reshape(-1)
         lm_ids = lm_topk.reshape(-1)
         top2 = torch.topk(corr, k=min(2, int(corr.shape[-1])), dim=-1).values
@@ -471,7 +539,33 @@ def main(args: argparse.Namespace | None = None) -> None:
             margin_by_query = top2[:, 0] - top2[:, 1]
         else:
             margin_by_query = torch.zeros(corr.shape[0], device=device, dtype=corr.dtype)
-        if should_collect_scene_match_pairs(phase):
+        if should_collect_scene_match_pairs(phase) and pair_format == "listwise":
+            list_labels, candidate_mask, _errors = label_scene_match_topk_candidates(
+                query_yx=query_yx,
+                landmark_xyz=landmark_xyz,
+                lm_topk=lm_topk,
+                pose_w2c=pose_w2c.to(device),
+                K=K,
+                reprojection_threshold_px=args.reprojection_threshold_px,
+                depth_map=depth_map,
+                alpha_map=alpha_map,
+                depth_abs_tolerance=args.visibility_depth_abs_tolerance,
+                depth_rel_tolerance=args.visibility_depth_rel_tolerance,
+                alpha_threshold=args.visibility_alpha_threshold,
+            )
+            append_scene_match_listwise_groups(
+                phase=phase,
+                query_desc_all=query_desc,
+                lm_topk=lm_topk,
+                scores_topk=raw_scores_topk,
+                labels=list_labels,
+                candidate_mask=candidate_mask,
+                reprojection_error=_errors,
+                margins=margin_by_query,
+                query_yx_all=query_yx,
+                query_scores_all=query_scores,
+            )
+        elif should_collect_scene_match_pairs(phase):
             pair_labels = label_scene_match_pairs(
                 query_yx=query_yx,
                 landmark_xyz=landmark_xyz,
@@ -491,7 +585,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 query_desc_all=query_desc,
                 q_ids=q_ids,
                 lm_ids=lm_ids,
-                scores=raw_corr[q_ids, lm_ids],
+                scores=raw_scores_topk.reshape(-1),
                 labels=pair_labels,
                 margins=margin_by_query[q_ids],
                 query_scores_all=query_scores,
@@ -815,15 +909,22 @@ def main(args: argparse.Namespace | None = None) -> None:
             "samples": int(pair_sample_count),
             "sample_limit": int(pair_sample_limit),
             "train_fraction": float(args.scene_match_pair_train_fraction),
+            "format": pair_format,
+            "selection": "query_topk_score_natural" if pair_format == "listwise" else "balanced_pair_score",
             "phase_limits": {key: int(value) for key, value in pair_phase_limits.items()},
             "phase_counts": {key: int(value) for key, value in pair_phase_counts.items()},
             "topk": int(args.topk),
             "reprojection_threshold_px": float(args.reprojection_threshold_px),
             "source": "calibrate_landmark_matchability",
+            "fields": sorted(pair_payload.keys()),
         }
         torch.save(pair_payload, pair_output_path)
         pair_sidecar = pair_output_path.with_suffix(".json")
-        positives = pair_payload["label"].float().sum() if pair_payload["label"].numel() else torch.tensor(0.0)
+        if pair_format == "listwise":
+            labels = pair_payload["label"].long().reshape(-1)
+            positives = (labels < int(args.topk)).float().sum() if labels.numel() else torch.tensor(0.0)
+        else:
+            positives = pair_payload["label"].float().sum() if pair_payload["label"].numel() else torch.tensor(0.0)
         pair_sidecar.write_text(
             json.dumps(
                 {

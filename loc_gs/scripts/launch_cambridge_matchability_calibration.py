@@ -27,7 +27,9 @@ def build_calibration_command(
     descriptor_source: str = "ply_loc",
     hybrid_residual_alpha_max: float = 0.05,
     rendered_query_source: str = "rendered_rgb_teacher",
+    visibility_check: str = "rendered",
     scene_match_pair_output_path: str = "",
+    scene_match_pair_format: str = "pair",
     scene_match_pair_sample_limit: int = 200000,
     scene_match_pair_train_fraction: float = 1.0,
 ) -> tuple[list[str], dict[str, str]]:
@@ -75,6 +77,8 @@ def build_calibration_command(
         "5.0",
         "--rendered_view_pair_min_overlap",
         "0.15",
+        "--visibility_check",
+        str(visibility_check),
         "--locability_prior_weight",
         "0.05",
         "--device",
@@ -87,6 +91,8 @@ def build_calibration_command(
             [
                 "--scene_match_pair_output_path",
                 scene_match_pair_output_path,
+                "--scene_match_pair_format",
+                str(scene_match_pair_format),
                 "--scene_match_pair_sample_limit",
                 str(int(scene_match_pair_sample_limit)),
                 "--scene_match_pair_train_fraction",
@@ -130,7 +136,9 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.05)
     parser.add_argument("--rendered_query_source", choices=["rendered_rgb_teacher", "feature_field"], default="rendered_rgb_teacher")
+    parser.add_argument("--visibility_check", choices=["none", "rendered"], default="rendered")
     parser.add_argument("--scene_match_pair_output_root", default="")
+    parser.add_argument("--scene_match_pair_format", choices=["pair", "listwise"], default="pair")
     parser.add_argument("--scene_match_pair_sample_limit", type=int, default=200000)
     parser.add_argument("--scene_match_pair_train_fraction", type=float, default=1.0)
     parser.add_argument("--gpus", default="")
@@ -182,7 +190,9 @@ def main() -> None:
             descriptor_source=args.descriptor_source,
             hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
             rendered_query_source=args.rendered_query_source,
+            visibility_check=args.visibility_check,
             scene_match_pair_output_path="" if pair_output_path is None else str(pair_output_path),
+            scene_match_pair_format=args.scene_match_pair_format,
             scene_match_pair_sample_limit=args.scene_match_pair_sample_limit,
             scene_match_pair_train_fraction=args.scene_match_pair_train_fraction,
         )

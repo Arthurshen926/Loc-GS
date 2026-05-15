@@ -159,17 +159,34 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
-def _branch_path(spec: Any, key: str) -> str:
+def _normalise_result_path(value: Any) -> str:
+    path = Path(str(value))
+    return str(path.parent if path.name == "summary.json" else path)
+
+
+def _branch_paths(spec: Any, key: str) -> list[str]:
     if isinstance(spec, str):
-        return spec
+        return [spec]
     if not isinstance(spec, dict):
         raise TypeError(f"branch spec must be a string or dict, got {type(spec)!r}")
+    plural_key = f"{key}s"
+    for candidate in (plural_key, "result_dirs", "eval_dirs", "dirs"):
+        value = spec.get(candidate)
+        if value:
+            if isinstance(value, (str, Path)):
+                return [_normalise_result_path(value)]
+            return [_normalise_result_path(item) for item in value]
     for candidate in (key, "result_dir", "eval_dir", "dir", "summary", "summary_json"):
         value = spec.get(candidate)
         if value:
-            path = Path(str(value))
-            return str(path.parent if path.name == "summary.json" else path)
+            if isinstance(value, (list, tuple)):
+                return [_normalise_result_path(item) for item in value]
+            return [_normalise_result_path(value)]
     raise KeyError(f"branch spec lacks {key}/result_dir/eval_dir: {spec}")
+
+
+def _branch_path(spec: Any, key: str) -> str:
+    return _branch_paths(spec, key)[0]
 
 
 def load_branch_manifest(path: str | Path) -> dict[str, dict[str, dict[str, Any]]]:
@@ -221,6 +238,7 @@ def select_scene_branch(
     allow_r5_drop: float = 0.0,
     r5_tie: float = 0.01,
     candidate_min_r5: float = 0.0,
+    candidate_max_median_te_cm: float = math.inf,
     max_median_te_increase_cm: float = math.inf,
     tie_prefer_branch: str = "",
     tie_max_te_increase_cm: float = 0.0,
@@ -234,6 +252,8 @@ def select_scene_branch(
     for name, metrics in branch_metrics.items():
         if baseline is not None and name != baseline_branch:
             if float(metrics["recall_5cm_5d"]) < float(candidate_min_r5):
+                continue
+            if float(metrics["median_te"]) > float(candidate_max_median_te_cm):
                 continue
             if float(metrics["recall_5cm_5d"]) < float(baseline["recall_5cm_5d"]) - float(allow_r5_drop):
                 continue
@@ -288,6 +308,7 @@ def select_branches(
     allow_r5_drop: float,
     r5_tie: float,
     candidate_min_r5: float = 0.0,
+    candidate_max_median_te_cm: float = math.inf,
     max_median_te_increase_cm: float = math.inf,
     tie_prefer_branch: str = "",
     tie_max_te_increase_cm: float = 0.0,
@@ -299,17 +320,23 @@ def select_branches(
     for scene, branches in manifest.items():
         metrics_by_branch: dict[str, dict[str, float]] = {}
         rows_by_branch: dict[str, int] = {}
+        sources_by_branch: dict[str, int] = {}
         for branch, spec in branches.items():
-            result_dir = _branch_path(spec, "calibration_dir")
-            rows = load_result_rows(result_dir, stage=stage)
-            rows = filter_rows(
-                rows,
-                ids=calibration_ids,
-                stride=calibration_stride,
-                offset=calibration_offset,
-            )
+            result_dirs = _branch_paths(spec, "calibration_dir")
+            rows = []
+            for result_dir in result_dirs:
+                source_rows = load_result_rows(result_dir, stage=stage)
+                rows.extend(
+                    filter_rows(
+                        source_rows,
+                        ids=calibration_ids,
+                        stride=calibration_stride,
+                        offset=calibration_offset,
+                    )
+                )
             metrics_by_branch[branch] = summarize_rows(rows)
             rows_by_branch[branch] = len(rows)
+            sources_by_branch[branch] = len(result_dirs)
         selected_branch, selected_metrics = select_scene_branch(
             metrics_by_branch,
             baseline_branch=baseline_branch,
@@ -318,6 +345,7 @@ def select_branches(
             allow_r5_drop=allow_r5_drop,
             r5_tie=r5_tie,
             candidate_min_r5=candidate_min_r5,
+            candidate_max_median_te_cm=candidate_max_median_te_cm,
             max_median_te_increase_cm=max_median_te_increase_cm,
             tie_prefer_branch=tie_prefer_branch,
             tie_max_te_increase_cm=tie_max_te_increase_cm,
@@ -332,6 +360,7 @@ def select_branches(
             "selected_metrics": selected_metrics,
             "branches": metrics_by_branch,
             "calibration_rows": rows_by_branch,
+            "calibration_sources": sources_by_branch,
         }
     return {
         "selected_branch": selected,
@@ -344,6 +373,7 @@ def select_branches(
             "allow_r5_drop": float(allow_r5_drop),
             "r5_tie": float(r5_tie),
             "candidate_min_r5": float(candidate_min_r5),
+            "candidate_max_median_te_cm": float(candidate_max_median_te_cm),
             "max_median_te_increase_cm": float(max_median_te_increase_cm),
             "tie_prefer_branch": str(tie_prefer_branch),
             "tie_max_te_increase_cm": float(tie_max_te_increase_cm),
@@ -412,6 +442,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Reject non-baseline branches whose calibration R@5cm falls below this floor.",
     )
     parser.add_argument(
+        "--candidate_max_median_te_cm",
+        type=float,
+        default=math.inf,
+        help="Reject non-baseline branches whose calibration median translation error exceeds this absolute ceiling.",
+    )
+    parser.add_argument(
         "--max_median_te_increase_cm",
         type=float,
         default=math.inf,
@@ -444,6 +480,7 @@ def main() -> None:
         allow_r5_drop=args.allow_r5_drop,
         r5_tie=args.r5_tie,
         candidate_min_r5=args.candidate_min_r5,
+        candidate_max_median_te_cm=args.candidate_max_median_te_cm,
         max_median_te_increase_cm=args.max_median_te_increase_cm,
         tie_prefer_branch=args.tie_prefer_branch,
         tie_max_te_increase_cm=args.tie_max_te_increase_cm,

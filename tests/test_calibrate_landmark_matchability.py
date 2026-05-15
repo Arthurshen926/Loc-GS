@@ -47,6 +47,7 @@ def test_calibration_parser_defaults_to_baseline_preserving_descriptor_and_rende
     assert args.rendered_rehearsal_interpolation_max == 1.15
     assert args.scene_match_pair_sample_limit == 200000
     assert args.scene_match_pair_train_fraction == 1.0
+    assert args.scene_match_pair_format == "pair"
 
 
 def test_calibration_parser_accepts_feedback_detector():
@@ -88,6 +89,35 @@ def test_query_like_calibration_launcher_uses_rendered_rgb_teacher():
     assert cmd[cmd.index("--scene_match_pair_output_path") + 1] == "output/scenematch_pairs/OldHospital/pairs.pt"
     assert cmd[cmd.index("--scene_match_pair_sample_limit") + 1] == "1234"
     assert cmd[cmd.index("--scene_match_pair_train_fraction") + 1] == "0.5"
+
+
+def test_query_like_calibration_launcher_can_emit_listwise_pairs():
+    cmd, env = build_calibration_command(
+        gpu_id=0,
+        scene="KingsCollege",
+        checkpoint="output/stdloc_hybrid/KingsCollege/latest.pth",
+        output_path="output/calib/KingsCollege/stdloc_bank.pt",
+        scene_match_pair_output_path="output/scenematch_pairs/KingsCollege/listwise.pt",
+        scene_match_pair_format="listwise",
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert cmd[cmd.index("--scene_match_pair_output_path") + 1] == "output/scenematch_pairs/KingsCollege/listwise.pt"
+    assert cmd[cmd.index("--scene_match_pair_format") + 1] == "listwise"
+
+
+def test_query_like_calibration_launcher_can_disable_visibility_checks_for_pair_labels():
+    cmd, _env = build_calibration_command(
+        gpu_id=0,
+        scene="KingsCollege",
+        checkpoint="output/stdloc_hybrid/KingsCollege/latest.pth",
+        output_path="output/calib/KingsCollege/stdloc_bank.pt",
+        scene_match_pair_output_path="output/scenematch_pairs/KingsCollege/listwise.pt",
+        scene_match_pair_format="listwise",
+        visibility_check="none",
+    )
+
+    assert cmd[cmd.index("--visibility_check") + 1] == "none"
 
 
 def test_query_like_calibration_launcher_can_follow_lff_feedback_distribution():

@@ -125,6 +125,39 @@ def test_select_scene_branch_recall_metric_respects_median_te_guard():
     assert metrics["median_te"] == 10.0
 
 
+def test_select_scene_branch_rejects_candidate_above_absolute_median_te_ceiling():
+    branch, metrics = select_scene_branch(
+        {
+            "stdloc_baseline": {
+                "median_te": 30.0,
+                "median_ae": 0.2,
+                "recall_10cm_5d": 0.10,
+                "recall_5cm_5d": 0.05,
+                "recall_2cm_2d": 0.0,
+                "localized": 120,
+                "queries": 120,
+                "avg_inliers": 100.0,
+            },
+            "historical_selected": {
+                "median_te": 12.0,
+                "median_ae": 0.2,
+                "recall_10cm_5d": 0.70,
+                "recall_5cm_5d": 0.50,
+                "recall_2cm_2d": 0.10,
+                "localized": 120,
+                "queries": 120,
+                "avg_inliers": 100.0,
+            },
+        },
+        baseline_branch="stdloc_baseline",
+        metric="r5",
+        candidate_max_median_te_cm=10.0,
+    )
+
+    assert branch == "stdloc_baseline"
+    assert metrics["median_te"] == 30.0
+
+
 def test_select_scene_branch_can_optimize_broader_recall():
     branch, metrics = select_scene_branch(
         {
@@ -227,6 +260,42 @@ def test_select_branches_uses_calibration_stride_and_preserves_baseline(tmp_path
         "SceneB": "stdloc_baseline",
     }
     assert selection["scenes"]["SceneA"]["calibration_rows"]["stdloc_baseline"] == 2
+
+
+def test_select_branches_can_merge_multiple_calibration_dirs(tmp_path):
+    baseline_real = _write_eval_dir(tmp_path / "baseline_real", [(4.0, 1.0), (12.0, 1.0)])
+    baseline_rendered = _write_eval_dir(tmp_path / "baseline_rendered", [(11.0, 1.0), (12.0, 1.0)])
+    learned_real = _write_eval_dir(tmp_path / "learned_real", [(6.0, 1.0), (13.0, 1.0)])
+    learned_rendered = _write_eval_dir(tmp_path / "learned_rendered", [(3.0, 1.0), (4.0, 1.0)])
+    manifest = {
+        "SceneA": {
+            "stdloc_baseline": {
+                "calibration_dirs": [str(baseline_real), str(baseline_rendered)],
+                "test_dir": str(baseline_real),
+            },
+            "historical_selected": {
+                "calibration_dirs": [str(learned_real), str(learned_rendered)],
+                "test_dir": str(learned_real),
+            },
+        }
+    }
+
+    selection = select_branches(
+        manifest,
+        stage="dense",
+        calibration_ids=None,
+        calibration_stride=0,
+        calibration_offset=0,
+        baseline_branch="stdloc_baseline",
+        metric="r5",
+        te_penalty_per_cm=0.002,
+        allow_r5_drop=0.0,
+        r5_tie=0.01,
+    )
+
+    assert selection["selected_branch"] == {"SceneA": "historical_selected"}
+    assert selection["scenes"]["SceneA"]["calibration_rows"]["stdloc_baseline"] == 4
+    assert selection["scenes"]["SceneA"]["calibration_sources"]["historical_selected"] == 2
 
 
 def test_eval_selected_branches_aggregates_test_dirs(tmp_path):

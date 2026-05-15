@@ -44,6 +44,7 @@ from loc_gs.localization.scene_matcher import (
     best_pair_per_query_indices,
     load_scene_matcher,
     score_scene_match_pairs,
+    select_scene_match_listwise_candidates,
 )
 from loc_gs.localization.stdloc_parity import (
     apply_match_prior,
@@ -174,6 +175,109 @@ def resolve_matchers(args: argparse.Namespace) -> tuple[str, str]:
         getattr(args, "sparse_matcher", ""),
         getattr(args, "dense_matcher", ""),
     )
+
+
+def selfmap_reliability_weight(
+    median_te_cm: float,
+    *,
+    center_cm: float = 10.0,
+    temperature_cm: float = 1.0,
+) -> float:
+    """Map self-localization median translation error to a soft LFF strength."""
+    if float(temperature_cm) <= 0.0:
+        raise ValueError("selfmap reliability temperature must be positive")
+    median = float(median_te_cm)
+    if not math.isfinite(median):
+        return 0.0
+    z = (float(center_cm) - median) / float(temperature_cm)
+    if z >= 0.0:
+        exp_neg = math.exp(-z)
+        return float(1.0 / (1.0 + exp_neg))
+    exp_pos = math.exp(z)
+    return float(exp_pos / (1.0 + exp_pos))
+
+
+def _summary_metric(metrics: dict[str, object], names: tuple[str, ...]) -> float | None:
+    for name in names:
+        value = metrics.get(name)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def load_selfmap_reliability(
+    path: str | Path,
+    *,
+    stage: str = "dense",
+    center_cm: float = 10.0,
+    temperature_cm: float = 1.0,
+) -> dict[str, object]:
+    """Load a self-map eval summary and convert it to a continuous reliability weight."""
+    summary_path = Path(path)
+    if summary_path.is_dir():
+        summary_path = summary_path / "summary.json"
+    if not summary_path.exists():
+        raise FileNotFoundError(f"self-map reliability summary not found: {summary_path}")
+    data = json.loads(summary_path.read_text(encoding="utf-8"))
+    metrics_obj = data.get(stage, data)
+    if not isinstance(metrics_obj, dict):
+        raise KeyError(f"self-map reliability summary {summary_path} does not contain stage '{stage}'")
+    median_te = _summary_metric(metrics_obj, ("median_te", "median_te_cm", "median_translation_cm"))
+    if median_te is None:
+        raise KeyError(f"self-map reliability summary {summary_path} does not contain median_te for stage '{stage}'")
+    recall_5 = _summary_metric(metrics_obj, ("recall_5cm_5d", "recall_5cm_5deg", "r5"))
+    rho = selfmap_reliability_weight(
+        median_te,
+        center_cm=float(center_cm),
+        temperature_cm=float(temperature_cm),
+    )
+    return {
+        "enabled": True,
+        "path": str(summary_path),
+        "stage": str(stage),
+        "median_te_cm": float(median_te),
+        "recall_5cm_5d": None if recall_5 is None else float(recall_5),
+        "center_cm": float(center_cm),
+        "temperature_cm": float(temperature_cm),
+        "rho": float(rho),
+    }
+
+
+def _args_weight_snapshot(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "descriptor_source": str(getattr(args, "descriptor_source", "")),
+        "ply_loc_feature_weight": float(getattr(args, "ply_loc_feature_weight", 0.5)),
+        "hybrid_residual_alpha_max": float(getattr(args, "hybrid_residual_alpha_max", 0.05)),
+        "landmark_score_calibrated_matchability_weight": float(
+            getattr(args, "landmark_score_calibrated_matchability_weight", 0.0)
+        ),
+        "match_calibrated_prior_weight": float(getattr(args, "match_calibrated_prior_weight", 0.0)),
+        "match_filter_calibrated_score_weight": float(
+            getattr(args, "match_filter_calibrated_score_weight", 0.0)
+        ),
+        "scene_matcher_weight": float(getattr(args, "scene_matcher_weight", 0.0)),
+    }
+
+
+def apply_selfmap_reliability(args: argparse.Namespace, rho: float) -> dict[str, object]:
+    """Scale continuous LFF/reliability knobs without selecting a separate branch."""
+    weight = min(max(float(rho), 0.0), 1.0)
+    original = _args_weight_snapshot(args)
+    base_ply = min(max(float(original["ply_loc_feature_weight"]), 0.0), 1.0)
+    args.ply_loc_feature_weight = 1.0 - weight * (1.0 - base_ply)
+    args.hybrid_residual_alpha_max = float(original["hybrid_residual_alpha_max"]) * weight
+    args.landmark_score_calibrated_matchability_weight = (
+        float(original["landmark_score_calibrated_matchability_weight"]) * weight
+    )
+    args.match_calibrated_prior_weight = float(original["match_calibrated_prior_weight"]) * weight
+    args.match_filter_calibrated_score_weight = float(original["match_filter_calibrated_score_weight"]) * weight
+    args.scene_matcher_weight = float(original["scene_matcher_weight"]) * weight
+    return {
+        "enabled": True,
+        "rho": float(weight),
+        "original": original,
+        "effective": _args_weight_snapshot(args),
+    }
 
 
 @torch.no_grad()
@@ -719,6 +823,12 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
         "scene_matcher_weight": float(getattr(args, "scene_matcher_weight", 0.0)),
         "scene_matcher_topk": int(getattr(args, "scene_matcher_topk", 1)),
         "scene_matcher_logit_norm": str(getattr(args, "scene_matcher_logit_norm", "none")),
+        "scene_matcher_listwise_dustbin": str(getattr(args, "scene_matcher_listwise_dustbin", "score")),
+        "sparse_candidate_topk": int(getattr(args, "sparse_candidate_topk", 0)),
+        "sparse_candidate_oracle_topk": int(getattr(args, "sparse_candidate_oracle_topk", 0)),
+        "sparse_candidate_oracle_threshold_px": None
+        if getattr(args, "sparse_candidate_oracle_threshold_px", None) is None
+        else float(getattr(args, "sparse_candidate_oracle_threshold_px")),
         "match_filter_mode": str(getattr(args, "match_filter_mode", "")),
         "match_filter_calibrated_score_weight": float(getattr(args, "match_filter_calibrated_score_weight", 0.0)),
         "match_filter_margin_weight": float(getattr(args, "match_filter_margin_weight", 0.0)),
@@ -740,6 +850,13 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
         "pnp_hypothesis_min_score_gain": float(getattr(args, "pnp_hypothesis_min_score_gain", 0.0)),
         "oracle_match_order": str(getattr(args, "oracle_match_order", "none")),
         "hybrid_residual_alpha_max": float(getattr(args, "hybrid_residual_alpha_max", 0.05)),
+        "selfmap_reliability_path": str(getattr(args, "selfmap_reliability_path", "")),
+        "selfmap_reliability_stage": str(getattr(args, "selfmap_reliability_stage", "dense")),
+        "selfmap_reliability_center_cm": float(getattr(args, "selfmap_reliability_center_cm", 10.0)),
+        "selfmap_reliability_temperature_cm": float(
+            getattr(args, "selfmap_reliability_temperature_cm", 1.0)
+        ),
+        "selfmap_reliability": getattr(args, "selfmap_reliability", {"enabled": False}),
     }
 
 
@@ -927,6 +1044,82 @@ def oracle_reprojection_match_scores_np(
         stats["oracle_inlier2_ratio"] = float(np.mean(valid_errors <= 2.0))
         stats["oracle_inlier8_ratio"] = float(np.mean(valid_errors <= 8.0))
     return scores, stats
+
+
+def sparse_candidate_oracle_matches(
+    corr: torch.Tensor,
+    query_yx: torch.Tensor,
+    landmark_xyz: torch.Tensor,
+    pose_w2c: np.ndarray | torch.Tensor,
+    K: torch.Tensor,
+    *,
+    topk: int,
+    reprojection_threshold_px: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Choose the best GT-consistent landmark from each query keypoint's top-K candidates.
+
+    This diagnostic oracle creates one correspondence per query keypoint at most.
+    It is intentionally analysis-only: GT pose is used to measure whether the
+    right landmark is present in the descriptor candidate pool.
+    """
+    if corr.ndim != 2:
+        raise ValueError("corr must have shape [num_query_keypoints, num_landmarks]")
+    device = corr.device
+    dtype = corr.dtype
+    num_queries = int(corr.shape[0])
+    num_landmarks = int(corr.shape[1])
+    empty_ids = torch.empty(0, dtype=torch.long, device=device)
+    empty_scores = torch.empty(0, dtype=dtype, device=device)
+    requested_topk = max(1, int(topk))
+    effective_topk = min(requested_topk, num_landmarks) if num_landmarks > 0 else 0
+    stats: dict[str, float] = {
+        "candidate_oracle_topk": float(effective_topk),
+        "candidate_oracle_query_count": float(num_queries),
+        "candidate_oracle_candidate_count": float(num_queries * effective_topk),
+        "candidate_oracle_positive_count": 0.0,
+        "candidate_oracle_positive_ratio": 0.0,
+        "candidate_oracle_top1_positive_ratio": 0.0,
+    }
+    if num_queries == 0 or effective_topk == 0:
+        return empty_ids, empty_ids, empty_scores, stats
+
+    values, topk_landmarks = torch.topk(corr.float(), k=effective_topk, dim=-1)
+    flat_landmarks = topk_landmarks.reshape(-1)
+    points = landmark_xyz.to(device=device, dtype=torch.float32)[flat_landmarks].view(1, -1, 3)
+    pose = torch.as_tensor(pose_w2c, device=device, dtype=torch.float32).reshape(1, 4, 4)
+    intr = K.to(device=device, dtype=torch.float32)
+    projected, valid_z = project_world_to_image_yx(points, pose, intr)
+    projected = projected.view(num_queries, effective_topk, 2)
+    valid_z = valid_z.view(num_queries, effective_topk)
+    query = query_yx.to(device=device, dtype=torch.float32).view(num_queries, 1, 2)
+    errors = torch.linalg.norm(projected - query, dim=-1)
+    finite = valid_z & torch.isfinite(errors)
+    threshold = float(reprojection_threshold_px)
+    positive = finite & (errors <= threshold)
+    stats["candidate_oracle_valid_candidate_ratio"] = float(finite.float().mean().item())
+    stats["candidate_oracle_top1_positive_ratio"] = float(positive[:, 0].float().mean().item())
+
+    masked_errors = errors.masked_fill(~positive, float("inf"))
+    best_errors, best_cols = masked_errors.min(dim=1)
+    has_positive = torch.isfinite(best_errors)
+    positive_count = int(has_positive.sum().item())
+    stats["candidate_oracle_positive_count"] = float(positive_count)
+    stats["candidate_oracle_positive_ratio"] = float(positive_count / max(num_queries, 1))
+    if positive_count == 0:
+        return empty_ids, empty_ids, empty_scores, stats
+
+    q_ids = torch.where(has_positive)[0]
+    cols = best_cols[q_ids]
+    lm_ids = topk_landmarks[q_ids, cols]
+    selected_errors = best_errors[q_ids]
+    selected_desc_scores = values[q_ids, cols]
+    scores = (threshold - selected_errors).to(dtype=dtype)
+    stats["candidate_oracle_reproj_median_px"] = float(selected_errors.median().item())
+    stats["candidate_oracle_reproj_mean_px"] = float(selected_errors.mean().item())
+    stats["candidate_oracle_descriptor_score_mean"] = float(selected_desc_scores.mean().item())
+    stats["candidate_oracle_inlier2_ratio"] = float((selected_errors <= 2.0).float().mean().item())
+    stats["candidate_oracle_inlier8_ratio"] = float((selected_errors <= 8.0).float().mean().item())
+    return q_ids, lm_ids.to(device=device, dtype=torch.long), scores, stats
 
 
 def _balanced_topk_by_coords(
@@ -2371,6 +2564,11 @@ def localize_one(
         if use_scene_matcher and not bool(getattr(args, "mnn", False))
         else 1
     )
+    sparse_candidate_topk = max(
+        sparse_candidate_topk,
+        int(getattr(args, "sparse_candidate_topk", 0)),
+        int(getattr(args, "sparse_candidate_oracle_topk", 0)),
+    )
     sparse_reprojection_error = (
         args.sparse_reprojection_error
         if args.sparse_reprojection_error is not None
@@ -2384,6 +2582,7 @@ def localize_one(
     sparse_matcher, dense_matcher = resolve_matchers(args)
     sparse_margin_by_query = None
     sparse_diag_corr = None
+    sparse_match_corr = None
     calibrated_sparse_reliability = landmark_filter_reliability
     if sparse_matcher == "stdloc_parity":
         corr = query_desc.float() @ F.normalize(landmark_desc.float(), dim=-1).T
@@ -2393,6 +2592,7 @@ def localize_one(
             calibrated_sparse_reliability,
             weight=match_calibrated_prior_weight,
         )
+        sparse_match_corr = corr[0]
         sparse_diag_corr = corr[0]
         _b, q_ids, lm_ids, _scores = match_correlation_matrix(
             corr,
@@ -2436,6 +2636,7 @@ def localize_one(
             calibrated_sparse_reliability,
             weight=match_calibrated_prior_weight,
         )
+        sparse_match_corr = corr[0]
         _b, q_ids, lm_ids, _scores = match_correlation_matrix(
             corr,
             threshold=args.sparse_match_threshold,
@@ -2475,6 +2676,7 @@ def localize_one(
             calibrated_sparse_reliability,
             weight=match_calibrated_prior_weight,
         )
+        sparse_match_corr = corr[0]
         _b, q_ids, lm_ids, _scores = match_correlation_matrix(
             corr,
             threshold=args.sparse_match_threshold,
@@ -2492,8 +2694,28 @@ def localize_one(
     ):
         top2 = torch.topk(sparse_diag_corr, k=2, dim=-1).values
         sparse_margin_by_query = (top2[:, 0] - top2[:, 1])[q_ids]
+    candidate_oracle_stats = None
+    candidate_oracle_topk = int(getattr(args, "sparse_candidate_oracle_topk", 0))
+    if candidate_oracle_topk > 0:
+        if gt_pose_w2c is None:
+            raise ValueError("sparse_candidate_oracle_topk requires gt_pose_w2c")
+        if sparse_match_corr is None:
+            raise ValueError("sparse candidate oracle requires sparse descriptor correlations")
+        candidate_threshold = getattr(args, "sparse_candidate_oracle_threshold_px", None)
+        if candidate_threshold is None:
+            candidate_threshold = sparse_reprojection_error
+        q_ids, lm_ids, _scores, candidate_oracle_stats = sparse_candidate_oracle_matches(
+            sparse_match_corr,
+            keypoints + sparse_query_offset,
+            landmark_xyz,
+            gt_pose_w2c,
+            sparse_K,
+            topk=candidate_oracle_topk,
+            reprojection_threshold_px=float(candidate_threshold),
+        )
+        sparse_margin_by_query = None
     sparse_scene_match_logits = None
-    if use_scene_matcher and q_ids.numel() > 0:
+    if candidate_oracle_stats is None and use_scene_matcher and q_ids.numel() > 0:
         pair_prior = landmark_prior[lm_ids] if landmark_prior is not None else None
         pair_calibrated = (
             calibrated_sparse_reliability[lm_ids]
@@ -2506,31 +2728,63 @@ def localize_one(
         ).sum(dim=-1)
         scene_extra = None
         matcher_scalar_dim = int(getattr(scene_matcher, "config", {}).get("scalar_dim", 4))
-        if matcher_scalar_dim > 4:
-            scene_extra = kp_scores[q_ids].float().reshape(-1, 1)
-        sparse_scene_match_logits = score_scene_match_pairs(
-            scene_matcher,
-            query_desc[q_ids],
-            landmark_desc[lm_ids],
-            cosine=raw_pair_cosine,
-            margin=sparse_margin_by_query,
-            landmark_prior=pair_prior,
-            calibrated_prior=pair_calibrated,
-            extra_scalar_features=scene_extra,
-        )
-        sparse_scene_match_logits = _normalize_scene_match_logits(
-            sparse_scene_match_logits,
-            getattr(args, "scene_matcher_logit_norm", "none"),
-        )
-        _scores = _scores.float() + scene_matcher_weight * sparse_scene_match_logits
-        if sparse_candidate_topk > 1:
-            best = best_pair_per_query_indices(q_ids, _scores, num_queries=query_desc.shape[0])
-            q_ids = q_ids[best]
-            lm_ids = lm_ids[best]
-            _scores = _scores[best]
-            sparse_scene_match_logits = sparse_scene_match_logits[best]
-            if sparse_margin_by_query is not None:
-                sparse_margin_by_query = sparse_margin_by_query[best]
+        matcher_type = str(getattr(scene_matcher, "config", {}).get("model_type", "pairwise"))
+        if matcher_type == "listwise":
+            selected, selected_logits = select_scene_match_listwise_candidates(
+                scene_matcher,
+                query_desc,
+                landmark_desc,
+                q_ids,
+                lm_ids,
+                cosine=raw_pair_cosine,
+                margin=sparse_margin_by_query,
+                landmark_prior=pair_prior,
+                calibrated_prior=pair_calibrated,
+                query_score=kp_scores if matcher_scalar_dim > 4 else None,
+                drop_dustbin=str(getattr(args, "scene_matcher_listwise_dustbin", "score")) == "drop",
+            )
+            if selected.numel() == 0:
+                q_ids = q_ids.new_empty(0)
+                lm_ids = lm_ids.new_empty(0)
+                _scores = _scores.new_empty(0)
+                sparse_scene_match_logits = _scores.float()
+                sparse_margin_by_query = None
+            else:
+                sparse_scene_match_logits = _normalize_scene_match_logits(
+                    selected_logits,
+                    getattr(args, "scene_matcher_logit_norm", "none"),
+                )
+                q_ids = q_ids[selected]
+                lm_ids = lm_ids[selected]
+                _scores = _scores[selected].float() + scene_matcher_weight * sparse_scene_match_logits
+                if sparse_margin_by_query is not None:
+                    sparse_margin_by_query = sparse_margin_by_query[selected]
+        else:
+            if matcher_scalar_dim > 4:
+                scene_extra = kp_scores[q_ids].float().reshape(-1, 1)
+            sparse_scene_match_logits = score_scene_match_pairs(
+                scene_matcher,
+                query_desc[q_ids],
+                landmark_desc[lm_ids],
+                cosine=raw_pair_cosine,
+                margin=sparse_margin_by_query,
+                landmark_prior=pair_prior,
+                calibrated_prior=pair_calibrated,
+                extra_scalar_features=scene_extra,
+            )
+            sparse_scene_match_logits = _normalize_scene_match_logits(
+                sparse_scene_match_logits,
+                getattr(args, "scene_matcher_logit_norm", "none"),
+            )
+            _scores = _scores.float() + scene_matcher_weight * sparse_scene_match_logits
+            if sparse_candidate_topk > 1:
+                best = best_pair_per_query_indices(q_ids, _scores, num_queries=query_desc.shape[0])
+                q_ids = q_ids[best]
+                lm_ids = lm_ids[best]
+                _scores = _scores[best]
+                sparse_scene_match_logits = sparse_scene_match_logits[best]
+                if sparse_margin_by_query is not None:
+                    sparse_margin_by_query = sparse_margin_by_query[best]
     sparse_reliability = None
     if lm_ids.numel() > 0:
         reliability_source = landmark_filter_reliability if landmark_filter_reliability is not None else landmark_prior
@@ -2568,23 +2822,27 @@ def localize_one(
         sparse_filter_scores = sparse_filter_scores[sparse_keep]
         if sparse_margin_by_query is not None:
             sparse_margin_by_query = sparse_margin_by_query[sparse_keep]
+    if candidate_oracle_stats is not None:
+        candidate_oracle_stats["candidate_oracle_pnp_match_count"] = float(q_ids.numel())
     sparse_query_for_pnp = keypoints[q_ids] + sparse_query_offset
-    sparse_pnp_scores = sparse_filter_scores
-    oracle_match_stats = None
+    sparse_pnp_scores = _scores if candidate_oracle_stats is not None else sparse_filter_scores
+    oracle_match_stats = dict(candidate_oracle_stats) if candidate_oracle_stats is not None else None
     oracle_match_order = str(getattr(args, "oracle_match_order", "none"))
-    if oracle_match_order == "sparse_reprojection" and q_ids.numel() > 0:
+    if oracle_match_order == "sparse_reprojection":
         if gt_pose_w2c is None:
             raise ValueError("oracle_match_order=sparse_reprojection requires gt_pose_w2c")
-        oracle_scores_np, oracle_match_stats = oracle_reprojection_match_scores_np(
-            sparse_query_for_pnp.detach().cpu().numpy(),
-            landmark_xyz[lm_ids].detach().cpu().numpy(),
-            gt_pose_w2c,
-            sparse_K.detach().cpu().numpy(),
-        )
-        sparse_pnp_scores = torch.from_numpy(oracle_scores_np).to(
-            device=sparse_filter_scores.device,
-            dtype=sparse_filter_scores.dtype,
-        )
+        if q_ids.numel() > 0:
+            oracle_scores_np, order_stats = oracle_reprojection_match_scores_np(
+                sparse_query_for_pnp.detach().cpu().numpy(),
+                landmark_xyz[lm_ids].detach().cpu().numpy(),
+                gt_pose_w2c,
+                sparse_K.detach().cpu().numpy(),
+            )
+            oracle_match_stats = {**(oracle_match_stats or {}), **order_stats}
+            sparse_pnp_scores = torch.from_numpy(oracle_scores_np).to(
+                device=sparse_filter_scores.device,
+                dtype=sparse_filter_scores.dtype,
+            )
     elif oracle_match_order != "none":
         raise ValueError(f"unsupported oracle_match_order: {oracle_match_order}")
     if int(getattr(args, "pnp_hypotheses", 1)) > 1:
@@ -3222,6 +3480,33 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--scene_matcher_weight", type=float, default=0.0)
     parser.add_argument("--scene_matcher_topk", type=int, default=1)
     parser.add_argument("--scene_matcher_logit_norm", choices=["none", "center", "zscore"], default="none")
+    parser.add_argument("--scene_matcher_listwise_dustbin", choices=["score", "drop"], default="score")
+    parser.add_argument(
+        "--selfmap_reliability_path",
+        default="",
+        help="Optional self-map eval summary used to softly scale LFF/reliability signals.",
+    )
+    parser.add_argument("--selfmap_reliability_stage", choices=["sparse", "dense"], default="dense")
+    parser.add_argument("--selfmap_reliability_center_cm", type=float, default=10.0)
+    parser.add_argument("--selfmap_reliability_temperature_cm", type=float, default=1.0)
+    parser.add_argument(
+        "--sparse_candidate_topk",
+        type=int,
+        default=0,
+        help="Expose multiple sparse descriptor candidates per query keypoint for diagnostics/listwise matchers.",
+    )
+    parser.add_argument(
+        "--sparse_candidate_oracle_topk",
+        type=int,
+        default=0,
+        help="Analysis-only GT oracle: choose the best reprojection candidate inside each sparse top-K list.",
+    )
+    parser.add_argument(
+        "--sparse_candidate_oracle_threshold_px",
+        type=float,
+        default=None,
+        help="GT reprojection threshold for sparse candidate oracle; defaults to sparse PnP threshold.",
+    )
     parser.add_argument(
         "--descriptor_source",
         choices=["hybrid", "ply_loc", "hybrid_ply_blend", "hybrid_ply_gated_residual"],
@@ -3367,6 +3652,16 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         raise ValueError("--query_offset must be non-negative")
     if args.query_stride < 1:
         raise ValueError("--query_stride must be at least 1")
+    args.selfmap_reliability = {"enabled": False}
+    if args.selfmap_reliability_path:
+        selfmap_meta = load_selfmap_reliability(
+            args.selfmap_reliability_path,
+            stage=args.selfmap_reliability_stage,
+            center_cm=args.selfmap_reliability_center_cm,
+            temperature_cm=args.selfmap_reliability_temperature_cm,
+        )
+        selfmap_meta.update(apply_selfmap_reliability(args, float(selfmap_meta["rho"])))
+        args.selfmap_reliability = selfmap_meta
     need_query_subset = args.query_offset > 0 or args.query_stride > 1
     eval_split = getattr(args, "eval_split", "test")
     eval_cameras_json = train_args["cameras_json"] if args.eval_pose_source == "cameras_json" else None
@@ -3778,6 +4073,13 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         "scene_matcher_weight": float(args.scene_matcher_weight),
         "scene_matcher_topk": int(args.scene_matcher_topk),
         "scene_matcher_logit_norm": str(args.scene_matcher_logit_norm),
+        "scene_matcher_listwise_dustbin": str(args.scene_matcher_listwise_dustbin),
+        "selfmap_reliability": getattr(args, "selfmap_reliability", {"enabled": False}),
+        "sparse_candidate_topk": int(args.sparse_candidate_topk),
+        "sparse_candidate_oracle_topk": int(args.sparse_candidate_oracle_topk),
+        "sparse_candidate_oracle_threshold_px": None
+        if args.sparse_candidate_oracle_threshold_px is None
+        else float(args.sparse_candidate_oracle_threshold_px),
         "query_detector": args.query_detector,
         "feedback_detector_path": args.feedback_detector_path,
         "query_feature_source": args.query_feature_source,
