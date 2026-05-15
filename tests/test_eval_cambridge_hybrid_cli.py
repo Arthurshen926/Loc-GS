@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from plyfile import PlyData, PlyElement
 
 from loc_gs.localization.stdloc_parity import DenseMatchResult
 from loc_gs.scripts import eval_cambridge_hybrid
@@ -39,6 +40,42 @@ def test_load_pickle_tensor_accepts_stdloc_score_dict(tmp_path):
     result = eval_cambridge_hybrid._load_pickle_tensor(path)
 
     assert torch.equal(result, expected)
+
+
+def test_load_ply_loc_feature_override_normalizes_loc_fields(tmp_path):
+    data = np.empty(
+        2,
+        dtype=[
+            ("x", "f4"),
+            ("y", "f4"),
+            ("z", "f4"),
+            ("loc_0", "f4"),
+            ("loc_1", "f4"),
+        ],
+    )
+    data["x"] = [0.0, 1.0]
+    data["y"] = [0.0, 1.0]
+    data["z"] = [1.0, 1.0]
+    data["loc_0"] = [3.0, 0.0]
+    data["loc_1"] = [4.0, 2.0]
+    path = tmp_path / "features.ply"
+    PlyData([PlyElement.describe(data, "vertex")], text=True).write(path)
+
+    loc = eval_cambridge_hybrid._load_ply_loc_feature_override(path, expected_count=2, device=torch.device("cpu"))
+
+    assert loc.shape == (2, 2)
+    assert torch.allclose(loc[0], torch.tensor([0.6, 0.8]), atol=1e-6)
+    assert torch.allclose(loc[1], torch.tensor([0.0, 1.0]), atol=1e-6)
+
+
+def test_scene_matcher_logit_normalization_can_clip_trust_region():
+    logits = torch.tensor([-10.0, 0.0, 10.0, float("inf")])
+
+    normalized = eval_cambridge_hybrid._normalize_scene_match_logits(logits, mode="zscore", clip=0.5)
+
+    finite = torch.isfinite(normalized)
+    assert normalized[finite].abs().max() <= 0.5
+    assert torch.isinf(normalized[-1])
 
 
 def test_eval_parser_exposes_stdloc_parity_options():
@@ -470,8 +507,12 @@ def test_eval_parser_exposes_scene_matcher_single_path_rerank():
             "4",
             "--scene_matcher_logit_norm",
             "zscore",
+            "--scene_matcher_logit_clip",
+            "1.5",
             "--scene_matcher_listwise_dustbin",
             "drop",
+            "--scene_matcher_candidate_mode",
+            "all",
             "--match_filter_query_score_weight",
             "0.2",
         ]
@@ -481,15 +522,37 @@ def test_eval_parser_exposes_scene_matcher_single_path_rerank():
     assert args.scene_matcher_weight == 0.4
     assert args.scene_matcher_topk == 4
     assert args.scene_matcher_logit_norm == "zscore"
+    assert args.scene_matcher_logit_clip == 1.5
     assert args.scene_matcher_listwise_dustbin == "drop"
+    assert args.scene_matcher_candidate_mode == "all"
     assert args.match_filter_query_score_weight == 0.2
+    assert not eval_cambridge_hybrid._should_collapse_scene_match_candidates(args, sparse_candidate_topk=4)
     config = effective_eval_config(args)
     assert config["scene_matcher_path"] == "output/scenematch/ShopFacade/best.pt"
     assert config["scene_matcher_weight"] == 0.4
     assert config["scene_matcher_topk"] == 4
     assert config["scene_matcher_logit_norm"] == "zscore"
+    assert config["scene_matcher_logit_clip"] == 1.5
     assert config["scene_matcher_listwise_dustbin"] == "drop"
+    assert config["scene_matcher_candidate_mode"] == "all"
     assert config["match_filter_query_score_weight"] == 0.2
+
+
+def test_scene_matcher_candidate_mode_defaults_to_best_query_match():
+    args = build_argparser().parse_args(
+        [
+            "--checkpoint",
+            "output/model/latest.pth",
+            "--scene_matcher_path",
+            "output/scenematch/ShopFacade/best.pt",
+            "--scene_matcher_topk",
+            "4",
+        ]
+    )
+
+    assert args.scene_matcher_candidate_mode == "best"
+    assert eval_cambridge_hybrid._should_collapse_scene_match_candidates(args, sparse_candidate_topk=4)
+    assert not eval_cambridge_hybrid._should_collapse_scene_match_candidates(args, sparse_candidate_topk=1)
 
 
 def test_detector_prior_for_all_gaussians_maps_sampled_scores_to_sampled_ids():
@@ -1066,6 +1129,21 @@ def test_calibrated_matchability_prior_uses_independent_logit_bias():
 
     assert torch.argmax(biased[0, 0]).item() == 1
     assert torch.allclose(biased - biased.mean(dim=-1, keepdim=True), biased, atol=1e-6)
+
+
+def test_calibrated_matchability_prior_is_bounded_for_extreme_sparse_reliability():
+    corr = torch.zeros(1, 1, 4, dtype=torch.float32)
+    reliability = torch.tensor([1e-5, 1e-4, 0.5, 0.99999], dtype=torch.float32)
+
+    biased = eval_cambridge_hybrid.apply_calibrated_matchability_prior(
+        corr,
+        reliability,
+        weight=1.0,
+    )
+
+    assert torch.isfinite(biased).all()
+    assert float(biased.abs().max()) <= 2.0
+    assert torch.allclose(biased.mean(dim=-1), torch.zeros(1, 1), atol=1e-6)
 
 
 def test_generate_pnp_hypotheses_tries_clustered_subsets(monkeypatch):

@@ -230,8 +230,13 @@ def test_build_reliability_eval_command_can_use_scene_matcher_prosac_recipe():
         scene_matcher_weight=0.45,
         scene_matcher_topk=6,
         scene_matcher_logit_norm="zscore",
+        scene_matcher_logit_clip=1.25,
         scene_matcher_listwise_dustbin="drop",
+        scene_matcher_candidate_mode="all",
         match_filter_query_score_weight=0.2,
+        dense_iters=3,
+        sparse_match_filter_mode="score",
+        sparse_match_filter_top_m=1536,
     )
 
     assert env["CUDA_VISIBLE_DEVICES"] == "0"
@@ -241,8 +246,13 @@ def test_build_reliability_eval_command_can_use_scene_matcher_prosac_recipe():
     assert cmd[cmd.index("--scene_matcher_weight") + 1] == "0.45"
     assert cmd[cmd.index("--scene_matcher_topk") + 1] == "6"
     assert cmd[cmd.index("--scene_matcher_logit_norm") + 1] == "zscore"
+    assert cmd[cmd.index("--scene_matcher_logit_clip") + 1] == "1.25"
     assert cmd[cmd.index("--scene_matcher_listwise_dustbin") + 1] == "drop"
+    assert cmd[cmd.index("--scene_matcher_candidate_mode") + 1] == "all"
     assert cmd[cmd.index("--match_filter_query_score_weight") + 1] == "0.2"
+    assert cmd[cmd.index("--dense_iters") + 1] == "3"
+    assert cmd[cmd.index("--sparse_match_filter_mode") + 1] == "score"
+    assert cmd[cmd.index("--sparse_match_filter_top_m") + 1] == "1536"
     assert "--max_landmarks" not in cmd
 
 
@@ -376,11 +386,29 @@ def test_build_reliability_eval_command_can_attach_calibrated_matchability():
         recipe="covisibility_prosac",
         calibrated_matchability_path="output/calib/OldHospital/stdloc_bank_query_like.pt",
         calibrated_matchability_weight=0.4,
+        match_calibrated_prior_weight=0.15,
     )
 
     assert env["CUDA_VISIBLE_DEVICES"] == "1"
     assert cmd[cmd.index("--calibrated_matchability_path") + 1] == "output/calib/OldHospital/stdloc_bank_query_like.pt"
     assert cmd[cmd.index("--landmark_score_calibrated_matchability_weight") + 1] == "0.4"
+    assert cmd[cmd.index("--match_calibrated_prior_weight") + 1] == "0.15"
+
+
+def test_build_reliability_eval_command_can_attach_unified_ply_loc_override():
+    cmd, _env = build_reliability_eval_command(
+        gpu_id=0,
+        scene="GreatCourt",
+        checkpoint="output/stdloc_hybrid/GreatCourt_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/GreatCourt_reliability_recipe/eval_unified",
+        recipe="scene_matcher_prosac",
+        scene_matcher_path="output/scenematch/GreatCourt/best.pt",
+        ply_loc_feature_override="output/unified_lff_v2/maps_desc_only_20260515/GreatCourt/point_cloud/iteration_30000/point_cloud.ply",
+    )
+
+    assert cmd[cmd.index("--ply_loc_feature_override") + 1].endswith(
+        "maps_desc_only_20260515/GreatCourt/point_cloud/iteration_30000/point_cloud.ply"
+    )
 
 
 def test_build_reliability_eval_command_can_use_covisibility_prosac_magsac_recipe():

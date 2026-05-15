@@ -611,6 +611,101 @@ def select_scene_match_listwise_candidates(
     return selected_flat[order], selected_logits[order]
 
 
+@torch.no_grad()
+def score_scene_match_listwise_flat_candidates(
+    matcher: nn.Module,
+    query_desc: torch.Tensor,
+    landmark_desc: torch.Tensor,
+    q_ids: torch.Tensor,
+    lm_ids: torch.Tensor,
+    *,
+    cosine: torch.Tensor | None = None,
+    margin: torch.Tensor | None = None,
+    landmark_prior: torch.Tensor | None = None,
+    calibrated_prior: torch.Tensor | None = None,
+    query_score: torch.Tensor | None = None,
+    drop_dustbin: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score flat top-K candidates without hard-selecting a matcher winner.
+
+    The returned logits are aligned with the returned flat indices and can be
+    blended with descriptor scores before the final one-per-query PROSAC
+    ordering is chosen.  This keeps the listwise readout as a soft
+    localization-feedback signal instead of an implicit hard branch selector.
+    """
+    if str(getattr(matcher, "config", {}).get("model_type", "pairwise")) != "listwise":
+        raise ValueError("score_scene_match_listwise_flat_candidates requires a listwise scene matcher")
+    q = q_ids.long().reshape(-1)
+    lm = lm_ids.long().reshape(-1)
+    if q.numel() != lm.numel():
+        raise ValueError("q_ids and lm_ids must have the same length")
+    device = query_desc.device
+    if q.numel() == 0:
+        return query_desc.new_empty(0), torch.empty(0, dtype=torch.long, device=device)
+    q = q.to(device=device)
+    lm = lm.to(device=device)
+    original_flat = torch.arange(q.numel(), dtype=torch.long, device=device)
+    sort_key = q * (q.numel() + 1) + original_flat
+    order = torch.argsort(sort_key)
+    q_sorted = q[order]
+    unique_q, counts = torch.unique_consecutive(q_sorted, return_counts=True)
+    topk = int(counts.max().item())
+    batch = int(unique_q.numel())
+    offsets = torch.arange(topk, dtype=torch.long, device=device).view(1, topk)
+    starts = (torch.cumsum(counts, dim=0) - counts).view(batch, 1)
+    candidate_mask = offsets < counts.view(batch, 1)
+    sorted_positions = (starts + offsets).clamp(max=int(q.numel()) - 1)
+    flat_indices = order[sorted_positions].masked_fill(~candidate_mask, -1)
+    safe_flat_indices = flat_indices.clamp_min(0)
+    candidate_lm = lm[safe_flat_indices].masked_fill(~candidate_mask, 0)
+
+    def _fill_scalar(value: torch.Tensor | None, fill: float = 0.0) -> torch.Tensor | None:
+        if value is None:
+            return None
+        src = value.to(device=device).reshape(-1)
+        out = src[safe_flat_indices]
+        return out.masked_fill(~candidate_mask, float(fill))
+
+    margin_group = None
+    if margin is not None:
+        margin_flat = margin.to(device=device).reshape(-1)
+        margin_group = margin_flat[safe_flat_indices[:, 0]]
+
+    query_score_group = None
+    if query_score is not None:
+        query_score = query_score.to(device=device).reshape(-1)
+        if query_score.numel() == int(query_desc.shape[0]):
+            query_score_group = query_score[unique_q]
+        elif query_score.numel() == int(q.numel()):
+            query_score_group = query_score[safe_flat_indices[:, 0]]
+        else:
+            raise ValueError("query_score must be per-query or per-flat-candidate")
+
+    logits = score_scene_match_candidates(
+        matcher,
+        query_desc[unique_q],
+        landmark_desc[candidate_lm],
+        cosine=_fill_scalar(cosine),
+        margin=margin_group,
+        landmark_prior=_fill_scalar(landmark_prior),
+        calibrated_prior=_fill_scalar(calibrated_prior),
+        query_score=query_score_group,
+        candidate_mask=candidate_mask,
+    )
+    candidate_logits = logits[:, :topk]
+    dustbin_logits = logits[:, topk]
+    score = candidate_logits - dustbin_logits[:, None]
+    valid = candidate_mask & torch.isfinite(score)
+    if bool(drop_dustbin):
+        valid = valid & (candidate_logits > dustbin_logits[:, None])
+    if not bool(valid.any()):
+        return query_desc.new_empty(0), torch.empty(0, dtype=torch.long, device=device)
+    keep_indices = flat_indices[valid]
+    keep_logits = score[valid]
+    out_order = torch.argsort(keep_indices)
+    return keep_logits[out_order], keep_indices[out_order]
+
+
 def best_pair_per_query_indices(
     query_ids: torch.Tensor,
     pair_scores: torch.Tensor,

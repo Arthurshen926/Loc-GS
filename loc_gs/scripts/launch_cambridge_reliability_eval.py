@@ -85,14 +85,21 @@ def build_eval_command(
     query_offset: int = 0,
     eval_split: str = "test",
     pnp_reprojection_error: float = 8.0,
+    dense_iters: int = 2,
     calibrated_matchability_path: str = "",
     calibrated_matchability_weight: float = 0.25,
+    match_calibrated_prior_weight: float = 0.0,
+    ply_loc_feature_override: str = "",
     scene_matcher_path: str = "",
     scene_matcher_weight: float = 0.35,
     scene_matcher_topk: int = 4,
     scene_matcher_logit_norm: str = "none",
+    scene_matcher_logit_clip: float = 0.0,
     scene_matcher_listwise_dustbin: str = "score",
+    scene_matcher_candidate_mode: str = "best",
     match_filter_query_score_weight: float = 0.0,
+    sparse_match_filter_mode: str = "",
+    sparse_match_filter_top_m: int = 0,
     hybrid_residual_alpha_max: float = 0.03,
     selfmap_reliability_path: str = "",
     selfmap_reliability_stage: str = "dense",
@@ -162,7 +169,7 @@ def build_eval_command(
         "--matcher",
         "stdloc_parity",
         "--dense_iters",
-        "2",
+        str(int(dense_iters)),
         "--dense_full_render",
         "--subpixel_refine",
         "--solver",
@@ -178,6 +185,8 @@ def build_eval_command(
     ]
     if recipe == "learned_blend":
         cmd.extend(["--ply_loc_feature_weight", "0.9"])
+    if ply_loc_feature_override:
+        cmd.extend(["--ply_loc_feature_override", str(ply_loc_feature_override)])
     if recipe in {
         "lff_feedback_prosac",
         "lff_residual_prosac",
@@ -292,6 +301,10 @@ def build_eval_command(
         )
         if float(match_filter_query_score_weight) != 0.0:
             cmd.extend(["--match_filter_query_score_weight", str(float(match_filter_query_score_weight))])
+        if str(sparse_match_filter_mode):
+            cmd.extend(["--sparse_match_filter_mode", str(sparse_match_filter_mode)])
+        if int(sparse_match_filter_top_m) > 0:
+            cmd.extend(["--sparse_match_filter_top_m", str(int(sparse_match_filter_top_m))])
     if recipe == "scene_matcher_coverage_prosac":
         cmd.extend(
             [
@@ -325,10 +338,14 @@ def build_eval_command(
                 str(int(scene_matcher_topk)),
                 "--scene_matcher_listwise_dustbin",
                 str(scene_matcher_listwise_dustbin),
+                "--scene_matcher_candidate_mode",
+                str(scene_matcher_candidate_mode),
             ]
         )
         if str(scene_matcher_logit_norm) != "none":
             cmd.extend(["--scene_matcher_logit_norm", str(scene_matcher_logit_norm)])
+        if float(scene_matcher_logit_clip) > 0.0:
+            cmd.extend(["--scene_matcher_logit_clip", str(float(scene_matcher_logit_clip))])
     if calibrated_matchability_path:
         cmd.extend(
             [
@@ -338,6 +355,8 @@ def build_eval_command(
                 str(float(calibrated_matchability_weight)),
             ]
         )
+        if float(match_calibrated_prior_weight) > 0.0:
+            cmd.extend(["--match_calibrated_prior_weight", str(float(match_calibrated_prior_weight))])
     if selfmap_reliability_path:
         cmd.extend(
             [
@@ -422,12 +441,24 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--query_offset", type=int, default=0)
     parser.add_argument("--query_shards", type=int, default=1)
     parser.add_argument("--pnp_reprojection_error", type=float, default=8.0)
+    parser.add_argument("--dense_iters", type=int, default=2)
     parser.add_argument(
         "--calibrated_matchability_template",
         default="",
         help="Optional per-scene template such as output/calib/{scene}/stdloc_bank_query_like.pt.",
     )
     parser.add_argument("--calibrated_matchability_weight", type=float, default=0.25)
+    parser.add_argument(
+        "--match_calibrated_prior_weight",
+        type=float,
+        default=0.0,
+        help="Optional calibrated matchability logit-bias weight applied to 2D-3D matches.",
+    )
+    parser.add_argument(
+        "--ply_loc_feature_override_template",
+        default="",
+        help="Optional per-scene PLY template whose loc_* fields override checkpoint PLY descriptors.",
+    )
     parser.add_argument(
         "--scene_matcher_template",
         default="",
@@ -436,8 +467,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--scene_matcher_weight", type=float, default=0.35)
     parser.add_argument("--scene_matcher_topk", type=int, default=4)
     parser.add_argument("--scene_matcher_logit_norm", choices=["none", "center", "zscore"], default="none")
+    parser.add_argument("--scene_matcher_logit_clip", type=float, default=0.0)
     parser.add_argument("--scene_matcher_listwise_dustbin", choices=["score", "drop"], default="score")
+    parser.add_argument("--scene_matcher_candidate_mode", choices=["best", "all"], default="best")
     parser.add_argument("--match_filter_query_score_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--sparse_match_filter_mode",
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage"],
+        default="",
+    )
+    parser.add_argument("--sparse_match_filter_top_m", type=int, default=0)
     parser.add_argument("--hybrid_residual_alpha_max", type=float, default=0.03)
     parser.add_argument(
         "--selfmap_reliability_template",
@@ -529,6 +568,11 @@ def main() -> None:
             if args.selfmap_reliability_template
             else ""
         )
+        ply_loc_feature_override = (
+            args.ply_loc_feature_override_template.format(scene=job.scene, tag=args.tag, recipe=job.recipe)
+            if args.ply_loc_feature_override_template
+            else ""
+        )
         if calibrated_path and not args.dry_run and not Path(calibrated_path).exists():
             raise FileNotFoundError(f"calibrated matchability not found for {job.scene}: {calibrated_path}")
         if job.recipe in {
@@ -544,6 +588,10 @@ def main() -> None:
             raise FileNotFoundError(
                 f"self-map reliability summary not found for {job.scene}: {selfmap_reliability_path}"
             )
+        if ply_loc_feature_override and not args.dry_run and not Path(ply_loc_feature_override).exists():
+            raise FileNotFoundError(
+                f"PLY loc feature override not found for {job.scene}: {ply_loc_feature_override}"
+            )
         cmd, env = build_eval_command(
             gpu_id=gpu_id,
             scene=job.scene,
@@ -555,14 +603,21 @@ def main() -> None:
             query_offset=job.query_offset,
             eval_split=args.eval_split,
             pnp_reprojection_error=args.pnp_reprojection_error,
+            dense_iters=args.dense_iters,
             calibrated_matchability_path=calibrated_path,
             calibrated_matchability_weight=args.calibrated_matchability_weight,
+            match_calibrated_prior_weight=args.match_calibrated_prior_weight,
+            ply_loc_feature_override=ply_loc_feature_override,
             scene_matcher_path=scene_matcher_path,
             scene_matcher_weight=args.scene_matcher_weight,
             scene_matcher_topk=args.scene_matcher_topk,
             scene_matcher_logit_norm=args.scene_matcher_logit_norm,
+            scene_matcher_logit_clip=args.scene_matcher_logit_clip,
             scene_matcher_listwise_dustbin=args.scene_matcher_listwise_dustbin,
+            scene_matcher_candidate_mode=args.scene_matcher_candidate_mode,
             match_filter_query_score_weight=args.match_filter_query_score_weight,
+            sparse_match_filter_mode=args.sparse_match_filter_mode,
+            sparse_match_filter_top_m=args.sparse_match_filter_top_m,
             hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
             selfmap_reliability_path=selfmap_reliability_path,
             selfmap_reliability_stage=args.selfmap_reliability_stage,

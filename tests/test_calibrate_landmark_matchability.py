@@ -3,6 +3,7 @@ import torch
 from loc_gs.scripts.launch_cambridge_matchability_calibration import build_calibration_command
 from loc_gs.scripts.calibrate_landmark_matchability import (
     accumulate_matchability_counts,
+    attach_listwise_landmark_bank,
     build_argparser,
     calibration_query_canvas_hw,
     matchability_from_counts,
@@ -231,3 +232,16 @@ def test_write_matchability_calibration_writes_sidecar_tensors(tmp_path):
     assert (tmp_path / "landmark_fp_rate.pt").exists()
     assert (tmp_path / "matchability_calibrator.pt").exists()
     assert (tmp_path / "stdloc_bank.json").exists()
+
+
+def test_attach_listwise_landmark_bank_records_descriptor_bank_and_gaussian_ids():
+    payload = {"metadata": {"format": "listwise"}}
+    desc = torch.randn(3, 4)
+    gaussian_ids = torch.tensor([10, 20, 30], dtype=torch.long)
+
+    attach_listwise_landmark_bank(payload, landmark_desc=desc, gaussian_ids=gaussian_ids)
+
+    assert payload["base_landmark_desc"].shape == (3, 4)
+    assert payload["base_landmark_desc"].dtype == torch.float16
+    assert payload["base_gaussian_id"].tolist() == [10, 20, 30]
+    assert payload["metadata"]["base_landmark_count"] == 3

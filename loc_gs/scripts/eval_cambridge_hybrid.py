@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from plyfile import PlyData
 from torch.utils.data import Subset
 from tqdm import tqdm
 
@@ -43,8 +44,8 @@ from loc_gs.localization.rendered_keypoints import select_rendered_keypoints
 from loc_gs.localization.scene_matcher import (
     best_pair_per_query_indices,
     load_scene_matcher,
+    score_scene_match_listwise_flat_candidates,
     score_scene_match_pairs,
-    select_scene_match_listwise_candidates,
 )
 from loc_gs.localization.stdloc_parity import (
     apply_match_prior,
@@ -246,6 +247,7 @@ def load_selfmap_reliability(
 def _args_weight_snapshot(args: argparse.Namespace) -> dict[str, object]:
     return {
         "descriptor_source": str(getattr(args, "descriptor_source", "")),
+        "ply_loc_feature_override": str(getattr(args, "ply_loc_feature_override", "")),
         "ply_loc_feature_weight": float(getattr(args, "ply_loc_feature_weight", 0.5)),
         "hybrid_residual_alpha_max": float(getattr(args, "hybrid_residual_alpha_max", 0.05)),
         "landmark_score_calibrated_matchability_weight": float(
@@ -278,6 +280,16 @@ def apply_selfmap_reliability(args: argparse.Namespace, rho: float) -> dict[str,
         "original": original,
         "effective": _args_weight_snapshot(args),
     }
+
+
+def _should_collapse_scene_match_candidates(args: argparse.Namespace, sparse_candidate_topk: int) -> bool:
+    """Return whether scene-matcher top-K candidates collapse to one pair per query."""
+    if int(sparse_candidate_topk) <= 1:
+        return False
+    mode = str(getattr(args, "scene_matcher_candidate_mode", "best"))
+    if mode not in {"best", "all"}:
+        raise ValueError(f"unsupported scene_matcher_candidate_mode: {mode}")
+    return mode == "best"
 
 
 @torch.no_grad()
@@ -325,6 +337,29 @@ def _load_pickle_tensor(path: Path) -> torch.Tensor:
             return torch.as_tensor(tensor_value)
         raise TypeError(f"Could not find a tensor-like entry in pickle dict: {path}")
     return torch.as_tensor(value)
+
+
+def _load_ply_loc_feature_override(
+    path: Path | str,
+    *,
+    expected_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    ply = PlyData.read(str(path))
+    vertex = ply["vertex"]
+    loc_names = sorted(
+        [prop.name for prop in vertex.properties if prop.name.startswith("loc_")],
+        key=lambda name: int(name.split("_")[-1]),
+    )
+    if not loc_names:
+        raise ValueError(f"PLY loc feature override has no loc_* fields: {path}")
+    if int(vertex.count) != int(expected_count):
+        raise ValueError(
+            f"PLY loc feature override has {vertex.count} vertices, expected {expected_count}: {path}"
+        )
+    loc = np.stack([np.asarray(vertex[name]) for name in loc_names], axis=1)
+    tensor = torch.tensor(loc, dtype=torch.float32, device=device)
+    return F.normalize(tensor, p=2, dim=-1)
 
 
 def _score_stats(prefix: str, score: torch.Tensor, out: dict[str, float]) -> None:
@@ -735,6 +770,7 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
         "query_detector": str(getattr(args, "query_detector", "superpoint")),
         "feedback_detector_path": str(getattr(args, "feedback_detector_path", "")),
         "feedback_detector_full_res": bool(getattr(args, "feedback_detector_full_res", False)),
+        "ply_loc_feature_override": str(getattr(args, "ply_loc_feature_override", "")),
         "keypoint_threshold": float(args.keypoint_threshold),
         "nms_radius": int(args.nms_radius),
         "sparse_match_threshold": float(args.sparse_match_threshold),
@@ -823,7 +859,9 @@ def effective_eval_config(args: argparse.Namespace) -> dict[str, object]:
         "scene_matcher_weight": float(getattr(args, "scene_matcher_weight", 0.0)),
         "scene_matcher_topk": int(getattr(args, "scene_matcher_topk", 1)),
         "scene_matcher_logit_norm": str(getattr(args, "scene_matcher_logit_norm", "none")),
+        "scene_matcher_logit_clip": float(getattr(args, "scene_matcher_logit_clip", 0.0)),
         "scene_matcher_listwise_dustbin": str(getattr(args, "scene_matcher_listwise_dustbin", "score")),
+        "scene_matcher_candidate_mode": str(getattr(args, "scene_matcher_candidate_mode", "best")),
         "sparse_candidate_topk": int(getattr(args, "sparse_candidate_topk", 0)),
         "sparse_candidate_oracle_topk": int(getattr(args, "sparse_candidate_oracle_topk", 0)),
         "sparse_candidate_oracle_threshold_px": None
@@ -1755,10 +1793,22 @@ def _match_filter_scores(
     return out
 
 
-def _normalize_scene_match_logits(logits: torch.Tensor, mode: str = "none") -> torch.Tensor:
+def _normalize_scene_match_logits(
+    logits: torch.Tensor,
+    mode: str = "none",
+    *,
+    clip: float = 0.0,
+) -> torch.Tensor:
     mode = str(mode or "none").lower()
-    if mode == "none" or logits.numel() == 0:
+    if logits.numel() == 0:
         return logits.float()
+    if mode == "none":
+        out = logits.float()
+        if float(clip) > 0.0:
+            finite = torch.isfinite(out)
+            out = out.clone()
+            out[finite] = out[finite].clamp(-float(clip), float(clip))
+        return out
     out = logits.float().clone()
     finite = torch.isfinite(out)
     if int(finite.sum().item()) == 0:
@@ -1767,9 +1817,13 @@ def _normalize_scene_match_logits(logits: torch.Tensor, mode: str = "none") -> t
     centered = values - values.mean()
     if mode == "center":
         out[finite] = centered
+        if float(clip) > 0.0:
+            out[finite] = out[finite].clamp(-float(clip), float(clip))
         return out
     if mode == "zscore":
         out[finite] = centered / values.std(unbiased=False).clamp_min(1e-6)
+        if float(clip) > 0.0:
+            out[finite] = out[finite].clamp(-float(clip), float(clip))
         return out
     raise ValueError(f"unsupported scene matcher logit norm: {mode}")
 
@@ -1876,8 +1930,11 @@ def apply_calibrated_matchability_prior(
         return corr_matrix
     eps = torch.finfo(corr_matrix.dtype).eps
     logit = torch.logit(rel.clamp(eps, 1.0 - eps))
-    logit = logit - logit.mean()
-    return corr_matrix + float(weight) * logit.reshape(*([1] * (corr_matrix.dim() - 1)), -1)
+    prior = logit - logit.mean()
+    std = prior.std(unbiased=False).clamp_min(eps)
+    prior = (prior / std).clamp(-2.0, 2.0)
+    prior = prior - prior.mean()
+    return corr_matrix + float(weight) * prior.reshape(*([1] * (corr_matrix.dim() - 1)), -1)
 
 
 def descriptor_top2_margin(
@@ -2730,7 +2787,7 @@ def localize_one(
         matcher_scalar_dim = int(getattr(scene_matcher, "config", {}).get("scalar_dim", 4))
         matcher_type = str(getattr(scene_matcher, "config", {}).get("model_type", "pairwise"))
         if matcher_type == "listwise":
-            selected, selected_logits = select_scene_match_listwise_candidates(
+            flat_logits, selected = score_scene_match_listwise_flat_candidates(
                 scene_matcher,
                 query_desc,
                 landmark_desc,
@@ -2751,14 +2808,23 @@ def localize_one(
                 sparse_margin_by_query = None
             else:
                 sparse_scene_match_logits = _normalize_scene_match_logits(
-                    selected_logits,
+                    flat_logits,
                     getattr(args, "scene_matcher_logit_norm", "none"),
+                    clip=float(getattr(args, "scene_matcher_logit_clip", 0.0)),
                 )
                 q_ids = q_ids[selected]
                 lm_ids = lm_ids[selected]
                 _scores = _scores[selected].float() + scene_matcher_weight * sparse_scene_match_logits
                 if sparse_margin_by_query is not None:
                     sparse_margin_by_query = sparse_margin_by_query[selected]
+                if _should_collapse_scene_match_candidates(args, sparse_candidate_topk):
+                    best = best_pair_per_query_indices(q_ids, _scores, num_queries=query_desc.shape[0])
+                    q_ids = q_ids[best]
+                    lm_ids = lm_ids[best]
+                    _scores = _scores[best]
+                    sparse_scene_match_logits = sparse_scene_match_logits[best]
+                    if sparse_margin_by_query is not None:
+                        sparse_margin_by_query = sparse_margin_by_query[best]
         else:
             if matcher_scalar_dim > 4:
                 scene_extra = kp_scores[q_ids].float().reshape(-1, 1)
@@ -2775,9 +2841,10 @@ def localize_one(
             sparse_scene_match_logits = _normalize_scene_match_logits(
                 sparse_scene_match_logits,
                 getattr(args, "scene_matcher_logit_norm", "none"),
+                clip=float(getattr(args, "scene_matcher_logit_clip", 0.0)),
             )
             _scores = _scores.float() + scene_matcher_weight * sparse_scene_match_logits
-            if sparse_candidate_topk > 1:
+            if _should_collapse_scene_match_candidates(args, sparse_candidate_topk):
                 best = best_pair_per_query_indices(q_ids, _scores, num_queries=query_desc.shape[0])
                 q_ids = q_ids[best]
                 lm_ids = lm_ids[best]
@@ -3434,6 +3501,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--query_stride", type=int, default=1)
     parser.add_argument("--landmark_source", choices=["rendered", "gaussian", "stdloc_detector"], default="stdloc_detector")
     parser.add_argument("--stdloc_detector_dir", default="")
+    parser.add_argument(
+        "--ply_loc_feature_override",
+        default="",
+        help="Optional PLY whose loc_* fields replace checkpoint PLY descriptors for unified-map evaluation.",
+    )
     parser.add_argument("--landmark_candidate_source", choices=["sampled", "all_gaussians"], default="sampled")
     parser.add_argument("--landmark_selection", choices=["global", "per_view", "per_view_spatial"], default="global")
     parser.add_argument("--max_landmarks", type=int, default=200000)
@@ -3480,7 +3552,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--scene_matcher_weight", type=float, default=0.0)
     parser.add_argument("--scene_matcher_topk", type=int, default=1)
     parser.add_argument("--scene_matcher_logit_norm", choices=["none", "center", "zscore"], default="none")
+    parser.add_argument("--scene_matcher_logit_clip", type=float, default=0.0)
     parser.add_argument("--scene_matcher_listwise_dustbin", choices=["score", "drop"], default="score")
+    parser.add_argument("--scene_matcher_candidate_mode", choices=["best", "all"], default="best")
     parser.add_argument(
         "--selfmap_reliability_path",
         default="",
@@ -3724,6 +3798,13 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     model.load_from_ply(train_args["ply_path"])
     model = model.to(device)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if args.ply_loc_feature_override:
+        override = _load_ply_loc_feature_override(
+            Path(args.ply_loc_feature_override),
+            expected_count=model.num_gaussians,
+            device=device,
+        )
+        model.register_buffer("_ply_loc_feature", override)
     model.eval()
     sp_head = SuperPointOutputHead(
         fused_dim=train_args["hybrid_output_dim"],
@@ -4073,7 +4154,9 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         "scene_matcher_weight": float(args.scene_matcher_weight),
         "scene_matcher_topk": int(args.scene_matcher_topk),
         "scene_matcher_logit_norm": str(args.scene_matcher_logit_norm),
+        "scene_matcher_logit_clip": float(args.scene_matcher_logit_clip),
         "scene_matcher_listwise_dustbin": str(args.scene_matcher_listwise_dustbin),
+        "scene_matcher_candidate_mode": str(args.scene_matcher_candidate_mode),
         "selfmap_reliability": getattr(args, "selfmap_reliability", {"enabled": False}),
         "sparse_candidate_topk": int(args.sparse_candidate_topk),
         "sparse_candidate_oracle_topk": int(args.sparse_candidate_oracle_topk),
@@ -4084,6 +4167,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         "feedback_detector_path": args.feedback_detector_path,
         "query_feature_source": args.query_feature_source,
         "descriptor_source": args.descriptor_source,
+        "ply_loc_feature_override": str(args.ply_loc_feature_override),
         "ply_loc_feature_weight": float(args.ply_loc_feature_weight),
         "hybrid_residual_alpha_max": float(args.hybrid_residual_alpha_max),
         "sparse_matcher": resolve_matchers(args)[0],

@@ -12,6 +12,7 @@ from loc_gs.localization.scene_matcher import (
     label_scene_match_pairs,
     load_scene_matcher,
     score_scene_match_candidates,
+    score_scene_match_listwise_flat_candidates,
     select_scene_match_listwise_candidates,
     scene_match_listwise_feature_dim,
     scene_match_feature_dim,
@@ -252,6 +253,44 @@ def test_select_scene_match_listwise_candidates_can_score_instead_of_drop_dustbi
 
     assert keep.tolist() == [1, 2]
     assert torch.allclose(logits, torch.tensor([0.9, -0.3]))
+
+
+def test_score_scene_match_listwise_flat_candidates_returns_soft_per_candidate_logits():
+    class FixedListwiseMatcher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = {"model_type": "listwise"}
+
+        def forward(self, query_desc, landmark_desc, **kwargs):
+            del query_desc, landmark_desc, kwargs
+            return torch.tensor(
+                [
+                    [0.1, 0.9, 0.0],
+                    [0.2, 0.1, 0.5],
+                ],
+                dtype=torch.float32,
+            )
+
+    q_ids = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    lm_ids = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+
+    logits, keep = score_scene_match_listwise_flat_candidates(
+        FixedListwiseMatcher(),
+        torch.randn(2, 4),
+        torch.randn(4, 4),
+        q_ids,
+        lm_ids,
+        drop_dustbin=False,
+    )
+
+    base_scores = torch.tensor([0.95, 0.80, 0.60, 0.55])
+    blended = base_scores + 0.1 * logits
+    best = best_pair_per_query_indices(q_ids[keep], blended, num_queries=2)
+
+    assert keep.tolist() == [0, 1, 2, 3]
+    assert torch.allclose(logits, torch.tensor([0.1, 0.9, -0.3, -0.4]))
+    assert q_ids[keep][best].tolist() == [0, 1]
+    assert lm_ids[keep][best].tolist() == [0, 2]
 
 
 def test_best_pair_per_query_indices_keeps_highest_scoring_candidate():

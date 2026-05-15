@@ -122,6 +122,28 @@ def write_matchability_calibration(payload: dict, output_path: Path) -> None:
     )
 
 
+def attach_listwise_landmark_bank(
+    pair_payload: dict,
+    *,
+    landmark_desc: torch.Tensor,
+    gaussian_ids: torch.Tensor | None = None,
+) -> None:
+    """Attach the sampled landmark bank used by listwise self-map labels."""
+
+    desc = torch.as_tensor(landmark_desc, dtype=torch.float32).detach().cpu()
+    if desc.dim() != 2:
+        raise ValueError("landmark_desc must have shape [num_landmarks, descriptor_dim]")
+    pair_payload["base_landmark_desc"] = desc.half()
+    if gaussian_ids is not None:
+        ids = torch.as_tensor(gaussian_ids, dtype=torch.long).detach().cpu().reshape(-1)
+        if ids.shape[0] != desc.shape[0]:
+            raise ValueError("gaussian_ids must have one value per landmark descriptor")
+        pair_payload["base_gaussian_id"] = ids
+    metadata = pair_payload.setdefault("metadata", {})
+    metadata["base_landmark_count"] = int(desc.shape[0])
+    metadata["base_descriptor_dim"] = int(desc.shape[1])
+
+
 @torch.no_grad()
 def accumulate_matchability_counts(
     tp_count: torch.Tensor,
@@ -310,7 +332,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         if args.stdloc_detector_dir
         else Path(train_args["ply_path"]).parents[2] / "detector"
     )
-    landmark_xyz, landmark_desc, landmark_prior, stats = build_stdloc_detector_landmark_bank(
+    landmark_xyz, landmark_desc, landmark_prior, stats, bank_aux = build_stdloc_detector_landmark_bank(
         model,
         sp_head,
         detector_dir=detector_dir,
@@ -320,7 +342,9 @@ def main(args: argparse.Namespace | None = None) -> None:
         hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
         device=device,
         candidate_source="sampled",
+        return_aux=True,
     )
+    landmark_gaussian_ids = bank_aux.get("gaussian_ids") if isinstance(bank_aux, dict) else None
 
     dataset = CambridgeHybridDataset(
         scene_root=scene_root,
@@ -918,6 +942,13 @@ def main(args: argparse.Namespace | None = None) -> None:
             "source": "calibrate_landmark_matchability",
             "fields": sorted(pair_payload.keys()),
         }
+        if pair_format == "listwise":
+            attach_listwise_landmark_bank(
+                pair_payload,
+                landmark_desc=landmark_desc,
+                gaussian_ids=landmark_gaussian_ids,
+            )
+            pair_payload["metadata"]["fields"] = sorted(pair_payload.keys())
         torch.save(pair_payload, pair_output_path)
         pair_sidecar = pair_output_path.with_suffix(".json")
         if pair_format == "listwise":

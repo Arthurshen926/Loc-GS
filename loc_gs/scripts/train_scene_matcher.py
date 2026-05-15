@@ -131,6 +131,42 @@ def listwise_reprojection_verifier_loss(
     return F.binary_cross_entropy_with_logits(candidate_vs_dustbin[valid], target[valid], reduction="mean")
 
 
+def listwise_soft_reprojection_loss(
+    logits: torch.Tensor,
+    reprojection_error: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    *,
+    sigma_px: float,
+) -> torch.Tensor:
+    """Soft listwise risk surrogate from continuous reprojection quality.
+
+    Instead of forcing one arbitrary positive candidate to be the only winner,
+    this target assigns probability mass to all low-error visible candidates
+    and sends the remaining mass to dustbin.  High-error and invalid candidates
+    receive zero mass, so repeated-structure false positives are explicitly
+    suppressed without needing a scene-specific rule.
+    """
+
+    if logits.dim() != 2 or logits.shape[1] < 2:
+        raise ValueError("listwise soft reprojection logits must have shape [N, K + 1]")
+    topk = int(logits.shape[1] - 1)
+    errors = reprojection_error.to(device=logits.device, dtype=torch.float32)
+    mask = candidate_mask.to(device=logits.device, dtype=torch.bool)
+    if errors.shape != mask.shape or errors.shape[-1] != topk:
+        raise ValueError("reprojection_error and candidate_mask must have shape [N, K]")
+    sigma = max(float(sigma_px), 1e-6)
+    valid = mask & torch.isfinite(errors)
+    candidate_quality = torch.zeros_like(errors, dtype=torch.float32, device=logits.device)
+    candidate_quality[valid] = torch.exp(-errors[valid].clamp_min(0.0) / sigma).clamp(0.0, 1.0)
+    best_quality = candidate_quality.amax(dim=1)
+    dustbin_quality = (1.0 - best_quality).clamp(0.0, 1.0)
+    target = torch.cat([candidate_quality, dustbin_quality[:, None]], dim=1)
+    target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    log_prob = F.log_softmax(logits.float(), dim=1)
+    terms = torch.where(target > 0.0, target * log_prob, torch.zeros_like(target))
+    return -terms.sum(dim=1).mean()
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train SceneMatchNet from self-localization pair labels.")
     parser.add_argument("--pair_files", nargs="+", required=True)
@@ -150,8 +186,11 @@ def build_argparser() -> argparse.ArgumentParser:
         default=DEFAULT_LISTWISE_EXTRA_FEATURES,
     )
     parser.add_argument("--listwise_loss_balance", choices=["binary", "none"], default="binary")
+    parser.add_argument("--listwise_ce_loss_weight", type=float, default=1.0)
     parser.add_argument("--listwise_verifier_loss_weight", type=float, default=0.0)
     parser.add_argument("--listwise_verifier_sigma_px", type=float, default=4.0)
+    parser.add_argument("--listwise_soft_reprojection_loss_weight", type=float, default=0.0)
+    parser.add_argument("--listwise_soft_reprojection_sigma_px", type=float, default=4.0)
     parser.add_argument("--pos_weight", type=float, default=0.0)
     parser.add_argument("--balanced_batches", action="store_true")
     parser.add_argument("--balanced_positive_fraction", type=float, default=0.5)
@@ -337,8 +376,14 @@ def _train_listwise(args: argparse.Namespace, device: torch.device) -> None:
         raise ValueError(f"unsupported listwise_loss_balance: {loss_balance}")
     loss_fn = torch.nn.CrossEntropyLoss(weight=None if class_weight is None else class_weight.to(device))
     history: list[dict[str, float]] = []
+    ce_loss_weight = max(0.0, float(getattr(args, "listwise_ce_loss_weight", 1.0)))
     verifier_loss_weight = max(0.0, float(getattr(args, "listwise_verifier_loss_weight", 0.0)))
     verifier_sigma_px = float(getattr(args, "listwise_verifier_sigma_px", 4.0))
+    soft_reprojection_loss_weight = max(
+        0.0,
+        float(getattr(args, "listwise_soft_reprojection_loss_weight", 0.0)),
+    )
+    soft_reprojection_sigma_px = float(getattr(args, "listwise_soft_reprojection_sigma_px", 4.0))
     verifier_valid = torch.isfinite(tensors["reprojection_error"]) & tensors["candidate_mask"].bool()
     verifier_finite_ratio = float(verifier_valid.float().mean().item())
     for epoch in range(int(args.epochs)):
@@ -346,6 +391,7 @@ def _train_listwise(args: argparse.Namespace, device: torch.device) -> None:
         total_loss = 0.0
         total_ce_loss = 0.0
         total_verifier_loss = 0.0
+        total_soft_reprojection_loss = 0.0
         total = 0
         correct = 0
         for q, d, cosine, margin, query_score, prior, candidate_mask, reprojection_error, label in tqdm(
@@ -378,13 +424,24 @@ def _train_listwise(args: argparse.Namespace, device: torch.device) -> None:
                 candidate_mask,
                 sigma_px=verifier_sigma_px,
             )
-            loss = ce_loss + verifier_loss_weight * verifier_loss
+            soft_reprojection_loss = listwise_soft_reprojection_loss(
+                logits,
+                reprojection_error,
+                candidate_mask,
+                sigma_px=soft_reprojection_sigma_px,
+            )
+            loss = (
+                ce_loss_weight * ce_loss
+                + verifier_loss_weight * verifier_loss
+                + soft_reprojection_loss_weight * soft_reprojection_loss
+            )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             total_loss += float(loss.detach().cpu()) * int(label.numel())
             total_ce_loss += float(ce_loss.detach().cpu()) * int(label.numel())
             total_verifier_loss += float(verifier_loss.detach().cpu()) * int(label.numel())
+            total_soft_reprojection_loss += float(soft_reprojection_loss.detach().cpu()) * int(label.numel())
             total += int(label.numel())
             correct += int((logits.detach().argmax(dim=-1) == label.clamp(0, topk)).sum().item())
         history.append(
@@ -393,6 +450,7 @@ def _train_listwise(args: argparse.Namespace, device: torch.device) -> None:
                 "loss": total_loss / max(1, total),
                 "ce_loss": total_ce_loss / max(1, total),
                 "verifier_loss": total_verifier_loss / max(1, total),
+                "soft_reprojection_loss": total_soft_reprojection_loss / max(1, total),
                 "accuracy": correct / max(1, total),
             }
         )
@@ -412,8 +470,11 @@ def _train_listwise(args: argparse.Namespace, device: torch.device) -> None:
                 else ["query_score", "candidate_rank", "cosine_gap_to_best"],
                 "listwise_extra_features": str(args.listwise_extra_features),
                 "listwise_loss_balance": loss_balance,
+                "listwise_ce_loss_weight": float(ce_loss_weight),
                 "listwise_verifier_loss_weight": float(verifier_loss_weight),
                 "listwise_verifier_sigma_px": float(verifier_sigma_px),
+                "listwise_soft_reprojection_loss_weight": float(soft_reprojection_loss_weight),
+                "listwise_soft_reprojection_sigma_px": float(soft_reprojection_sigma_px),
                 "verifier_finite_ratio": float(verifier_finite_ratio),
                 "class_weight": [] if class_weight is None else [float(v) for v in class_weight.tolist()],
                 "history": history,

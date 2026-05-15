@@ -4,6 +4,7 @@ from loc_gs.localization.scene_matcher import load_scene_matcher
 from loc_gs.scripts.train_scene_matcher import (
     build_argparser,
     listwise_reprojection_verifier_loss,
+    listwise_soft_reprojection_loss,
     load_listwise_tensors,
     load_pair_tensors,
     main,
@@ -174,6 +175,35 @@ def test_listwise_reprojection_verifier_loss_ignores_masked_infinite_logits():
     assert torch.isfinite(loss)
 
 
+def test_listwise_soft_reprojection_loss_prefers_low_error_candidates_and_dustbin():
+    errors = torch.tensor(
+        [
+            [0.1, 12.0],
+            [float("inf"), float("inf")],
+        ],
+        dtype=torch.float32,
+    )
+    mask = torch.tensor([[True, True], [False, False]])
+    good_logits = torch.tensor([[4.0, -4.0, 0.0], [-4.0, -4.0, 4.0]], dtype=torch.float32)
+    bad_logits = torch.tensor([[-4.0, 4.0, 0.0], [4.0, 4.0, -4.0]], dtype=torch.float32)
+
+    good_loss = listwise_soft_reprojection_loss(good_logits, errors, mask, sigma_px=4.0)
+    bad_loss = listwise_soft_reprojection_loss(bad_logits, errors, mask, sigma_px=4.0)
+
+    assert good_loss < bad_loss
+    assert torch.isfinite(good_loss)
+
+
+def test_listwise_soft_reprojection_loss_ignores_masked_infinite_logits():
+    errors = torch.tensor([[0.1, float("inf")]], dtype=torch.float32)
+    mask = torch.tensor([[True, False]])
+    logits = torch.tensor([[4.0, float("-inf"), 0.0]], dtype=torch.float32)
+
+    loss = listwise_soft_reprojection_loss(logits, errors, mask, sigma_px=4.0)
+
+    assert torch.isfinite(loss)
+
+
 def test_train_scene_matcher_listwise_can_use_reprojection_verifier_loss(tmp_path):
     pair_path = tmp_path / "listwise_pairs_with_errors.pt"
     output_path = tmp_path / "best_listwise_verifier.pt"
@@ -208,6 +238,44 @@ def test_train_scene_matcher_listwise_can_use_reprojection_verifier_loss(tmp_pat
     assert checkpoint["metadata"]["listwise_verifier_loss_weight"] == 0.25
     assert checkpoint["metadata"]["listwise_verifier_sigma_px"] == 4.0
     assert checkpoint["metadata"]["verifier_finite_ratio"] == 1.0
+
+
+def test_train_scene_matcher_listwise_can_use_soft_reprojection_loss(tmp_path):
+    pair_path = tmp_path / "listwise_pairs_with_soft_errors.pt"
+    output_path = tmp_path / "best_listwise_soft.pt"
+    _write_listwise_pairs(pair_path, include_reprojection_error=True)
+    args = build_argparser().parse_args(
+        [
+            "--pair_files",
+            str(pair_path),
+            "--output_path",
+            str(output_path),
+            "--listwise",
+            "--listwise_ce_loss_weight",
+            "0.25",
+            "--listwise_soft_reprojection_loss_weight",
+            "1.5",
+            "--listwise_soft_reprojection_sigma_px",
+            "6.0",
+            "--epochs",
+            "1",
+            "--batch_size",
+            "4",
+            "--hidden_dim",
+            "8",
+            "--num_layers",
+            "2",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    main(args)
+    checkpoint = torch.load(output_path, map_location="cpu")
+
+    assert checkpoint["metadata"]["listwise_ce_loss_weight"] == 0.25
+    assert checkpoint["metadata"]["listwise_soft_reprojection_loss_weight"] == 1.5
+    assert checkpoint["metadata"]["listwise_soft_reprojection_sigma_px"] == 6.0
 
 
 def test_train_scene_matcher_listwise_can_use_rank_gap_features(tmp_path):
