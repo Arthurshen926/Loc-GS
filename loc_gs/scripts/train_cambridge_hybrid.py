@@ -20,6 +20,8 @@ from tqdm import tqdm
 from loc_gs.data.cambridge_dataset import CambridgeHybridDataset
 from loc_gs.data.external_match_cache import ExternalMatchCache
 from loc_gs.data.superpoint_cache import SuperPointTeacherCache
+from loc_gs.feedback.io import load_feedback_bank
+from loc_gs.feedback.labels import derive_hard_negative_labels
 from loc_gs.localization.descriptor_blend import gated_residual_descriptor_blend
 from loc_gs.localization.stdloc_detector import StdlocKeypointDetector
 from loc_gs.losses.cross_view import (
@@ -31,6 +33,7 @@ from loc_gs.losses.cross_view import (
 from loc_gs.losses.differentiable_pnp import DifferentiablePnPMatchLoss
 from loc_gs.losses.external_match import external_match_supervision_loss
 from loc_gs.losses.geometric_match import geometric_keypoint_match_loss
+from loc_gs.losses.hard_negative_descriptor import residual_trust_region_loss
 from loc_gs.losses.landmark_selection import (
     depth_consistency_score,
     descriptor_ambiguity_loss,
@@ -452,6 +455,85 @@ def descriptor_residual_alignment_loss(
     pred = F.normalize(predicted_desc.float(), p=2, dim=-1)
     ref = F.normalize(reference_desc.to(device=pred.device, dtype=torch.float32), p=2, dim=-1)
     return (1.0 - F.cosine_similarity(pred, ref, dim=-1)).mean()
+
+
+def load_feedback_hard_negative_targets(
+    feedback_bank_path: str | Path,
+    *,
+    descriptor_score_min: float = 0.5,
+    reprojection_error_px_min: float = 8.0,
+    max_records: int = 4096,
+) -> dict[str, torch.Tensor | dict]:
+    """Load hard-negative Gaussian ids from a feedback bank for residual training."""
+
+    bank = load_feedback_bank(feedback_bank_path)
+    manifest = dict(bank.get("manifest", {}))
+    if str(manifest.get("split_name", "")).strip().lower() == "test":
+        raise ValueError("feedback bank split_name=test is not allowed for training")
+    records = list(bank.get("records", []))
+    labels = derive_hard_negative_labels(
+        records,
+        descriptor_score_min=descriptor_score_min,
+        reprojection_error_px_min=reprojection_error_px_min,
+    )
+    ids: list[int] = []
+    weights: list[float] = []
+    for record, label in zip(records, labels):
+        if not label:
+            continue
+        raw_id = record.get("matched_gaussian_id") or record.get("matched_landmark_id")
+        try:
+            gaussian_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if gaussian_id < 0:
+            continue
+        ids.append(gaussian_id)
+        try:
+            weights.append(float(record.get("descriptor_score", 1.0)))
+        except (TypeError, ValueError):
+            weights.append(1.0)
+        if len(ids) >= int(max_records):
+            break
+    return {
+        "gaussian_ids": torch.tensor(ids, dtype=torch.long),
+        "weights": torch.tensor(weights, dtype=torch.float32),
+        "metadata": manifest,
+    }
+
+
+def feedback_bank_residual_loss(
+    base_desc: torch.Tensor,
+    residual_desc: torch.Tensor,
+    targets: dict[str, torch.Tensor | dict] | None,
+    *,
+    alpha_max: float,
+    residual_trust_region_weight: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    """Compute a loggable residual loss over hard-negative ids from a feedback bank."""
+
+    zero = base_desc.float().sum() * 0.0
+    if not targets:
+        return {"loss": zero, "trust_region": zero, "samples": zero}
+    ids = torch.as_tensor(targets.get("gaussian_ids", []), device=base_desc.device, dtype=torch.long).reshape(-1)
+    weights = torch.as_tensor(targets.get("weights", []), device=base_desc.device, dtype=torch.float32).reshape(-1)
+    valid = (ids >= 0) & (ids < base_desc.shape[0]) & (ids < residual_desc.shape[0])
+    if not valid.any():
+        return {"loss": zero, "trust_region": zero, "samples": zero}
+    ids = ids[valid]
+    weights = weights[valid] if weights.numel() == valid.numel() else torch.ones(ids.numel(), device=base_desc.device)
+    trust = residual_trust_region_loss(
+        base_desc[ids].detach(),
+        residual_desc[ids],
+        alpha_max=float(alpha_max),
+        weights=weights,
+    )
+    loss = float(residual_trust_region_weight) * trust
+    return {
+        "loss": loss,
+        "trust_region": trust,
+        "samples": base_desc.new_tensor(float(ids.numel())),
+    }
 
 
 def locability_prior_alignment_loss(
@@ -987,6 +1069,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--locability_sparse_weight", type=float, default=0.001)
     parser.add_argument("--cross_view_weight", type=float, default=0.0)
     parser.add_argument("--hard_negative_weight", type=float, default=0.0)
+    parser.add_argument("--feedback_bank_path", default="")
+    parser.add_argument("--enable_hard_negative_residual_loss", action="store_true")
+    parser.add_argument("--hard_negative_margin", type=float, default=0.2)
+    parser.add_argument("--hard_negative_loss_weight", type=float, default=0.0)
+    parser.add_argument("--residual_trust_region_weight", type=float, default=0.0)
     parser.add_argument("--memory_bank_size", type=int, default=4096)
     parser.add_argument("--memory_bank_momentum", type=float, default=0.99)
     parser.add_argument("--view_pair_min_overlap", type=float, default=0.05)
@@ -1178,6 +1265,17 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             scene=args.scene,
             pipeline=args.external_match_pipeline,
             split="train",
+        )
+    feedback_hard_negative_targets = None
+    if bool(args.enable_hard_negative_residual_loss) and args.feedback_bank_path:
+        feedback_hard_negative_targets = load_feedback_hard_negative_targets(
+            args.feedback_bank_path,
+            max_records=max(1, int(args.ply_residual_reg_samples)),
+        )
+        print(
+            "[train] loaded "
+            f"{int(feedback_hard_negative_targets['gaussian_ids'].numel())} "
+            f"feedback hard-negative residual targets from {args.feedback_bank_path}"
         )
 
     pnp_loss_fn = DifferentiablePnPMatchLoss(
@@ -1700,6 +1798,53 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     residual_desc = decode_gaussian_center_descriptors(model, sp_head, residual_ids)
                     residual_ref = loc_feature.to(device=device, dtype=torch.float32)[residual_ids]
                     ply_residual_reg = descriptor_residual_alignment_loss(residual_desc, residual_ref)
+                feedback_residual_out = {
+                    "loss": pred_desc.new_tensor(0.0),
+                    "trust_region": pred_desc.new_tensor(0.0),
+                    "samples": pred_desc.new_tensor(0.0),
+                }
+                if (
+                    feedback_hard_negative_targets is not None
+                    and args.hard_negative_loss_weight > 0.0
+                    and args.residual_trust_region_weight > 0.0
+                    and loc_feature.numel() > 0
+                    and loc_feature.shape[1] > 0
+                ):
+                    target_ids = torch.as_tensor(
+                        feedback_hard_negative_targets["gaussian_ids"],
+                        device=device,
+                        dtype=torch.long,
+                    ).reshape(-1)
+                    target_weights = torch.as_tensor(
+                        feedback_hard_negative_targets["weights"],
+                        device=device,
+                        dtype=torch.float32,
+                    ).reshape(-1)
+                    valid_target = (target_ids >= 0) & (target_ids < int(model.num_gaussians))
+                    target_ids = target_ids[valid_target]
+                    target_weights = target_weights[valid_target]
+                    if target_ids.numel() > 0:
+                        sample_count = min(
+                            max(1, int(args.ply_residual_reg_samples)),
+                            int(target_ids.numel()),
+                        )
+                        if target_ids.numel() > sample_count:
+                            order = torch.randperm(target_ids.numel(), device=device)[:sample_count]
+                            target_ids = target_ids[order]
+                            target_weights = target_weights[order]
+                        base_target = loc_feature.to(device=device, dtype=torch.float32)[target_ids]
+                        residual_target = decode_gaussian_center_descriptors(model, sp_head, target_ids)
+                        local_targets = {
+                            "gaussian_ids": torch.arange(target_ids.numel(), device=device, dtype=torch.long),
+                            "weights": target_weights,
+                        }
+                        feedback_residual_out = feedback_bank_residual_loss(
+                            base_target,
+                            residual_target,
+                            local_targets,
+                            alpha_max=float(args.hybrid_residual_alpha_max),
+                            residual_trust_region_weight=float(args.residual_trust_region_weight),
+                        )
                 geometry_reg = pred_desc.new_tensor(0.0)
                 if args.train_xyz:
                     geometry_reg = geometry_reg + F.mse_loss(model.get_xyz(), xyz0)
@@ -1731,6 +1876,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     + args.locability_ambiguity_weight * ambiguity_loss
                     + args.key_gaussian_isotropy_weight * isotropy_loss
                     + args.ply_residual_reg_weight * ply_residual_reg
+                    + args.hard_negative_loss_weight * feedback_residual_out["loss"]
                 )
 
             scaler.scale(loss / float(grad_accum_steps)).backward()
@@ -1780,6 +1926,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "ambiguity": float(ambiguity_loss.detach()),
                 "isotropy": float(isotropy_loss.detach()),
                 "ply_residual_reg": float(ply_residual_reg.detach()),
+                "hard_negative_residual": float(feedback_residual_out["loss"].detach()),
+                "hard_negative_residual_samples": float(feedback_residual_out["samples"].detach()),
             }
             for key, value in metrics.items():
                 accum[key] = accum.get(key, 0.0) + value
