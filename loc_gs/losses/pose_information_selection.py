@@ -151,17 +151,23 @@ def coverage_regularization_loss(
     if visibility_score is not None:
         visibility = _as_candidate_tensor(visibility_score, logits).clamp(0.0, 1.0)
         probs = probs * visibility.masked_fill(~valid, 0.0)
-    flat_probs = probs.reshape(-1)
-    flat_valid = valid.reshape(-1)
-    if int((flat_probs > eps).sum().item()) < 2:
+    batch_probs = probs.reshape(-1, probs.shape[-1])
+    batch_valid = valid.reshape(-1, valid.shape[-1])
+    if not ((batch_probs > eps) & batch_valid).sum(dim=1).ge(2).any():
         return _zero_like_loss(logits)
-    pos = positions_xy[..., :2].to(device=logits.device, dtype=torch.float32).reshape(-1, 2)
-    pos = pos.masked_fill(~flat_valid[:, None], 0.0)
+    pos = positions_xy[..., :2].to(device=logits.device, dtype=torch.float32).reshape(
+        batch_probs.shape[0],
+        batch_probs.shape[1],
+        2,
+    )
+    pos = pos.masked_fill(~batch_valid[..., None], 0.0)
     dist2 = torch.cdist(pos, pos).square()
     scale = max(float(sigma), float(eps))
     close_penalty = torch.exp(-dist2 / (2.0 * scale * scale))
-    pair_weight = flat_probs[:, None] * flat_probs[None, :]
-    eye = torch.eye(pair_weight.shape[0], dtype=torch.bool, device=pair_weight.device)
+    pair_weight = batch_probs[..., :, None] * batch_probs[..., None, :]
+    valid_pair = batch_valid[..., :, None] & batch_valid[..., None, :]
+    eye = torch.eye(pair_weight.shape[-1], dtype=torch.bool, device=pair_weight.device).unsqueeze(0)
+    pair_weight = pair_weight.masked_fill(~valid_pair, 0.0)
     pair_weight = pair_weight.masked_fill(eye, 0.0)
     close_penalty = close_penalty.masked_fill(eye, 0.0)
     denom = pair_weight.sum()

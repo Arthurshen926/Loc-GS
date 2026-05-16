@@ -18,10 +18,10 @@ Machine-readable artifacts currently visible in this checkout:
   Cambridge tables.
 
 The generated board from checked-in `results/` marks the smoke run as
-`diagnostic` and not paper-safe because both manifest and split audit are
-missing. The stronger full-Cambridge numbers are documented in README and
-mainline notes, but their machine-readable paper-safety bundle is not present in
-this checkout.
+`diagnostic` and not paper-safe because manifest, split audit, and audit-bundle
+files are missing. The stronger full-Cambridge numbers are documented in README
+and mainline notes, but their machine-readable paper-safety bundle is not
+present in this checkout.
 
 ## Claim 1
 

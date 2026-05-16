@@ -10,25 +10,28 @@ from result roots with:
   --output_json output/experiment_board.json
 ```
 
-The script scans each root for `summary.json` or `metrics_summary.json`, reads
-sidecar `manifest.json` and `split_audit.json` from the same run directory, and
-writes:
+The script scans each root for `metrics_summary.json` or `summary.json`, reads
+sidecar audit files from the same run directory, and writes:
 
 - a Markdown table;
 - compact JSON;
 - one row per discovered run.
 
+When both metric files exist in the same run directory, `metrics_summary.json`
+is used as the canonical audit-bundle source.
+
 ## Roles
 
 Rows are marked as one of:
 
-- `main_candidate`: paper-facing candidate with manifest and passed split audit.
+- `main_candidate`: paper-facing candidate with a complete audit bundle and
+  passed split audit.
 - `ablation`: controlled comparison, usually marked by `manifest.run_role`.
 - `diagnostic`: useful for debugging or failure analysis but not paper-safe.
 - `rejected`: failed split audit or invalid run.
 
-Missing manifest or split audit makes `paper_safe = false`; it does not pass by
-default.
+Missing manifest, split audit, `metrics_summary.json`, `command.txt`, or git
+diff/status evidence makes `paper_safe = false`; it does not pass by default.
 
 ## Columns
 

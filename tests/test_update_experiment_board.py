@@ -3,24 +3,24 @@ import json
 from loc_gs.scripts.update_experiment_board import build_argparser, main
 
 
-def _write_run(root, name, *, scene="ShopFacade", manifest=True, audit_status="passed", role=None):
+def _write_run(root, name, *, scene="ShopFacade", manifest=True, audit_status="passed", role=None, audit_bundle=True):
     run = root / name
     run.mkdir(parents=True)
-    (run / "summary.json").write_text(
-        json.dumps(
-            {
-                "scene": scene,
-                "dense": {
-                    "median_te": 2.5,
-                    "median_ae": 0.12,
-                    "recall_10cm_5d": 0.9,
-                    "recall_5cm_5d": 0.8,
-                    "recall_2cm_2d": 0.3,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    summary = {
+        "scene": scene,
+        "dense": {
+            "median_te": 2.5,
+            "median_ae": 0.12,
+            "recall_10cm_5d": 0.9,
+            "recall_5cm_5d": 0.8,
+            "recall_2cm_2d": 0.3,
+        },
+    }
+    (run / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    if audit_bundle:
+        (run / "metrics_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        (run / "command.txt").write_text("python -m loc_gs.scripts.eval_stdloc_native\n", encoding="utf-8")
+        (run / "git_status.txt").write_text("", encoding="utf-8")
     if manifest:
         payload = {
             "scene": scene,
@@ -72,6 +72,29 @@ def test_update_experiment_board_writes_markdown_and_json(tmp_path):
     assert "failed_audit" in text
 
 
+def test_update_experiment_board_requires_complete_audit_bundle_for_paper_safe(tmp_path):
+    root = tmp_path / "results"
+    _write_run(root, "incomplete_bundle", role="main_candidate", audit_bundle=False)
+    js = tmp_path / "board.json"
+    args = build_argparser().parse_args(
+        [
+            "--result_roots",
+            str(root),
+            "--output_json",
+            str(js),
+        ]
+    )
+
+    assert main(args) == 0
+
+    row = json.loads(js.read_text(encoding="utf-8"))["runs"][0]
+    assert row["paper_safe"] is False
+    assert row["run_role"] == "main_candidate"
+    assert "missing metrics_summary.json" in row["paper_safety_reason"]
+    assert "missing command.txt" in row["paper_safety_reason"]
+    assert "missing git diff/status" in row["paper_safety_reason"]
+
+
 def test_update_experiment_board_can_mark_manifest_ablation(tmp_path):
     root = tmp_path / "results"
     _write_run(root, "ablation_safe", role="ablation")
@@ -113,6 +136,8 @@ def test_update_experiment_board_discovers_metrics_summary_bundles(tmp_path):
     )
     (run / "manifest.json").write_text(json.dumps({"scene": "ShopFacade"}), encoding="utf-8")
     (run / "split_audit.json").write_text(json.dumps({"audit_status": "passed"}), encoding="utf-8")
+    (run / "command.txt").write_text("python -m loc_gs.scripts.eval_stdloc_native\n", encoding="utf-8")
+    (run / "git_status.txt").write_text("", encoding="utf-8")
     js = tmp_path / "board.json"
     args = build_argparser().parse_args(
         [
@@ -129,4 +154,32 @@ def test_update_experiment_board_discovers_metrics_summary_bundles(tmp_path):
     assert len(rows) == 1
     assert rows[0]["run_name"] == "audit_bundle"
     assert rows[0]["paper_safe"] is True
+    assert rows[0]["metrics"]["dense"]["median_te_cm"] == 2.25
+
+
+def test_update_experiment_board_prefers_metrics_summary_when_both_exist(tmp_path):
+    root = tmp_path / "results"
+    run = _write_run(root, "audit_bundle")
+    (run / "summary.json").write_text(
+        json.dumps({"scene": "ShopFacade", "dense": {"median_te": 99.0}}),
+        encoding="utf-8",
+    )
+    (run / "metrics_summary.json").write_text(
+        json.dumps({"scene": "ShopFacade", "dense": {"median_te_cm": 2.25}}),
+        encoding="utf-8",
+    )
+    js = tmp_path / "board.json"
+    args = build_argparser().parse_args(
+        [
+            "--result_roots",
+            str(root),
+            "--output_json",
+            str(js),
+        ]
+    )
+
+    assert main(args) == 0
+
+    rows = json.loads(js.read_text(encoding="utf-8"))["runs"]
+    assert len(rows) == 1
     assert rows[0]["metrics"]["dense"]["median_te_cm"] == 2.25

@@ -56,6 +56,21 @@ def test_coverage_regularization_penalizes_collapsed_selected_points():
     assert collapsed > spread
 
 
+def test_coverage_regularization_keeps_batches_independent():
+    positions = torch.tensor(
+        [
+            [[0.0, 0.0], [1.0, 1.0]],
+            [[0.0, 0.0], [1.0, 1.0]],
+        ],
+        dtype=torch.float32,
+    )
+    one_selected_per_batch = torch.tensor([[5.0, -30.0], [5.0, -30.0]], dtype=torch.float32)
+
+    loss = coverage_regularization_loss(one_selected_per_batch, positions, sigma=0.25)
+
+    assert loss == 0
+
+
 def test_combined_pose_info_selector_loss_handles_empty_mask_without_nan():
     logits = torch.randn(2, 3)
     mask = torch.zeros(2, 3, dtype=torch.bool)

@@ -10,7 +10,7 @@ from loc_gs.scripts.locgsctl import summarize_path
 
 
 ROLE_VALUES = {"main_candidate", "ablation", "diagnostic", "rejected"}
-SUMMARY_FILENAMES = ("summary.json", "metrics_summary.json")
+SUMMARY_FILENAMES = ("metrics_summary.json", "summary.json")
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -56,7 +56,12 @@ def _role_from_manifest(manifest: dict[str, Any] | None) -> str | None:
     return None
 
 
-def _paper_safety(manifest: dict[str, Any] | None, split_audit: dict[str, Any] | None) -> tuple[bool, str]:
+def _paper_safety(
+    manifest: dict[str, Any] | None,
+    split_audit: dict[str, Any] | None,
+    *,
+    run_dir: Path,
+) -> tuple[bool, str]:
     reasons: list[str] = []
     if manifest is None:
         reasons.append("missing manifest")
@@ -64,6 +69,12 @@ def _paper_safety(manifest: dict[str, Any] | None, split_audit: dict[str, Any] |
         reasons.append("missing split audit")
     elif str(split_audit.get("audit_status", "unknown")) != "passed":
         reasons.append(f"split audit {split_audit.get('audit_status', 'unknown')}")
+    if not (run_dir / "metrics_summary.json").exists():
+        reasons.append("missing metrics_summary.json")
+    if not (run_dir / "command.txt").exists():
+        reasons.append("missing command.txt")
+    if not (run_dir / "git_diff.patch").exists() and not (run_dir / "git_status.txt").exists():
+        reasons.append("missing git diff/status")
     return (not reasons), "; ".join(reasons) if reasons else "passed"
 
 
@@ -86,7 +97,7 @@ def _row_from_summary(summary_path: Path) -> dict[str, Any]:
     manifest = _load_json(run_dir / "manifest.json")
     split_audit = _load_json(run_dir / "split_audit.json")
     compact = summarize_path(summary_path)
-    paper_safe, reason = _paper_safety(manifest, split_audit)
+    paper_safe, reason = _paper_safety(manifest, split_audit, run_dir=run_dir)
     role = _classify_run(manifest, split_audit, paper_safe=paper_safe)
     scene = str(
         compact.get(
