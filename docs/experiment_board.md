@@ -18,7 +18,8 @@ sidecar audit files from the same run directory, and writes:
 - one row per discovered run.
 
 When both metric files exist in the same run directory, `metrics_summary.json`
-is used as the canonical audit-bundle source.
+is used as the canonical audit-bundle source, including when `--result_roots`
+points directly at that run's `summary.json`.
 
 ## Roles
 

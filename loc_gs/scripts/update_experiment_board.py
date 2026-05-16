@@ -35,13 +35,21 @@ def _load_json(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _canonical_summary_path(path: Path) -> Path:
+    if path.name == "summary.json":
+        metrics_summary = path.parent / "metrics_summary.json"
+        if metrics_summary.exists():
+            return metrics_summary
+    return path
+
+
 def _discover_summary_paths(result_roots: list[str]) -> list[Path]:
     paths: list[Path] = []
     seen_run_dirs: set[Path] = set()
     for raw in result_roots:
         root = Path(raw)
         if root.is_file() and root.name in SUMMARY_FILENAMES:
-            candidates = [root]
+            candidates = [_canonical_summary_path(root)]
         elif root.exists():
             candidates = []
             for filename in SUMMARY_FILENAMES:

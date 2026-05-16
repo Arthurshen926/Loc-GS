@@ -239,3 +239,31 @@ def test_update_experiment_board_prefers_metrics_summary_when_both_exist(tmp_pat
     rows = json.loads(js.read_text(encoding="utf-8"))["runs"]
     assert len(rows) == 1
     assert rows[0]["metrics"]["dense"]["median_te_cm"] == 2.25
+
+
+def test_update_experiment_board_prefers_metrics_summary_for_direct_summary_file(tmp_path):
+    root = tmp_path / "results"
+    run = _write_run(root, "audit_bundle")
+    (run / "summary.json").write_text(
+        json.dumps({"scene": "ShopFacade", "dense": {"median_te": 99.0}}),
+        encoding="utf-8",
+    )
+    (run / "metrics_summary.json").write_text(
+        json.dumps({"scene": "ShopFacade", "dense": {"median_te_cm": 2.25}}),
+        encoding="utf-8",
+    )
+    js = tmp_path / "board.json"
+    args = build_argparser().parse_args(
+        [
+            "--result_roots",
+            str(run / "summary.json"),
+            "--output_json",
+            str(js),
+        ]
+    )
+
+    assert main(args) == 0
+
+    rows = json.loads(js.read_text(encoding="utf-8"))["runs"]
+    assert len(rows) == 1
+    assert rows[0]["metrics"]["dense"]["median_te_cm"] == 2.25
