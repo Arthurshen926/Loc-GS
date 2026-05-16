@@ -30,8 +30,12 @@ Rows are marked as one of:
 - `diagnostic`: useful for debugging or failure analysis but not paper-safe.
 - `rejected`: failed split audit or invalid run.
 
-Missing manifest, split audit, `metrics_summary.json`, `command.txt`, or git
-diff/status evidence makes `paper_safe = false`; it does not pass by default.
+Missing manifest, required manifest fields, split audit,
+`metrics_summary.json`, `command.txt`, or git diff/status evidence makes
+`paper_safe = false`; it does not pass by default. Required manifest fields are
+`git_commit`, timestamp, command, scene, split, checkpoint path, map path, data
+root(s), hyperparameters, `rho`, and flags for feedback, residual, and selector
+enablement.
 
 ## Columns
 

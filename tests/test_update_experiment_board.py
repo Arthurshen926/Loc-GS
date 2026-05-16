@@ -24,8 +24,18 @@ def _write_run(root, name, *, scene="ShopFacade", manifest=True, audit_status="p
     if manifest:
         payload = {
             "scene": scene,
-            "checkpoint": f"output/checkpoints/{name}.pth",
-            "baseline_map": "output/stdloc/map_cambridge_spgs/ShopFacade",
+            "split": "selfmap_train",
+            "command": ["python", "-m", "loc_gs.scripts.eval_stdloc_native"],
+            "checkpoint_path": f"output/checkpoints/{name}.pth",
+            "map_path": "output/stdloc/map_cambridge_spgs/ShopFacade",
+            "data_roots": ["/mnt/pool/sqy/dataset/Cambridge/ShopFacade"],
+            "hyperparameters": {"rho": 0.0, "alpha": 0.0},
+            "rho": 0.0,
+            "git_commit": "abc123",
+            "timestamp_utc": "2026-05-16T00:00:00+00:00",
+            "feedback_enabled": False,
+            "residual_enabled": False,
+            "selector_enabled": False,
         }
         if role is not None:
             payload["run_role"] = role
@@ -95,6 +105,33 @@ def test_update_experiment_board_requires_complete_audit_bundle_for_paper_safe(t
     assert "missing git diff/status" in row["paper_safety_reason"]
 
 
+def test_update_experiment_board_requires_complete_manifest_fields_for_paper_safe(tmp_path):
+    root = tmp_path / "results"
+    run = _write_run(root, "incomplete_manifest", role="main_candidate")
+    (run / "manifest.json").write_text(
+        json.dumps({"scene": "ShopFacade", "run_role": "main_candidate"}),
+        encoding="utf-8",
+    )
+    js = tmp_path / "board.json"
+    args = build_argparser().parse_args(
+        [
+            "--result_roots",
+            str(root),
+            "--output_json",
+            str(js),
+        ]
+    )
+
+    assert main(args) == 0
+
+    row = json.loads(js.read_text(encoding="utf-8"))["runs"][0]
+    assert row["paper_safe"] is False
+    assert row["run_role"] == "main_candidate"
+    assert "missing manifest field split" in row["paper_safety_reason"]
+    assert "missing manifest field checkpoint_path" in row["paper_safety_reason"]
+    assert "missing manifest field hyperparameters" in row["paper_safety_reason"]
+
+
 def test_update_experiment_board_can_mark_manifest_ablation(tmp_path):
     root = tmp_path / "results"
     _write_run(root, "ablation_safe", role="ablation")
@@ -134,7 +171,26 @@ def test_update_experiment_board_discovers_metrics_summary_bundles(tmp_path):
         ),
         encoding="utf-8",
     )
-    (run / "manifest.json").write_text(json.dumps({"scene": "ShopFacade"}), encoding="utf-8")
+    (run / "manifest.json").write_text(
+        json.dumps(
+            {
+                "scene": "ShopFacade",
+                "split": "selfmap_train",
+                "command": ["python", "-m", "loc_gs.scripts.eval_stdloc_native"],
+                "checkpoint_path": "output/stdloc_hybrid/ShopFacade/latest.pth",
+                "map_path": "output/stdloc/map_cambridge_spgs/ShopFacade",
+                "data_roots": ["/mnt/pool/sqy/dataset/Cambridge/ShopFacade"],
+                "hyperparameters": {"rho": 0.0, "alpha": 0.0},
+                "rho": 0.0,
+                "git_commit": "abc123",
+                "timestamp_utc": "2026-05-16T00:00:00+00:00",
+                "feedback_enabled": False,
+                "residual_enabled": False,
+                "selector_enabled": False,
+            }
+        ),
+        encoding="utf-8",
+    )
     (run / "split_audit.json").write_text(json.dumps({"audit_status": "passed"}), encoding="utf-8")
     (run / "command.txt").write_text("python -m loc_gs.scripts.eval_stdloc_native\n", encoding="utf-8")
     (run / "git_status.txt").write_text("", encoding="utf-8")

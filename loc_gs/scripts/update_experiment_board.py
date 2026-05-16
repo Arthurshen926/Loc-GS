@@ -11,6 +11,21 @@ from loc_gs.scripts.locgsctl import summarize_path
 
 ROLE_VALUES = {"main_candidate", "ablation", "diagnostic", "rejected"}
 SUMMARY_FILENAMES = ("metrics_summary.json", "summary.json")
+MANIFEST_FIELD_GROUPS = (
+    ("git_commit", ("git_commit",)),
+    ("timestamp_utc", ("timestamp_utc", "timestamp")),
+    ("command", ("command",)),
+    ("scene", ("scene",)),
+    ("split", ("split", "split_name")),
+    ("checkpoint_path", ("checkpoint_path", "checkpoint")),
+    ("map_path", ("map_path", "map", "baseline_map")),
+    ("data_roots", ("data_roots", "data_root")),
+    ("hyperparameters", ("hyperparameters",)),
+    ("rho", ("rho",)),
+    ("feedback_enabled", ("feedback_enabled",)),
+    ("residual_enabled", ("residual_enabled",)),
+    ("selector_enabled", ("selector_enabled",)),
+)
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -56,6 +71,35 @@ def _role_from_manifest(manifest: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _has_manifest_value(manifest: dict[str, Any], names: tuple[str, ...]) -> bool:
+    for name in names:
+        if name not in manifest:
+            continue
+        value = manifest[name]
+        if isinstance(value, bool):
+            return True
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return True
+            continue
+        if isinstance(value, (list, tuple, set)):
+            if any(str(item).strip() for item in value):
+                return True
+            continue
+        return True
+    return False
+
+
+def _missing_manifest_fields(manifest: dict[str, Any]) -> list[str]:
+    return [
+        field_name
+        for field_name, aliases in MANIFEST_FIELD_GROUPS
+        if not _has_manifest_value(manifest, aliases)
+    ]
+
+
 def _paper_safety(
     manifest: dict[str, Any] | None,
     split_audit: dict[str, Any] | None,
@@ -65,6 +109,8 @@ def _paper_safety(
     reasons: list[str] = []
     if manifest is None:
         reasons.append("missing manifest")
+    else:
+        reasons.extend(f"missing manifest field {field}" for field in _missing_manifest_fields(manifest))
     if split_audit is None:
         reasons.append("missing split audit")
     elif str(split_audit.get("audit_status", "unknown")) != "passed":
