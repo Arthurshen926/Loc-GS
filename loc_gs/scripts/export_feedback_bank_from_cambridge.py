@@ -108,7 +108,9 @@ def _gaussian_id(
         if row is not None and col is not None and tensor.dim() >= 2 and row < tensor.shape[0] and col < tensor.shape[1]:
             return str(int(tensor[row, col].item()))
         flat = tensor.reshape(-1)
-        if flat.numel() == tensor.numel() and flat.numel() > flat_index:
+        if key == "base_gaussian_id" and 0 <= landmark_id < flat.numel():
+            return str(int(flat[landmark_id].item()))
+        if flat.numel() > flat_index:
             return str(int(flat[flat_index].item()))
         if 0 <= landmark_id < flat.numel():
             return str(int(flat[landmark_id].item()))

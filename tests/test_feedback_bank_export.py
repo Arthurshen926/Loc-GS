@@ -16,7 +16,7 @@ def _write_listwise_pair_cache(path):
         "reprojection_error": torch.tensor([[1.0, 12.0, float("inf")], [9.0, 10.0, 11.0]], dtype=torch.float32),
         "query_yx": torch.tensor([[20.0, 10.0], [24.0, 12.0]], dtype=torch.float32),
         "landmark_id": torch.tensor([[101, 102, 103], [201, 202, 203]], dtype=torch.long),
-        "base_gaussian_id": torch.tensor([1001, 1002, 1003, 2001, 2002, 2003], dtype=torch.long),
+        "base_gaussian_id": torch.arange(3000, dtype=torch.long) + 1000,
         "label": torch.tensor([0, 3], dtype=torch.long),
         "metadata": {
             "scene": "ShopFacade",
@@ -74,7 +74,7 @@ def test_export_feedback_bank_from_listwise_pair_cache(tmp_path):
     assert records[0]["source_view_id"] == "scene_match_pairs.pt"
     assert records[0]["keypoint_xy"] == [10.0, 20.0]
     assert records[0]["matched_landmark_id"] == "101"
-    assert records[0]["matched_gaussian_id"] == "1001"
+    assert records[0]["matched_gaussian_id"] == "1101"
     assert records[0]["pnp_inlier"] is True
     assert records[1]["pnp_inlier"] is False
     assert records[-1]["query_id"] == "query_000001"
