@@ -132,6 +132,52 @@ def test_update_experiment_board_requires_complete_manifest_fields_for_paper_saf
     assert "missing manifest field hyperparameters" in row["paper_safety_reason"]
 
 
+def test_update_experiment_board_rejects_manifest_scene_mismatch_for_paper_safe(tmp_path):
+    root = tmp_path / "results"
+    run = _write_run(root, "scene_mismatch", role="main_candidate")
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    manifest["scene"] = "KingsCollege"
+    (run / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    js = tmp_path / "board.json"
+    args = build_argparser().parse_args(
+        [
+            "--result_roots",
+            str(root),
+            "--output_json",
+            str(js),
+        ]
+    )
+
+    assert main(args) == 0
+
+    row = json.loads(js.read_text(encoding="utf-8"))["runs"][0]
+    assert row["paper_safe"] is False
+    assert "manifest scene mismatch" in row["paper_safety_reason"]
+
+
+def test_update_experiment_board_rejects_manifest_command_mismatch_for_paper_safe(tmp_path):
+    root = tmp_path / "results"
+    run = _write_run(root, "command_mismatch", role="main_candidate")
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    manifest["command"] = ["python", "-m", "loc_gs.scripts.train_stdloc_native"]
+    (run / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    js = tmp_path / "board.json"
+    args = build_argparser().parse_args(
+        [
+            "--result_roots",
+            str(root),
+            "--output_json",
+            str(js),
+        ]
+    )
+
+    assert main(args) == 0
+
+    row = json.loads(js.read_text(encoding="utf-8"))["runs"][0]
+    assert row["paper_safe"] is False
+    assert "manifest command mismatch" in row["paper_safety_reason"]
+
+
 def test_update_experiment_board_can_mark_manifest_ablation(tmp_path):
     root = tmp_path / "results"
     _write_run(root, "ablation_safe", role="ablation")

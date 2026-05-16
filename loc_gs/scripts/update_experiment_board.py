@@ -108,10 +108,41 @@ def _missing_manifest_fields(manifest: dict[str, Any]) -> list[str]:
     ]
 
 
+def _manifest_command_text(command: Any) -> str:
+    if isinstance(command, str):
+        return command.strip()
+    if isinstance(command, (list, tuple)):
+        return " ".join(str(part) for part in command).strip()
+    return ""
+
+
+def _audit_bundle_consistency(
+    manifest: dict[str, Any] | None,
+    compact_metrics: dict[str, Any],
+    *,
+    run_dir: Path,
+) -> list[str]:
+    if manifest is None:
+        return []
+    reasons: list[str] = []
+    manifest_scene = str(manifest.get("scene", "")).strip()
+    metrics_scene = str(compact_metrics.get("scene", "")).strip()
+    if manifest_scene and metrics_scene and manifest_scene != metrics_scene:
+        reasons.append("manifest scene mismatch")
+    manifest_command = _manifest_command_text(manifest.get("command"))
+    command_path = run_dir / "command.txt"
+    if command_path.exists() and manifest_command:
+        command_text = command_path.read_text(encoding="utf-8").strip()
+        if command_text and manifest_command != command_text:
+            reasons.append("manifest command mismatch")
+    return reasons
+
+
 def _paper_safety(
     manifest: dict[str, Any] | None,
     split_audit: dict[str, Any] | None,
     *,
+    compact_metrics: dict[str, Any],
     run_dir: Path,
 ) -> tuple[bool, str]:
     reasons: list[str] = []
@@ -119,6 +150,7 @@ def _paper_safety(
         reasons.append("missing manifest")
     else:
         reasons.extend(f"missing manifest field {field}" for field in _missing_manifest_fields(manifest))
+        reasons.extend(_audit_bundle_consistency(manifest, compact_metrics, run_dir=run_dir))
     if split_audit is None:
         reasons.append("missing split audit")
     elif str(split_audit.get("audit_status", "unknown")) != "passed":
@@ -151,7 +183,7 @@ def _row_from_summary(summary_path: Path) -> dict[str, Any]:
     manifest = _load_json(run_dir / "manifest.json")
     split_audit = _load_json(run_dir / "split_audit.json")
     compact = summarize_path(summary_path)
-    paper_safe, reason = _paper_safety(manifest, split_audit, run_dir=run_dir)
+    paper_safe, reason = _paper_safety(manifest, split_audit, compact_metrics=compact, run_dir=run_dir)
     role = _classify_run(manifest, split_audit, paper_safe=paper_safe)
     scene = str(
         compact.get(
