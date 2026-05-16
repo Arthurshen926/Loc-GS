@@ -131,9 +131,11 @@ def _audit_bundle_consistency(
         reasons.append("manifest scene mismatch")
     manifest_command = _manifest_command_text(manifest.get("command"))
     command_path = run_dir / "command.txt"
-    if command_path.exists() and manifest_command:
+    if command_path.exists():
         command_text = command_path.read_text(encoding="utf-8").strip()
-        if command_text and manifest_command != command_text:
+        if not command_text:
+            reasons.append("empty command.txt")
+        elif manifest_command and manifest_command != command_text:
             reasons.append("manifest command mismatch")
     return reasons
 

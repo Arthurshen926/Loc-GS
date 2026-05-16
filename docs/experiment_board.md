@@ -36,8 +36,8 @@ Missing manifest, required manifest fields, split audit,
 `paper_safe = false`; it does not pass by default. Required manifest fields are
 `git_commit`, timestamp, command, scene, split, checkpoint path, map path, data
 root(s), hyperparameters, `rho`, and flags for feedback, residual, and selector
-enablement. The manifest scene must match the metrics scene, and the manifest
-command must match `command.txt`.
+enablement. `command.txt` must be non-empty, the manifest scene must match the
+metrics scene, and the manifest command must match `command.txt`.
 
 ## Columns
 
