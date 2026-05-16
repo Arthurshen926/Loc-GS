@@ -149,6 +149,10 @@ def write_export_eval_audit_bundle(
     manifest_payload = dict(manifest)
     manifest_payload.setdefault("git_commit", _git_commit())
     manifest_payload.setdefault("timestamp_utc", datetime.now(timezone.utc).isoformat())
+    if isinstance(command, str):
+        manifest_payload["command"] = command.rstrip()
+    else:
+        manifest_payload["command"] = [str(part) for part in command]
     paths = {
         "manifest": root / "manifest.json",
         "command": root / "command.txt",

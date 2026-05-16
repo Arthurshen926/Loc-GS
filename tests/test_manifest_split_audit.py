@@ -84,6 +84,11 @@ def test_write_export_eval_audit_bundle_writes_required_files(tmp_path):
         "git_diff",
     }
     assert (tmp_path / "manifest.json").exists()
+    assert json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))["command"] == [
+        "python",
+        "-m",
+        "loc_gs.scripts.eval_stdloc_native",
+    ]
     assert (tmp_path / "command.txt").read_text(encoding="utf-8") == "python -m loc_gs.scripts.eval_stdloc_native\n"
     assert json.loads((tmp_path / "metrics_summary.json").read_text(encoding="utf-8"))["dense"]["median_te_cm"] == 2.5
     assert json.loads((tmp_path / "split_audit.json").read_text(encoding="utf-8"))["audit_status"] == "passed"
