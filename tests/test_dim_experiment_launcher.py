@@ -63,6 +63,7 @@ def test_build_train_command_uses_large_batch_and_conservative_pnp_recipe():
     assert cmd[cmd.index("--pnp_feedback_detector_weight") + 1] == "0.05"
     assert "--pnp_feedback_detector_init_from_stdloc" in cmd
     assert cmd[cmd.index("--pnp_feedback_detector_anchor_weight") + 1] == "0.1"
+    assert cmd[cmd.index("--pnp_feedback_detector_prior_weight") + 1] == "0.25"
     assert "--pnp_feedback_detector_full_res" in cmd
     assert cmd[cmd.index("--same_view_match_weight") + 1] == "1.0"
     assert cmd[cmd.index("--locability_prior_target_weight") + 1] == "0.02"
@@ -409,6 +410,38 @@ def test_build_reliability_eval_command_can_attach_unified_ply_loc_override():
     assert cmd[cmd.index("--ply_loc_feature_override") + 1].endswith(
         "maps_desc_only_20260515/GreatCourt/point_cloud/iteration_30000/point_cloud.ply"
     )
+
+
+def test_build_reliability_eval_command_can_attach_unified_detector_dir():
+    cmd, _env = build_reliability_eval_command(
+        gpu_id=0,
+        scene="GreatCourt",
+        checkpoint="output/stdloc_hybrid/GreatCourt_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/GreatCourt_reliability_recipe/eval_unified_gate",
+        recipe="covisibility_prosac",
+        ply_loc_feature_override=(
+            "output/unified_lff_v2/maps_gate010/GreatCourt/point_cloud/iteration_30000/point_cloud.ply"
+        ),
+        stdloc_detector_dir="output/unified_lff_v2/maps_gate010/GreatCourt/detector",
+    )
+
+    assert cmd[cmd.index("--ply_loc_feature_override") + 1].endswith(
+        "maps_gate010/GreatCourt/point_cloud/iteration_30000/point_cloud.ply"
+    )
+    assert cmd[cmd.index("--stdloc_detector_dir") + 1].endswith("maps_gate010/GreatCourt/detector")
+
+
+def test_build_reliability_eval_command_can_override_match_prior_weight():
+    cmd, _env = build_reliability_eval_command(
+        gpu_id=0,
+        scene="GreatCourt",
+        checkpoint="output/stdloc_hybrid/GreatCourt_reliability_recipe/latest.pth",
+        output_dir="output/stdloc_hybrid/GreatCourt_reliability_recipe/eval_unified_gate_prior010",
+        recipe="covisibility_prosac",
+        locability_prior_weight=0.10,
+    )
+
+    assert cmd[cmd.index("--locability_prior_weight") + 1] == "0.1"
 
 
 def test_build_reliability_eval_command_can_use_covisibility_prosac_magsac_recipe():

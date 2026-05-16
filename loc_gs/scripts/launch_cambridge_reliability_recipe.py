@@ -83,6 +83,8 @@ def build_train_command(
         "2",
         "--pnp_feedback_detector_sigma_px",
         "1.0",
+        "--pnp_feedback_detector_prior_weight",
+        "0.25",
         "--same_view_match_weight",
         "1.0",
         "--locability_prior_target_weight",

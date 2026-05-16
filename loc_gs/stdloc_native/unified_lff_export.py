@@ -102,6 +102,7 @@ def _blend_gate_into_locability(
 
 def _blend_gate_into_detector_scores(
     source_map: Path,
+    source_ply: Path,
     output_map: Path,
     *,
     gaussian_ids: torch.Tensor,
@@ -113,25 +114,40 @@ def _blend_gate_into_detector_scores(
         return False
     sampled_idx_path = source_map / "detector" / "sampled_idx.pkl"
     scores_path = output_map / "detector" / "sampled_scores.pkl"
-    if not sampled_idx_path.exists() or not scores_path.exists():
+    if not sampled_idx_path.exists():
         return False
     sampled_idx = torch.as_tensor(_load_pickle(sampled_idx_path), dtype=torch.long).reshape(-1).cpu()
-    score_payload = _load_pickle(scores_path)
-    if isinstance(score_payload, dict):
-        scores = dict(score_payload)
-        sampled_scores = torch.as_tensor(
-            scores.get("sampled_scores", torch.zeros(sampled_idx.shape[0])),
-            dtype=torch.float32,
-        ).reshape(-1).cpu()
-        score_avg = (
-            torch.as_tensor(scores["score_avg"], dtype=torch.float32).reshape(-1).clone().cpu()
-            if "score_avg" in scores
-            else None
-        )
+    source_logits = _source_locability_logits(source_ply)
+    source_prob = (
+        torch.sigmoid(source_logits.float().reshape(-1)).cpu()
+        if source_logits is not None and int(source_logits.numel()) == int(num_gaussians)
+        else None
+    )
+    if scores_path.exists():
+        score_payload = _load_pickle(scores_path)
+        if isinstance(score_payload, dict):
+            scores = dict(score_payload)
+            sampled_scores = torch.as_tensor(
+                scores.get("sampled_scores", torch.zeros(sampled_idx.shape[0])),
+                dtype=torch.float32,
+            ).reshape(-1).cpu()
+            score_avg = (
+                torch.as_tensor(scores["score_avg"], dtype=torch.float32).reshape(-1).clone().cpu()
+                if "score_avg" in scores
+                else None
+            )
+        else:
+            sampled_scores = torch.as_tensor(score_payload, dtype=torch.float32).reshape(-1).cpu()
+            scores = {"sampled_scores": sampled_scores}
+            score_avg = None
     else:
-        sampled_scores = torch.as_tensor(score_payload, dtype=torch.float32).reshape(-1).cpu()
+        if source_prob is not None:
+            sampled_scores = source_prob[sampled_idx].clone()
+            score_avg = source_prob.clone()
+        else:
+            sampled_scores = torch.ones(sampled_idx.shape[0], dtype=torch.float32)
+            score_avg = None
         scores = {"sampled_scores": sampled_scores}
-        score_avg = None
     if sampled_scores.shape[0] != sampled_idx.shape[0]:
         return False
     gaussian_ids = gaussian_ids.to(device="cpu", dtype=torch.long)
@@ -150,6 +166,8 @@ def _blend_gate_into_detector_scores(
     if score_avg is not None and score_avg.shape[0] == int(num_gaussians):
         score_avg[gaussian_ids] = ((1.0 - weight) * score_avg[gaussian_ids] + weight * gate).clamp(0.0, 1.0)
         scores["score_avg"] = score_avg
+    if scores_path.is_symlink():
+        scores_path.unlink()
     _dump_pickle(scores, scores_path)
     return bool(valid_sampled.any())
 
@@ -161,12 +179,16 @@ def build_unified_lff_map(
     checkpoint_path: str | Path,
     overwrite: bool = True,
     gate_locability_blend: float = 0.0,
+    descriptor_mode: str = "checkpoint",
 ) -> dict[str, Any]:
     """Export a trained Unified LFF-v2 descriptor checkpoint to a STDLoc map."""
 
     source_map = Path(source_map)
     output_map = Path(output_map)
     checkpoint_path = Path(checkpoint_path)
+    descriptor_mode = str(descriptor_mode)
+    if descriptor_mode not in {"checkpoint", "native"}:
+        raise ValueError(f"unsupported descriptor_mode: {descriptor_mode}")
     if not source_map.exists():
         raise FileNotFoundError(f"source map not found: {source_map}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -180,6 +202,8 @@ def build_unified_lff_map(
     raw = _load_ply_loc_features(source_ply)
     exported = _checkpoint_descriptors(checkpoint)
     gaussian_ids = _checkpoint_gaussian_ids(checkpoint, count=int(exported.shape[0]), full_count=int(raw.shape[0]))
+    if descriptor_mode == "native":
+        exported = torch.nn.functional.normalize(raw[gaussian_ids].float(), p=2, dim=-1)
     gate = _checkpoint_gate(checkpoint, count=int(exported.shape[0]))
     locability_logits = _blend_gate_into_locability(
         source_ply,
@@ -192,6 +216,7 @@ def build_unified_lff_map(
     _write_updated_ply(source_ply, output_ply, exported, gaussian_ids, locability_logits=locability_logits)
     detector_scores_updated = _blend_gate_into_detector_scores(
         source_map,
+        source_ply,
         output_map,
         gaussian_ids=gaussian_ids,
         gate=gate,
@@ -219,6 +244,7 @@ def build_unified_lff_map(
         "single_path_deployment": True,
         "branch_selection": False,
         "method": "unified_lff_v2_export_aligned",
+        "descriptor_mode": descriptor_mode,
         "root_input_updated": bool(root_input_updated),
         "gate_locability_blend": float(gate_locability_blend),
         "detector_scores_updated": bool(detector_scores_updated),

@@ -27,8 +27,10 @@ class UnifiedLFFDescriptor(nn.Module):
         *,
         residual_init: torch.Tensor | None = None,
         gate_logit_init: torch.Tensor | None = None,
+        selector_logit_init: torch.Tensor | None = None,
         alpha_max: float = 0.05,
         init_gate: float = 0.01,
+        init_selector: float | None = None,
         eps: float = 1e-8,
     ) -> None:
         super().__init__()
@@ -58,6 +60,16 @@ class UnifiedLFFDescriptor(nn.Module):
                     f"gate_logit_init has {gate_logit.shape[0]} rows, expected {base.shape[0]}"
                 )
         self.gate_logit = nn.Parameter(gate_logit.clone())
+        if selector_logit_init is None:
+            selector_value = init_gate if init_selector is None else float(init_selector)
+            selector_logit = torch.full((base.shape[0],), _logit(selector_value), dtype=torch.float32)
+        else:
+            selector_logit = selector_logit_init.float().reshape(-1)
+            if selector_logit.shape[0] != base.shape[0]:
+                raise ValueError(
+                    f"selector_logit_init has {selector_logit.shape[0]} rows, expected {base.shape[0]}"
+                )
+        self.selector_logit = nn.Parameter(selector_logit.clone())
 
     @property
     def num_landmarks(self) -> int:
@@ -77,6 +89,9 @@ class UnifiedLFFDescriptor(nn.Module):
 
     def gate(self, ids: torch.Tensor | None = None) -> torch.Tensor:
         return torch.sigmoid(self.gate_logit[self._ids(ids)])
+
+    def selector(self, ids: torch.Tensor | None = None) -> torch.Tensor:
+        return torch.sigmoid(self.selector_logit[self._ids(ids)])
 
     def alpha(self, ids: torch.Tensor | None = None) -> torch.Tensor:
         return self.alpha_max * self.gate(ids)

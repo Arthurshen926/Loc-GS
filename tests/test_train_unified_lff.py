@@ -124,6 +124,37 @@ def test_load_unified_lff_training_tensors_accepts_existing_listwise_calibration
     assert tensors["gaussian_advantage_target"][1] < tensors["gaussian_advantage_target"][0]
 
 
+def test_load_unified_lff_training_tensors_can_limit_gate_penalty_to_hard_false_positives(tmp_path):
+    base = F.normalize(torch.randn(4, 4), p=2, dim=-1)
+    base_path = tmp_path / "base.pt"
+    cache_path = tmp_path / "calibration_listwise.pt"
+    torch.save({"descriptors": base}, base_path)
+    torch.save(
+        {
+            "query_desc": F.normalize(torch.randn(2, 4), p=2, dim=-1),
+            "landmark_id": torch.tensor([[0, 1], [2, 1]], dtype=torch.long),
+            "cosine": torch.tensor([[0.95, 0.20], [0.40, 0.30]], dtype=torch.float32),
+            "candidate_mask": torch.ones(2, 2, dtype=torch.bool),
+            "label": torch.tensor([0, 2], dtype=torch.long),
+            "metadata": {"format": "listwise"},
+        },
+        cache_path,
+    )
+
+    all_negatives = load_unified_lff_training_tensors(base_path, [cache_path])
+    hard_negatives = load_unified_lff_training_tensors(
+        base_path,
+        [cache_path],
+        false_positive_score_threshold=0.5,
+    )
+
+    assert hard_negatives["gaussian_advantage_target"][1] > all_negatives["gaussian_advantage_target"][1]
+    assert torch.allclose(
+        hard_negatives["gaussian_advantage_target"][0],
+        all_negatives["gaussian_advantage_target"][0],
+    )
+
+
 def test_load_unified_lff_training_tensors_can_use_native_ply_descriptor_bank(tmp_path):
     base_path = tmp_path / "native.ply"
     cache_path = tmp_path / "cache.pt"
@@ -204,6 +235,10 @@ def test_train_unified_lff_writes_export_aligned_descriptor_checkpoint(tmp_path)
     assert checkpoint["config"]["alpha_max"] == 0.05
     assert "residual" in checkpoint["state_dict"]
     assert "gate_logit" in checkpoint["state_dict"]
+    assert "selector_logit" in checkpoint["state_dict"]
     assert checkpoint["export_descriptors"].shape == base.shape
+    assert checkpoint["gate"].shape == (base.shape[0],)
+    assert checkpoint["residual_gate"].shape == (base.shape[0],)
+    assert checkpoint["metadata"]["selector_gate_decoupled"] is True
     assert checkpoint["metadata"]["single_path_deployment"] is True
     assert len(checkpoint["metadata"]["history"]) == 2

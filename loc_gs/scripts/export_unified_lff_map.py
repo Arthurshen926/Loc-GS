@@ -12,6 +12,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--output_map", required=True)
     parser.add_argument("--checkpoint_path", required=True)
     parser.add_argument("--gate_locability_blend", type=float, default=0.0)
+    parser.add_argument("--descriptor_mode", choices=("checkpoint", "native"), default="checkpoint")
     parser.add_argument("--no_overwrite", action="store_true")
     return parser
 
@@ -23,6 +24,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         output_map=args.output_map,
         checkpoint_path=args.checkpoint_path,
         gate_locability_blend=float(args.gate_locability_blend),
+        descriptor_mode=args.descriptor_mode,
         overwrite=not bool(args.no_overwrite),
     )
     print(f"[unified_lff_export] wrote {manifest['output_map']}")

@@ -573,6 +573,8 @@ def pnp_feedback_detector_target(
     height: int,
     width: int,
     sigma_px: float = 1.0,
+    prior_target_map: torch.Tensor | None = None,
+    prior_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rasterize query-level PnP feedback into a coarse detector target.
 
@@ -599,9 +601,9 @@ def pnp_feedback_detector_target(
         indexing="ij",
     )
     sigma = max(float(sigma_px), 1e-4)
-    scores = inlier_score.to(device=device, dtype=dtype).reshape(B, Kp).clamp(0.0, 1.0)
+    scores = inlier_score.detach().to(device=device, dtype=dtype).reshape(B, Kp).clamp(0.0, 1.0)
     valid = query_mask.to(device=device, dtype=torch.bool).reshape(B, Kp)
-    coords = keypoints_yx.to(device=device, dtype=dtype)
+    coords = keypoints_yx.detach().to(device=device, dtype=dtype)
     for b in range(B):
         valid_ids = torch.where(valid[b])[0]
         if valid_ids.numel() == 0:
@@ -617,7 +619,20 @@ def pnp_feedback_detector_target(
             target[b, 0] = torch.maximum(target[b, 0], kernel * score)
             # Hard negatives still receive supervision near the queried point.
             weight[b, 0] = torch.maximum(weight[b, 0], kernel * (0.25 + 0.75 * score))
-    return target.clamp(0.0, 1.0), weight.clamp(0.0, 1.0)
+    if prior_target_map is not None and float(prior_weight) > 0.0:
+        prior = prior_target_map.detach().to(device=device, dtype=dtype)
+        if prior.dim() == 3:
+            prior = prior.unsqueeze(1)
+        if prior.dim() != 4 or prior.shape[1] != 1:
+            raise ValueError("prior_target_map must have shape [B,H,W] or [B,1,H,W]")
+        if prior.shape[0] != B:
+            raise ValueError("prior_target_map batch dimension must match keypoints")
+        if prior.shape[-2:] != (h, w):
+            prior = F.interpolate(prior, size=(h, w), mode="bilinear", align_corners=False)
+        prior = (prior.clamp(0.0, 1.0) * float(prior_weight)).clamp(0.0, 1.0)
+        target = torch.maximum(target, prior)
+        weight = torch.maximum(weight, prior)
+    return target.clamp(0.0, 1.0).detach(), weight.clamp(0.0, 1.0).detach()
 
 
 def pnp_feedback_detector_loss(
@@ -628,6 +643,8 @@ def pnp_feedback_detector_loss(
     *,
     sigma_px: float = 1.0,
     negative_weight: float = 0.25,
+    prior_target_map: torch.Tensor | None = None,
+    prior_weight: float = 0.0,
 ) -> torch.Tensor:
     """Train a scene-specific query detector from self-localization feedback."""
 
@@ -642,6 +659,8 @@ def pnp_feedback_detector_loss(
         detector_score.shape[-2],
         detector_score.shape[-1],
         sigma_px=sigma_px,
+        prior_target_map=prior_target_map,
+        prior_weight=prior_weight,
     )
     pred = detector_score.float().clamp(1e-4, 1.0 - 1e-4)
     target = target.to(device=pred.device, dtype=pred.dtype)
@@ -1036,6 +1055,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--pnp_feedback_detector_warmup_epochs", type=int, default=1)
     parser.add_argument("--pnp_feedback_detector_sigma_px", type=float, default=1.0)
     parser.add_argument("--pnp_feedback_detector_negative_weight", type=float, default=0.25)
+    parser.add_argument("--pnp_feedback_detector_prior_weight", type=float, default=0.0)
     parser.add_argument(
         "--pnp_feedback_detector_init_path",
         default="",
@@ -1588,6 +1608,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                         loc_query_mask & pnp_out["query_valid_mask"],
                         sigma_px=args.pnp_feedback_detector_sigma_px,
                         negative_weight=args.pnp_feedback_detector_negative_weight,
+                        prior_target_map=locability_target_prior,
+                        prior_weight=args.pnp_feedback_detector_prior_weight,
                     )
                     if feedback_detector_anchor is not None and float(args.pnp_feedback_detector_anchor_weight) > 0.0:
                         with torch.no_grad():

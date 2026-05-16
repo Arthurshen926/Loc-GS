@@ -89,7 +89,9 @@ def build_eval_command(
     calibrated_matchability_path: str = "",
     calibrated_matchability_weight: float = 0.25,
     match_calibrated_prior_weight: float = 0.0,
+    locability_prior_weight: float = 0.05,
     ply_loc_feature_override: str = "",
+    stdloc_detector_dir: str = "",
     scene_matcher_path: str = "",
     scene_matcher_weight: float = 0.35,
     scene_matcher_topk: int = 4,
@@ -187,6 +189,10 @@ def build_eval_command(
         cmd.extend(["--ply_loc_feature_weight", "0.9"])
     if ply_loc_feature_override:
         cmd.extend(["--ply_loc_feature_override", str(ply_loc_feature_override)])
+    if stdloc_detector_dir:
+        cmd.extend(["--stdloc_detector_dir", str(stdloc_detector_dir)])
+    if abs(float(locability_prior_weight) - 0.05) > 1e-12:
+        cmd.extend(["--locability_prior_weight", str(float(locability_prior_weight))])
     if recipe in {
         "lff_feedback_prosac",
         "lff_residual_prosac",
@@ -455,9 +461,20 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Optional calibrated matchability logit-bias weight applied to 2D-3D matches.",
     )
     parser.add_argument(
+        "--locability_prior_weight",
+        type=float,
+        default=0.05,
+        help="Global STDLoc landmark prior logit-bias weight used during descriptor matching.",
+    )
+    parser.add_argument(
         "--ply_loc_feature_override_template",
         default="",
         help="Optional per-scene PLY template whose loc_* fields override checkpoint PLY descriptors.",
+    )
+    parser.add_argument(
+        "--stdloc_detector_dir_template",
+        default="",
+        help="Optional per-scene detector directory template, e.g. output/maps/{scene}/detector.",
     )
     parser.add_argument(
         "--scene_matcher_template",
@@ -573,6 +590,11 @@ def main() -> None:
             if args.ply_loc_feature_override_template
             else ""
         )
+        stdloc_detector_dir = (
+            args.stdloc_detector_dir_template.format(scene=job.scene, tag=args.tag, recipe=job.recipe)
+            if args.stdloc_detector_dir_template
+            else ""
+        )
         if calibrated_path and not args.dry_run and not Path(calibrated_path).exists():
             raise FileNotFoundError(f"calibrated matchability not found for {job.scene}: {calibrated_path}")
         if job.recipe in {
@@ -592,6 +614,8 @@ def main() -> None:
             raise FileNotFoundError(
                 f"PLY loc feature override not found for {job.scene}: {ply_loc_feature_override}"
             )
+        if stdloc_detector_dir and not args.dry_run and not Path(stdloc_detector_dir).exists():
+            raise FileNotFoundError(f"STDLoc detector dir not found for {job.scene}: {stdloc_detector_dir}")
         cmd, env = build_eval_command(
             gpu_id=gpu_id,
             scene=job.scene,
@@ -607,7 +631,9 @@ def main() -> None:
             calibrated_matchability_path=calibrated_path,
             calibrated_matchability_weight=args.calibrated_matchability_weight,
             match_calibrated_prior_weight=args.match_calibrated_prior_weight,
+            locability_prior_weight=args.locability_prior_weight,
             ply_loc_feature_override=ply_loc_feature_override,
+            stdloc_detector_dir=stdloc_detector_dir,
             scene_matcher_path=scene_matcher_path,
             scene_matcher_weight=args.scene_matcher_weight,
             scene_matcher_topk=args.scene_matcher_topk,

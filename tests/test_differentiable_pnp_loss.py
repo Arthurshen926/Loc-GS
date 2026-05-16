@@ -336,6 +336,50 @@ def test_topk_pnp_candidates_respect_gt_visibility_mask():
     assert out["reprojection"].item() < 1e-4
 
 
+def test_topk_pnp_does_not_reweight_invisible_fill_candidates():
+    channels = 16
+    height = 4
+    width = 4
+    rendered_desc = torch.eye(channels, dtype=torch.float32).T.reshape(1, channels, height, width)
+    # Only the top-left rendered point is GT-visible for this query, but the
+    # descriptor strongly prefers the bottom-right point.  If top-k has to pad
+    # with masked candidates, those candidates must keep zero probability.
+    query_descs = rendered_desc.flatten(2).transpose(1, 2)[:, [15], :]
+    query_keypoints = torch.tensor([[[0.0, 0.0]]], dtype=torch.float32)
+    depth = torch.ones(1, height, width)
+    pose = torch.eye(4).unsqueeze(0)
+    K = torch.eye(3)
+    gt_alpha = torch.zeros(1, height, width)
+    gt_alpha[:, 0, 0] = 1.0
+
+    out = DifferentiablePnPMatchLoss(
+        temperature=0.05,
+        pnp_iterations=1,
+        topk_pnp=2,
+        pose_weight=0.0,
+        match_weight=0.0,
+        quality_weight=0.0,
+        reprojection_weight=1.0,
+        observability_weight=0.0,
+        locability_weight=0.0,
+        target_sigma_px=0.25,
+        gt_alpha_threshold=0.5,
+    )(
+        query_descs=query_descs,
+        query_keypoints_yx=query_keypoints,
+        query_mask=torch.ones(1, 1, dtype=torch.bool),
+        rendered_desc=rendered_desc,
+        depth_map=depth,
+        render_pose_w2c=pose,
+        gt_pose_w2c=pose,
+        K=K,
+        gt_alpha_map=gt_alpha,
+    )
+
+    assert out["valid_queries"].item() == 1.0
+    assert out["reprojection"].item() < 1e-4
+
+
 def test_differentiable_pnp_loss_handles_amp_half_inputs_on_cuda():
     if not torch.cuda.is_available():
         return

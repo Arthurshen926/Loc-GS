@@ -71,6 +71,8 @@ def _pair_label_from_listwise(labels: torch.Tensor, topk: int) -> torch.Tensor:
 def load_unified_lff_training_tensors(
     base_descriptor_path: str | Path,
     episode_cache_paths: list[str | Path],
+    *,
+    false_positive_score_threshold: float | None = 0.0,
 ) -> dict[str, torch.Tensor]:
     loaded_payloads = [(Path(path), torch.load(Path(path), map_location="cpu")) for path in episode_cache_paths]
     base_gaussian_id = torch.empty(0, dtype=torch.long)
@@ -158,7 +160,7 @@ def load_unified_lff_training_tensors(
                 pair_label.reshape(-1)[valid],
                 num_landmarks=int(base.shape[0]),
                 pair_scores=cosine.reshape(-1)[valid],
-                false_positive_score_threshold=0.0,
+                false_positive_score_threshold=false_positive_score_threshold,
                 false_positive_weight=1.0,
             )
             gate_targets.append(stats["target"])
@@ -222,6 +224,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_rank", type=float, default=0.25)
     parser.add_argument("--rank_margin", type=float, default=0.1)
     parser.add_argument("--trust_l1_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--false_positive_score_threshold",
+        type=float,
+        default=0.0,
+        help="Only negative candidates at or above this cosine contribute to Gaussian gate suppression.",
+    )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     return parser
@@ -231,7 +239,11 @@ def main(args: argparse.Namespace | None = None) -> None:
     args = build_argparser().parse_args() if args is None else args
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     cache_paths = _parse_paths(list(args.episode_cache))
-    tensors = load_unified_lff_training_tensors(args.base_descriptor_path, cache_paths)
+    tensors = load_unified_lff_training_tensors(
+        args.base_descriptor_path,
+        cache_paths,
+        false_positive_score_threshold=float(args.false_positive_score_threshold),
+    )
     dataset = TensorDataset(
         tensors["query_desc"].float(),
         tensors["candidate_landmark_ids"].long(),
@@ -250,6 +262,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         tensors["base_descriptors"],
         alpha_max=float(args.alpha_max),
         init_gate=float(args.init_gate),
+        init_selector=0.5,
     ).to(device)
     dustbin_logit = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32, device=device))
     optimizer = torch.optim.AdamW(
@@ -291,7 +304,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 pair_loss = logits.sum() * 0.0
             rank_loss = _ranking_loss(candidate_logits_raw, listwise_label, candidate_mask, float(args.rank_margin))
             trust = model.trust_region_loss(l1_weight=float(args.trust_l1_weight))["loss"]
-            gate_loss = F.binary_cross_entropy_with_logits(model.gate_logit, gate_target)
+            gate_loss = F.binary_cross_entropy_with_logits(model.selector_logit, gate_target)
             loss = (
                 ce_loss
                 + float(args.lambda_pair) * pair_loss
@@ -331,7 +344,8 @@ def main(args: argparse.Namespace | None = None) -> None:
             "state_dict": model.state_dict(),
             "readout_state_dict": {"dustbin_logit": dustbin_logit.detach().cpu()},
             "export_descriptors": model().detach().cpu(),
-            "gate": model.gate().detach().cpu(),
+            "gate": model.selector().detach().cpu(),
+            "residual_gate": model.gate().detach().cpu(),
             "base_gaussian_id": tensors["base_gaussian_id"].detach().cpu(),
             "metadata": {
                 "episode_cache": [str(path) for path in cache_paths],
@@ -340,12 +354,14 @@ def main(args: argparse.Namespace | None = None) -> None:
                 "topk": topk,
                 "single_path_deployment": True,
                 "branch_selection": False,
+                "selector_gate_decoupled": True,
                 "loss_weights": {
                     "trust": float(args.lambda_trust),
                     "gate": float(args.lambda_gate),
                     "pair": float(args.lambda_pair),
                     "rank": float(args.lambda_rank),
                 },
+                "false_positive_score_threshold": float(args.false_positive_score_threshold),
                 "history": history,
             },
         },

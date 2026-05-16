@@ -39,6 +39,20 @@ def test_unified_lff_descriptor_can_learn_to_suppress_or_apply_residuals():
     assert torch.allclose(exported[1], expected_applied, atol=1e-6)
 
 
+def test_unified_lff_selector_is_independent_from_descriptor_residual_gate():
+    base = F.normalize(torch.eye(2, dtype=torch.float32), p=2, dim=-1)
+
+    model = UnifiedLFFDescriptor(base, alpha_max=0.5, init_gate=0.1, init_selector=0.8)
+    with torch.no_grad():
+        model.gate_logit.fill_(-30.0)
+
+    exported = model()
+
+    assert torch.allclose(exported, base, atol=1e-6)
+    assert torch.allclose(model.gate(), torch.zeros(2), atol=1e-6)
+    assert torch.allclose(model.selector(), torch.full((2,), 0.8), atol=1e-6)
+
+
 def test_unified_lff_trust_region_loss_penalizes_gate_weighted_residual():
     base = F.normalize(torch.eye(2, dtype=torch.float32), p=2, dim=-1)
     residual = torch.ones_like(base)

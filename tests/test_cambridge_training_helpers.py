@@ -259,6 +259,8 @@ def test_training_parser_exposes_sota_extension_options():
             "output/stdloc/map/scene/detector/30000_detector.pth",
             "--pnp_feedback_detector_anchor_weight",
             "0.2",
+            "--pnp_feedback_detector_prior_weight",
+            "0.3",
             "--pnp_feedback_detector_full_res",
             "--train_scaling",
             "--lr_scaling",
@@ -310,6 +312,7 @@ def test_training_parser_exposes_sota_extension_options():
     assert args.pnp_feedback_detector_sigma_px == 1.5
     assert args.pnp_feedback_detector_init_path == "output/stdloc/map/scene/detector/30000_detector.pth"
     assert args.pnp_feedback_detector_anchor_weight == 0.2
+    assert args.pnp_feedback_detector_prior_weight == 0.3
     assert args.pnp_feedback_detector_full_res is True
     assert args.train_scaling is True
     assert args.lr_scaling == 3e-7
@@ -427,6 +430,65 @@ def test_pnp_feedback_detector_target_marks_inliers_and_hard_negatives():
     assert target[0, 0, 1, 1] > 0.8
     assert target[0, 0, 2, 3] < 0.1
     assert weight[0, 0, 2, 3] > 0.2
+
+
+def test_pnp_feedback_detector_target_keeps_projected_prior_positives():
+    keypoints = torch.tensor([[[3.0, 3.0]]])
+    scores = torch.tensor([[0.0]])
+    mask = torch.tensor([[True]])
+    prior = torch.zeros(1, 1, 4, 5)
+    prior[0, 0, 1, 2] = 0.8
+
+    target, weight = pnp_feedback_detector_target(
+        keypoints,
+        scores,
+        mask,
+        height=4,
+        width=5,
+        sigma_px=0.5,
+        prior_target_map=prior,
+        prior_weight=0.5,
+    )
+
+    assert target[0, 0, 1, 2] > 0.35
+    assert weight[0, 0, 1, 2] > 0.35
+    assert target[0, 0, 3, 3] < 0.1
+    assert weight[0, 0, 3, 3] > 0.2
+
+
+def test_pnp_feedback_detector_prior_is_label_not_trainable_weight():
+    keypoints = torch.tensor([[[1.0, 1.0]]])
+    scores = torch.tensor([[0.0]])
+    mask = torch.tensor([[True]])
+    prior = torch.full((1, 1, 4, 4), 0.2, requires_grad=True)
+    pred = torch.full((1, 1, 4, 4), 0.5, requires_grad=True)
+
+    target, weight = pnp_feedback_detector_target(
+        keypoints,
+        scores,
+        mask,
+        height=4,
+        width=4,
+        sigma_px=0.5,
+        prior_target_map=prior,
+        prior_weight=0.5,
+    )
+    assert not target.requires_grad
+    assert not weight.requires_grad
+
+    loss = pnp_feedback_detector_loss(
+        pred,
+        keypoints,
+        scores,
+        mask,
+        sigma_px=0.5,
+        prior_target_map=prior,
+        prior_weight=0.5,
+    )
+    loss.backward()
+
+    assert pred.grad is not None
+    assert prior.grad is None
 
 
 def test_pnp_feedback_detector_loss_rewards_feedback_aligned_scores():
