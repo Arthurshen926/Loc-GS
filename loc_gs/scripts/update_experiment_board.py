@@ -10,6 +10,7 @@ from loc_gs.scripts.locgsctl import summarize_path
 
 
 ROLE_VALUES = {"main_candidate", "ablation", "diagnostic", "rejected"}
+SUMMARY_FILENAMES = ("summary.json", "metrics_summary.json")
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -21,20 +22,23 @@ def _load_json(path: Path) -> dict[str, Any] | None:
 
 def _discover_summary_paths(result_roots: list[str]) -> list[Path]:
     paths: list[Path] = []
-    seen: set[Path] = set()
+    seen_run_dirs: set[Path] = set()
     for raw in result_roots:
         root = Path(raw)
-        if root.is_file() and root.name == "summary.json":
+        if root.is_file() and root.name in SUMMARY_FILENAMES:
             candidates = [root]
         elif root.exists():
-            candidates = sorted(root.rglob("summary.json"))
+            candidates = []
+            for filename in SUMMARY_FILENAMES:
+                candidates.extend(sorted(root.rglob(filename)))
         else:
             candidates = []
         for candidate in candidates:
-            resolved = candidate.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                paths.append(candidate)
+            run_dir = candidate.parent.resolve()
+            if run_dir in seen_run_dirs:
+                continue
+            seen_run_dirs.add(run_dir)
+            paths.append(candidate)
     return paths
 
 
@@ -154,7 +158,9 @@ def board_to_markdown(board: dict[str, Any]) -> str:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Aggregate Loc-GS summary.json files into a research experiment board.")
+    parser = argparse.ArgumentParser(
+        description="Aggregate Loc-GS summary.json or metrics_summary.json files into a research experiment board."
+    )
     parser.add_argument("--result_roots", nargs="+", default=["output/stdloc_hybrid"])
     parser.add_argument("--output_markdown", default="")
     parser.add_argument("--output_json", default="")

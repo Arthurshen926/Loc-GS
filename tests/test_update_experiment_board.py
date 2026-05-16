@@ -90,3 +90,43 @@ def test_update_experiment_board_can_mark_manifest_ablation(tmp_path):
 
     assert rows[0]["run_role"] == "ablation"
     assert rows[0]["metrics"]["dense"]["median_te_cm"] == 2.5
+
+
+def test_update_experiment_board_discovers_metrics_summary_bundles(tmp_path):
+    root = tmp_path / "results"
+    run = root / "audit_bundle"
+    run.mkdir(parents=True)
+    (run / "metrics_summary.json").write_text(
+        json.dumps(
+            {
+                "scene": "ShopFacade",
+                "dense": {
+                    "median_te_cm": 2.25,
+                    "median_re_deg": 0.11,
+                    "recall_10cm_5deg": 0.91,
+                    "recall_5cm_5deg": 0.82,
+                    "recall_2cm_2deg": 0.31,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run / "manifest.json").write_text(json.dumps({"scene": "ShopFacade"}), encoding="utf-8")
+    (run / "split_audit.json").write_text(json.dumps({"audit_status": "passed"}), encoding="utf-8")
+    js = tmp_path / "board.json"
+    args = build_argparser().parse_args(
+        [
+            "--result_roots",
+            str(root),
+            "--output_json",
+            str(js),
+        ]
+    )
+
+    assert main(args) == 0
+
+    rows = json.loads(js.read_text(encoding="utf-8"))["runs"]
+    assert len(rows) == 1
+    assert rows[0]["run_name"] == "audit_bundle"
+    assert rows[0]["paper_safe"] is True
+    assert rows[0]["metrics"]["dense"]["median_te_cm"] == 2.25

@@ -10,8 +10,9 @@ from result roots with:
   --output_json output/experiment_board.json
 ```
 
-The script scans each root for `summary.json`, reads sidecar `manifest.json` and
-`split_audit.json` from the same run directory, and writes:
+The script scans each root for `summary.json` or `metrics_summary.json`, reads
+sidecar `manifest.json` and `split_audit.json` from the same run directory, and
+writes:
 
 - a Markdown table;
 - compact JSON;
