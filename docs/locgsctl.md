@@ -78,7 +78,7 @@ without failing.
 ## summarize
 
 Reads a run directory or a direct JSON file and emits compact stage metrics.
-Directories are searched for `summary.json`, `metrics_summary.json`, then
+Directories are searched for `metrics_summary.json`, `summary.json`, then
 `metrics.json`.
 
 ```bash

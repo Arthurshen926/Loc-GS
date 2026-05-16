@@ -125,7 +125,7 @@ def command_list_scenes(args: argparse.Namespace) -> int:
 def _summary_path(path: str | Path) -> Path:
     raw = Path(path)
     if raw.is_dir():
-        for filename in ("summary.json", "metrics_summary.json", "metrics.json"):
+        for filename in ("metrics_summary.json", "summary.json", "metrics.json"):
             candidate = raw / filename
             if candidate.exists():
                 return candidate

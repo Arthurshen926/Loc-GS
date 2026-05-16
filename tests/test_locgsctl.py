@@ -71,6 +71,24 @@ def test_summarize_compacts_summary_metrics(tmp_path, capsys):
     assert payload["sparse"]["recall_5cm_5deg"] == 0.5
 
 
+def test_summarize_prefers_metrics_summary_for_audit_bundle_directories(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "summary.json").write_text(
+        json.dumps({"scene": "ShopFacade", "dense": {"median_te": 99.0}}),
+        encoding="utf-8",
+    )
+    (run_dir / "metrics_summary.json").write_text(
+        json.dumps({"scene": "ShopFacade", "dense": {"median_te_cm": 2.25}}),
+        encoding="utf-8",
+    )
+
+    payload = _run_cli(capsys, "summarize", str(run_dir))
+
+    assert payload["source"] == str(run_dir / "metrics_summary.json")
+    assert payload["dense"]["median_te_cm"] == 2.25
+
+
 def test_compare_reports_candidate_minus_baseline_deltas(tmp_path, capsys):
     baseline = tmp_path / "baseline"
     candidate = tmp_path / "candidate"
