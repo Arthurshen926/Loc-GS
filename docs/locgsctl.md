@@ -126,6 +126,8 @@ Generates a manifest template and optionally writes it to disk.
   --split selfmap_train \
   --checkpoint output/stdloc_hybrid/ShopFacade/latest.pth \
   --map output/stdloc/map_cambridge_spgs/ShopFacade \
+  --data-root /mnt/pool/sqy/dataset/Cambridge/ShopFacade \
+  --hyperparameters '{"rho": 0.5, "alpha": 0.0}' \
   --feedback-enabled \
   --rho 0.5 \
   --residual-enabled \
@@ -134,4 +136,5 @@ Generates a manifest template and optionally writes it to disk.
 ```
 
 Manifest fields include git commit, UTC timestamp, scene, split, command,
-checkpoint, map, feedback flags, `rho`, and notes.
+checkpoint/checkpoint path, map/map path, data root(s), hyperparameters,
+feedback flags, `rho`, and notes.

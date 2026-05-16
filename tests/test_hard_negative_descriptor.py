@@ -113,3 +113,27 @@ def test_feedback_bank_residual_loss_uses_synthetic_hard_negative_bank(tmp_path)
     assert out["samples"].item() == 1
     assert out["loss"] > 0
     assert torch.isfinite(out["loss"])
+
+
+def test_feedback_hard_negative_targets_reject_missing_split_name(tmp_path):
+    bank_path = tmp_path / "feedback_bank.jsonl"
+    save_feedback_bank(
+        bank_path,
+        [
+            {
+                "scene": "ShopFacade",
+                "matched_gaussian_id": "1",
+                "descriptor_score": 0.9,
+                "pnp_inlier": False,
+                "reprojection_error_px": 12.0,
+            }
+        ],
+        {"scene": "ShopFacade", "split_name": ""},
+    )
+
+    try:
+        load_feedback_hard_negative_targets(bank_path)
+    except ValueError as exc:
+        assert "split_name is required" in str(exc)
+    else:
+        raise AssertionError("expected missing split_name to be rejected")

@@ -154,7 +154,8 @@ def _listwise_records(
     records: list[FeedbackMatchRecord] = []
     for row in range(num_queries):
         query_id = f"query_{row:06d}"
-        pnp_success = int(labels[row].item()) < topk
+        label_idx = int(labels[row].item())
+        pnp_success = 0 <= label_idx < topk
         for col in range(topk):
             if not bool(candidate_mask[row, col].item()):
                 continue
@@ -179,7 +180,7 @@ def _listwise_records(
                         "descriptor_score": _scalar(cosine[row, col]),
                         "detector_score": _scalar(query_score[row]) if query_score.numel() > row else None,
                         "match_rank": col + 1,
-                        "pnp_inlier": int(labels[row].item()) == col,
+                        "pnp_inlier": label_idx == col,
                         "reprojection_error_px": _scalar(reprojection_error[row, col]),
                         "depth_consistency": None,
                         "visibility_score": _scalar(landmark_prior[row, col]),

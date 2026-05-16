@@ -468,7 +468,10 @@ def load_feedback_hard_negative_targets(
 
     bank = load_feedback_bank(feedback_bank_path)
     manifest = dict(bank.get("manifest", {}))
-    if str(manifest.get("split_name", "")).strip().lower() == "test":
+    split_name = str(manifest.get("split_name", "")).strip()
+    if not split_name:
+        raise ValueError("feedback bank split_name is required for training")
+    if split_name.lower() == "test":
         raise ValueError("feedback bank split_name=test is not allowed for training")
     records = list(bank.get("records", []))
     labels = derive_hard_negative_labels(

@@ -115,3 +115,43 @@ def test_compare_reports_candidate_minus_baseline_deltas(tmp_path, capsys):
     assert payload["delta"]["recall_10cm_5deg"] == pytest.approx(0.05)
     assert payload["delta"]["recall_5cm_5deg"] == pytest.approx(0.05)
     assert payload["delta"]["recall_2cm_2deg"] == pytest.approx(0.02)
+
+
+def test_manifest_includes_experiment_audit_fields(tmp_path, capsys):
+    output = tmp_path / "manifest.json"
+
+    payload = _run_cli(
+        capsys,
+        "manifest",
+        "--scene",
+        "ShopFacade",
+        "--split",
+        "selfmap_train",
+        "--checkpoint",
+        "output/stdloc_hybrid/ShopFacade/latest.pth",
+        "--map",
+        "output/stdloc/map_cambridge_spgs/ShopFacade",
+        "--data-root",
+        "/mnt/pool/sqy/dataset/Cambridge/ShopFacade",
+        "--hyperparameters",
+        '{"rho": 0.25, "alpha": 0.0}',
+        "--feedback-enabled",
+        "--rho",
+        "0.25",
+        "--output",
+        str(output),
+        "--command",
+        "--",
+        "python",
+        "-m",
+        "loc_gs.scripts.eval_stdloc_native",
+    )
+
+    assert payload["scene"] == "ShopFacade"
+    assert payload["checkpoint_path"] == "output/stdloc_hybrid/ShopFacade/latest.pth"
+    assert payload["map_path"] == "output/stdloc/map_cambridge_spgs/ShopFacade"
+    assert payload["data_roots"] == ["/mnt/pool/sqy/dataset/Cambridge/ShopFacade"]
+    assert payload["hyperparameters"] == {"rho": 0.25, "alpha": 0.0}
+    assert payload["feedback_enabled"] is True
+    assert payload["command"] == ["python", "-m", "loc_gs.scripts.eval_stdloc_native"]
+    assert json.loads(output.read_text(encoding="utf-8"))["hyperparameters"]["rho"] == 0.25

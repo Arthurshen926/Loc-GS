@@ -176,6 +176,15 @@ def _compact_stage(data: dict[str, Any]) -> dict[str, float]:
     return out
 
 
+def _parse_hyperparameters(raw: str | None) -> dict[str, Any]:
+    if raw is None or not str(raw).strip():
+        return {}
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("--hyperparameters must be a JSON object")
+    return data
+
+
 def summarize_path(path: str | Path) -> dict[str, Any]:
     source = _summary_path(path)
     data = _load_json(source)
@@ -270,6 +279,9 @@ def command_smoke(args: argparse.Namespace) -> int:
 def command_manifest(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo_root).resolve()
     command = list(args.command) if args.command else sys.argv[1:]
+    if command[:1] == ["--"]:
+        command = command[1:]
+    hyperparameters = _parse_hyperparameters(args.hyperparameters)
     manifest = {
         "git_commit": _git_commit(repo_root),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -277,7 +289,12 @@ def command_manifest(args: argparse.Namespace) -> int:
         "split": args.split,
         "command": command,
         "checkpoint": args.checkpoint,
+        "checkpoint_path": args.checkpoint,
         "map": args.map,
+        "map_path": args.map,
+        "data_root": args.data_root,
+        "data_roots": [args.data_root] if args.data_root else [],
+        "hyperparameters": hyperparameters,
         "feedback_enabled": bool(args.feedback_enabled),
         "rho": args.rho,
         "residual_enabled": bool(args.residual_enabled),
@@ -332,6 +349,8 @@ def build_argparser() -> argparse.ArgumentParser:
     manifest.add_argument("--split", default="")
     manifest.add_argument("--checkpoint", default="")
     manifest.add_argument("--map", default="")
+    manifest.add_argument("--data-root", default="")
+    manifest.add_argument("--hyperparameters", default="{}", help="JSON object with run hyperparameters.")
     manifest.add_argument("--output", default="", help="Optional path to write manifest JSON.")
     manifest.add_argument("--feedback-enabled", action="store_true")
     manifest.add_argument("--rho", type=float, default=None)
@@ -345,6 +364,11 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--command" in argv:
+        command_idx = argv.index("--command")
+        if command_idx + 1 < len(argv) and argv[command_idx + 1] == "--":
+            del argv[command_idx + 1]
     parser = build_argparser()
     args = parser.parse_args(argv)
     try:

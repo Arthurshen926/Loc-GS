@@ -31,7 +31,8 @@ residual_trust_region_weight = 0
 
 ## Training Hook
 
-When explicitly enabled with a non-test feedback bank, the training entry loads
+When explicitly enabled with a feedback bank that has an audited non-test split
+name, the training entry loads
 hard-negative `matched_gaussian_id` values from the bank and samples those
 Gaussians for the protected residual trust-region loss. The active cap is the
 existing `--hybrid_residual_alpha_max`; this keeps the residual inside the same
@@ -47,7 +48,7 @@ these metrics remain zero and no feedback-bank path is loaded.
 
 ## Safety Rules
 
-- Feedback banks with `split_name=test` are rejected.
+- Feedback banks with missing `split_name` or `split_name=test` are rejected.
 - This is training-time feedback only.
 - Query-time inference remains one path: descriptor matching, OpenCV
   PROSAC/RANSAC PnP, and STDLoc-style dense refinement.

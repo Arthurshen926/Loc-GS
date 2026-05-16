@@ -85,6 +85,39 @@ def test_export_feedback_bank_from_listwise_pair_cache(tmp_path):
     assert manifest["baseline_relative"]["median_te_delta_cm"] == pytest.approx(-0.5)
 
 
+def test_export_feedback_bank_treats_negative_listwise_label_as_no_pnp_success(tmp_path):
+    pair_cache = tmp_path / "scene_match_pairs.pt"
+    _write_listwise_pair_cache(pair_cache)
+    payload = torch.load(pair_cache, map_location="cpu")
+    payload["label"] = torch.tensor([-1, 0], dtype=torch.long)
+    torch.save(payload, pair_cache)
+    selfmap_summary = tmp_path / "selfmap_summary.json"
+    selfmap_summary.write_text(json.dumps({"dense": {"median_te": 2.5}}), encoding="utf-8")
+    output_dir = tmp_path / "export"
+    args = build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--pair_cache",
+            str(pair_cache),
+            "--selfmap_summary",
+            str(selfmap_summary),
+            "--output_path",
+            str(output_dir),
+            "--split_name",
+            "selfmap_train",
+        ]
+    )
+
+    assert main(args) == 0
+
+    records = load_feedback_bank(output_dir / "feedback_bank.jsonl")["records"]
+    first_query_records = [record for record in records if record["query_id"] == "query_000000"]
+    assert first_query_records
+    assert all(record["pnp_success"] is False for record in first_query_records)
+    assert all(record["pnp_inlier"] is False for record in first_query_records)
+
+
 def test_export_feedback_bank_dry_run_reports_schema_without_files(tmp_path, capsys):
     args = build_argparser().parse_args(
         [

@@ -75,8 +75,9 @@ Listwise caches produce one feedback record per valid top-k candidate:
   `matched_gaussian_id`.
 - `cosine` becomes `descriptor_score`.
 - `query_score` becomes `detector_score`.
-- `label == candidate_rank` marks `pnp_inlier = true`; dustbin labels mark all
-  candidates as outliers.
+- `label` values in `[0, topk)` mark the matching candidate as
+  `pnp_inlier = true` and `pnp_success = true`; `-1` or dustbin labels mark all
+  candidates as outliers and the query as no-success.
 - `reprojection_error` becomes `reprojection_error_px`.
 - Dense self-map median translation/rotation are copied into pose-error fields.
 
