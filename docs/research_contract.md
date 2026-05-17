@@ -3,13 +3,15 @@
 ## Scope
 
 Loc-GS studies localization-oriented Gaussian feature fields for Cambridge
-camera relocalization. The active paper line starts from the repository README:
+camera relocalization. The active paper line is now a localization-aware
+sampling field on top of native STDLoc Feature Gaussians:
 
 ```text
-SuperPoint teacher features
-  -> low-dimensional per-Gaussian latent feature field
-  -> decoded descriptor and detector maps at novel views
-  -> geometry-aware matching and PnP camera relocalization
+native STDLoc descriptor / geometry / radiance field
+  -> train/rendered self-localization rehearsal
+  -> per-Gaussian localization utility / selector field
+  -> STDLoc-compatible sampling, ranking, and locability payload
+  -> single-path feature matching, OpenCV PROSAC PnP, and dense refinement
 ```
 
 For Cambridge, the source-of-truth baseline is native STDLoc executed through
@@ -24,10 +26,11 @@ of a selected feature field, not per-query inference branching.
 
 The defensible claim is:
 
-Loc-GS turns reconstruction-time virtual self-localization feedback into
-paper-auditable signals for per-Gaussian/per-landmark selection and protected
-descriptor residual reconstruction, while preserving the STDLoc-compatible
-single-path query-time localization pipeline.
+Loc-GS turns reconstruction-time virtual self-localization feedback into a
+paper-auditable localization utility / sampling field. The main method keeps
+native STDLoc descriptors and the standard geometric backend fixed, then exports
+the learned utility as STDLoc-compatible landmark sampling, ranking, and
+locability payloads.
 
 This claim requires all of the following:
 
@@ -36,6 +39,9 @@ This claim requires all of the following:
   rehearsal views that are disjoint from Cambridge test queries.
 - Real test queries use one selected map/checkpoint and one evaluator path:
   matching, OpenCV PROSAC/RANSAC PnP, and STDLoc-style dense refinement.
+- The main result does not require descriptor residuals; residual descriptor
+  reconstruction is an ablation unless future full-split evidence makes it
+  strictly better on median and recall.
 - Metrics are reported as median translation/rotation plus recall at
   10 cm / 5 deg, 5 cm / 5 deg, and 2 cm / 2 deg, with per-scene breakdowns.
 
@@ -46,6 +52,7 @@ The project does not claim:
 - A new official Cambridge benchmark split.
 - A modified STDLoc metric, evaluator, or ground truth.
 - A replacement of the STDLoc/SuperPoint descriptor backbone.
+- A learned descriptor field that is the source of the current main gain.
 - Test-time per-query model selection, branch selection, or oracle pose
   selection.
 - That SceneMatchNet, LoFTR, static calibrated priors, or oracle ordering are

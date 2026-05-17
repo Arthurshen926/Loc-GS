@@ -3,12 +3,12 @@ import json
 from loc_gs.scripts.merge_cambridge_eval_results import merge_eval_dirs
 
 
-def _write_eval_dir(path, image_name, dense_te, dense_ae, sparse_te=None, sparse_ae=None):
+def _write_eval_dir(path, image_name, dense_te, dense_ae, sparse_te=None, sparse_ae=None, scene="Scene"):
     path.mkdir(parents=True)
     (path / "summary.json").write_text(
         json.dumps(
             {
-                "scene": "Scene",
+                "scene": scene,
                 "query_offset": 0,
                 "query_stride": 2,
                 "dense": {},
@@ -53,3 +53,20 @@ def test_merge_eval_dirs_recomputes_metrics(tmp_path):
     assert summary["query_stride"] == 1
     details = json.loads((out / "results.json").read_text())
     assert [row["image_name"] for row in details] == ["a.png", "b.png"]
+
+
+def test_merge_eval_dirs_allows_same_image_name_in_different_scenes(tmp_path):
+    a = tmp_path / "great"
+    b = tmp_path / "kings"
+    out = tmp_path / "merged"
+    _write_eval_dir(a, "seq4/frame00002.png", 4.0, 1.0, scene="GreatCourt")
+    _write_eval_dir(b, "seq4/frame00002.png", 8.0, 1.0, scene="KingsCollege")
+
+    summary = merge_eval_dirs([a, b], out)
+
+    assert summary["queries"] == 2
+    details = json.loads((out / "results.json").read_text())
+    assert [(row["scene"], row["image_name"]) for row in details] == [
+        ("GreatCourt", "seq4/frame00002.png"),
+        ("KingsCollege", "seq4/frame00002.png"),
+    ]

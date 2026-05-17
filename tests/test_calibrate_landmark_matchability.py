@@ -5,6 +5,7 @@ from loc_gs.scripts.calibrate_landmark_matchability import (
     accumulate_matchability_counts,
     attach_listwise_landmark_bank,
     build_argparser,
+    build_pair_cache_split_metadata,
     calibration_query_canvas_hw,
     matchability_from_counts,
     write_matchability_calibration,
@@ -245,3 +246,43 @@ def test_attach_listwise_landmark_bank_records_descriptor_bank_and_gaussian_ids(
     assert payload["base_landmark_desc"].dtype == torch.float16
     assert payload["base_gaussian_id"].tolist() == [10, 20, 30]
     assert payload["metadata"]["base_landmark_count"] == 3
+
+
+def test_build_pair_cache_split_metadata_passes_when_source_ids_avoid_test(tmp_path):
+    scene_root = tmp_path / "ShopFacade"
+    scene_root.mkdir()
+    (scene_root / "dataset_test.txt").write_text(
+        "ImageFile X Y Z W P Q R\nseq1/frame00003.png 0 0 0 1 0 0 0\n",
+        encoding="utf-8",
+    )
+
+    metadata = build_pair_cache_split_metadata(
+        scene_root=scene_root,
+        phase_source_image_ids={
+            "train": ["seq1/frame00001.png", "seq1/frame00002.png"],
+            "rendered": ["rendered_from:seq1/frame00001.png"],
+        },
+    )
+
+    assert metadata["source_split_name"] == "train"
+    assert metadata["phase_source_image_ids"]["train"] == ["seq1/frame00001.png", "seq1/frame00002.png"]
+    assert metadata["test_image_ids"] == ["seq1/frame00003.png"]
+    assert metadata["split_audit"]["audit_status"] == "passed"
+    assert metadata["split_audit"]["checks"]["image_id_disjointness"]["overlap"] == []
+
+
+def test_build_pair_cache_split_metadata_fails_on_test_overlap(tmp_path):
+    scene_root = tmp_path / "ShopFacade"
+    scene_root.mkdir()
+    (scene_root / "dataset_test.txt").write_text(
+        "ImageFile X Y Z W P Q R\nseq1/frame00001.png 0 0 0 1 0 0 0\n",
+        encoding="utf-8",
+    )
+
+    metadata = build_pair_cache_split_metadata(
+        scene_root=scene_root,
+        phase_source_image_ids={"train": ["seq1/frame00001.png"], "rendered": []},
+    )
+
+    assert metadata["split_audit"]["audit_status"] == "failed"
+    assert metadata["split_audit"]["checks"]["image_id_disjointness"]["overlap"] == ["seq1/frame00001.png"]

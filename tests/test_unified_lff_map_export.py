@@ -265,6 +265,59 @@ def test_build_unified_lff_map_does_not_mutate_source_detector_symlink_targets(t
     assert torch.allclose(exported_scores["score_avg"], torch.tensor([0.1, 0.9, 0.3]))
 
 
+def test_build_unified_lff_map_materializes_detector_when_scores_are_not_updated(tmp_path):
+    source = tmp_path / "source"
+    pc_dir = source / "point_cloud" / "iteration_30000"
+    detector = source / "detector"
+    pc_dir.mkdir(parents=True)
+    detector.mkdir()
+    _write_ply_with_locability(pc_dir / "point_cloud.ply")
+    with (detector / "sampled_idx.pkl").open("wb") as handle:
+        pickle.dump(torch.tensor([0, 1, 2], dtype=torch.long), handle)
+    with (detector / "sampled_scores.pkl").open("wb") as handle:
+        pickle.dump(
+            {
+                "sampled_scores": torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+                "score_avg": torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+            },
+            handle,
+        )
+    checkpoint = tmp_path / "unified.pt"
+    torch.save(
+        {
+            "export_descriptors": F.normalize(torch.tensor([[1.0, 1.0]], dtype=torch.float32), p=2, dim=-1),
+            "base_gaussian_id": torch.tensor([1], dtype=torch.long),
+            "gate": torch.tensor([0.9], dtype=torch.float32),
+        },
+        checkpoint,
+    )
+    output = tmp_path / "output"
+
+    manifest = build_unified_lff_map(
+        source_map=source,
+        output_map=output,
+        checkpoint_path=checkpoint,
+        gate_locability_blend=1.0,
+        apply_to_detector_scores=False,
+    )
+
+    assert not (output / "detector" / "sampled_idx.pkl").is_symlink()
+    assert not (output / "detector" / "sampled_scores.pkl").is_symlink()
+    assert manifest["detector_files_materialized"] >= 2
+    with (detector / "sampled_scores.pkl").open("wb") as handle:
+        pickle.dump(
+            {
+                "sampled_scores": torch.tensor([9.0, 9.0, 9.0], dtype=torch.float32),
+                "score_avg": torch.tensor([9.0, 9.0, 9.0], dtype=torch.float32),
+            },
+            handle,
+        )
+    with (output / "detector" / "sampled_scores.pkl").open("rb") as handle:
+        exported_scores = pickle.load(handle)
+    assert torch.allclose(exported_scores["sampled_scores"], torch.tensor([0.1, 0.2, 0.3]))
+    assert torch.allclose(exported_scores["score_avg"], torch.tensor([0.1, 0.2, 0.3]))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA tensor pickle regression needs CUDA")
 def test_build_unified_lff_map_accepts_cuda_detector_score_pickles(tmp_path):
     source = tmp_path / "source"

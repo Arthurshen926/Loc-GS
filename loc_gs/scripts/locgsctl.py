@@ -16,7 +16,7 @@ from loc_gs.stdloc_native.commands import CAMBRIDGE_SCENES
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAP_ROOT = Path("output/stdloc/map_cambridge_spgs")
 DEFAULT_CHECKPOINT_ROOT = Path("output/stdloc_hybrid")
-DEFAULT_DATA_ROOT = Path("/mnt/pool/sqy/dataset/Cambridge")
+DEFAULT_DATA_ROOT = Path("/mnt/pool/sqy/Cambridge_stdloc")
 DEFAULT_MAP_NAME_OVERRIDES = {
     "GreatCourt": "GreatCourt_stream_stable2",
     "StMarysChurch": "StMarysChurch_stream_fastsave",

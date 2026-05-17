@@ -135,6 +135,12 @@ def test_compare_reports_candidate_minus_baseline_deltas(tmp_path, capsys):
     assert payload["delta"]["recall_2cm_2deg"] == pytest.approx(0.02)
 
 
+def test_list_scenes_uses_stdloc_cambridge_default_root(capsys):
+    payload = _run_cli(capsys, "list-scenes")
+
+    assert payload["scenes"][0]["data_root"].startswith("/mnt/pool/sqy/Cambridge_stdloc/")
+
+
 def test_manifest_includes_experiment_audit_fields(tmp_path, capsys):
     output = tmp_path / "manifest.json"
 

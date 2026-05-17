@@ -13,6 +13,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint_path", required=True)
     parser.add_argument("--gate_locability_blend", type=float, default=0.0)
     parser.add_argument("--descriptor_mode", choices=("checkpoint", "native"), default="checkpoint")
+    parser.add_argument("--gate_transform", choices=("identity", "uniform", "permuted", "inverted"), default="identity")
+    parser.add_argument("--gate_transform_seed", type=int, default=0)
+    parser.add_argument("--apply_to_detector_scores", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--apply_to_ply_locability", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ablation_type", default="selector")
     parser.add_argument("--no_overwrite", action="store_true")
     return parser
 
@@ -25,6 +30,11 @@ def main(args: argparse.Namespace | None = None) -> None:
         checkpoint_path=args.checkpoint_path,
         gate_locability_blend=float(args.gate_locability_blend),
         descriptor_mode=args.descriptor_mode,
+        gate_transform=args.gate_transform,
+        gate_transform_seed=int(args.gate_transform_seed),
+        apply_to_detector_scores=bool(args.apply_to_detector_scores),
+        apply_to_ply_locability=bool(args.apply_to_ply_locability),
+        ablation_type=args.ablation_type,
         overwrite=not bool(args.no_overwrite),
     )
     print(f"[unified_lff_export] wrote {manifest['output_map']}")

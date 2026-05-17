@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,29 @@ def _checkpoint_gate(checkpoint: dict[str, Any], *, count: int) -> torch.Tensor 
     return gate
 
 
+def _transform_gate(
+    gate: torch.Tensor | None,
+    *,
+    transform: str = "identity",
+    seed: int = 0,
+) -> torch.Tensor | None:
+    if gate is None:
+        return None
+    transform = str(transform)
+    if transform == "identity":
+        return gate
+    if transform == "uniform":
+        return torch.full_like(gate, float(gate.mean().item()))
+    if transform == "inverted":
+        return (1.0 - gate).clamp(0.0, 1.0)
+    if transform == "permuted":
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+        order = torch.randperm(gate.shape[0], generator=generator)
+        return gate[order]
+    raise ValueError(f"unsupported gate_transform: {transform}")
+
+
 def _write_updated_ply(
     source_ply: Path,
     output_ply: Path,
@@ -78,6 +102,24 @@ def _write_updated_ply(
         locability_logits=locability_logits,
     )
     return True
+
+
+def _materialize_symlinked_files(root: Path) -> int:
+    """Make mirrored payload files independent from the source map."""
+
+    if not root.exists():
+        return 0
+    count = 0
+    for path in sorted(root.rglob("*")):
+        if not path.is_symlink():
+            continue
+        target = path.resolve()
+        if not target.is_file():
+            continue
+        path.unlink()
+        shutil.copy2(target, path)
+        count += 1
+    return count
 
 
 def _blend_gate_into_locability(
@@ -180,6 +222,11 @@ def build_unified_lff_map(
     overwrite: bool = True,
     gate_locability_blend: float = 0.0,
     descriptor_mode: str = "checkpoint",
+    gate_transform: str = "identity",
+    gate_transform_seed: int = 0,
+    apply_to_detector_scores: bool = True,
+    apply_to_ply_locability: bool = True,
+    ablation_type: str = "selector",
 ) -> dict[str, Any]:
     """Export a trained Unified LFF-v2 descriptor checkpoint to a STDLoc map."""
 
@@ -204,24 +251,37 @@ def build_unified_lff_map(
     gaussian_ids = _checkpoint_gaussian_ids(checkpoint, count=int(exported.shape[0]), full_count=int(raw.shape[0]))
     if descriptor_mode == "native":
         exported = torch.nn.functional.normalize(raw[gaussian_ids].float(), p=2, dim=-1)
-    gate = _checkpoint_gate(checkpoint, count=int(exported.shape[0]))
-    locability_logits = _blend_gate_into_locability(
-        source_ply,
-        gaussian_ids=gaussian_ids,
-        gate=gate,
-        blend=float(gate_locability_blend),
+    gate = _transform_gate(
+        _checkpoint_gate(checkpoint, count=int(exported.shape[0])),
+        transform=gate_transform,
+        seed=int(gate_transform_seed),
+    )
+    locability_logits = (
+        _blend_gate_into_locability(
+            source_ply,
+            gaussian_ids=gaussian_ids,
+            gate=gate,
+            blend=float(gate_locability_blend),
+        )
+        if bool(apply_to_ply_locability)
+        else None
     )
     _mirror_map(source_map, output_map, overwrite=overwrite)
+    detector_files_materialized = _materialize_symlinked_files(output_map / "detector")
     output_ply = output_map / source_ply.relative_to(source_map)
     _write_updated_ply(source_ply, output_ply, exported, gaussian_ids, locability_logits=locability_logits)
-    detector_scores_updated = _blend_gate_into_detector_scores(
-        source_map,
-        source_ply,
-        output_map,
-        gaussian_ids=gaussian_ids,
-        gate=gate,
-        num_gaussians=int(raw.shape[0]),
-        blend=float(gate_locability_blend),
+    detector_scores_updated = (
+        _blend_gate_into_detector_scores(
+            source_map,
+            source_ply,
+            output_map,
+            gaussian_ids=gaussian_ids,
+            gate=gate,
+            num_gaussians=int(raw.shape[0]),
+            blend=float(gate_locability_blend),
+        )
+        if bool(apply_to_detector_scores)
+        else False
     )
     root_input_updated = False
     root_input = source_map / "input.ply"
@@ -245,9 +305,15 @@ def build_unified_lff_map(
         "branch_selection": False,
         "method": "unified_lff_v2_export_aligned",
         "descriptor_mode": descriptor_mode,
+        "ablation_type": str(ablation_type),
+        "gate_transform": str(gate_transform),
+        "gate_transform_seed": int(gate_transform_seed),
+        "apply_to_detector_scores": bool(apply_to_detector_scores),
+        "apply_to_ply_locability": bool(apply_to_ply_locability),
         "root_input_updated": bool(root_input_updated),
         "gate_locability_blend": float(gate_locability_blend),
         "detector_scores_updated": bool(detector_scores_updated),
+        "detector_files_materialized": int(detector_files_materialized),
     }
     (output_map / "unified_lff_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest

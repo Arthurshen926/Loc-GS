@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -142,6 +143,84 @@ def attach_listwise_landmark_bank(
     metadata = pair_payload.setdefault("metadata", {})
     metadata["base_landmark_count"] = int(desc.shape[0])
     metadata["base_descriptor_dim"] = int(desc.shape[1])
+
+
+def _read_cambridge_split_image_ids(scene_root: str | Path, split: str) -> list[str] | None:
+    path = Path(scene_root) / ("dataset_test.txt" if str(split) == "test" else "dataset_train.txt")
+    if not path.exists():
+        return None
+    ids: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("Visual") or line.startswith("ImageFile"):
+            continue
+        parts = line.split()
+        if parts:
+            ids.append(str(parts[0]))
+    return sorted(set(ids))
+
+
+def _audit_image_id(value: str) -> str:
+    text = str(value)
+    if text.startswith("rendered_from:"):
+        return text.split(":", 1)[1]
+    return text
+
+
+def build_pair_cache_split_metadata(
+    *,
+    scene_root: str | Path,
+    phase_source_image_ids: dict[str, list[str] | set[str]],
+) -> dict[str, Any]:
+    """Build split metadata for self-map/listwise caches without using test data for labels."""
+
+    phase_ids = {
+        str(phase): sorted({str(item) for item in values if str(item)})
+        for phase, values in phase_source_image_ids.items()
+    }
+    test_ids = _read_cambridge_split_image_ids(scene_root, "test")
+    source_audit_ids = {
+        _audit_image_id(value)
+        for values in phase_ids.values()
+        for value in values
+        if str(value)
+    }
+    if test_ids is None:
+        image_check = {
+            "status": "unknown",
+            "reason": "dataset_test.txt is missing",
+            "overlap": [],
+        }
+        audit_status = "unknown"
+    else:
+        overlap = sorted(source_audit_ids & set(test_ids))
+        image_check = {
+            "status": "failed" if overlap else "passed",
+            "overlap": overlap,
+        }
+        audit_status = "failed" if overlap else "passed"
+    split_name = "selfmap_train_rendered"
+    return {
+        "source_split_name": "train",
+        "feedback_bank_split_name": split_name,
+        "phase_source_image_ids": phase_ids,
+        "test_image_ids": test_ids or [],
+        "split_audit": {
+            "audit_status": audit_status,
+            "checks": {
+                "image_id_disjointness": image_check,
+                "feedback_bank_split": {
+                    "status": "passed",
+                    "split_name": split_name,
+                },
+                "quality_gate": {
+                    "status": "passed",
+                    "mode": "disabled",
+                    "per_query_branch_selection": False,
+                },
+            },
+        },
+    }
 
 
 @torch.no_grad()
@@ -402,6 +481,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     rendered_pair_limit = pair_sample_limit - train_pair_limit
     pair_phase_limits = {"train": train_pair_limit, "rendered": rendered_pair_limit}
     pair_phase_counts = {"train": 0, "rendered": 0}
+    pair_phase_image_ids: dict[str, set[str]] = {"train": set(), "rendered": set()}
     if pair_format == "listwise":
         pair_chunks: dict[str, list[torch.Tensor]] = {
             "query_desc": [],
@@ -633,6 +713,7 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     for idx in tqdm(ids, desc=f"Calibrating {scene}", dynamic_ncols=True):
         item = dataset[int(idx)]
+        pair_phase_image_ids["train"].add(str(item["image_name"]))
         resized_rgb = item["rgb"].unsqueeze(0).to(device=device, dtype=torch.float32)
         teacher_rgb = resized_rgb
         if args.query_feature_source == "original":
@@ -776,6 +857,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         ):
             frame_idx = int(ids[ridx % len(ids)] if ids else ridx % len(dataset))
             item = dataset[frame_idx]
+            pair_phase_image_ids["rendered"].add(f"rendered_from:{item['image_name']}")
             base_pose = item["pose_w2c"].to(device=device, dtype=torch.float32).unsqueeze(0)
             loc_pose = sample_rehearsal_pose_batch(
                 dataset=dataset,
@@ -941,6 +1023,10 @@ def main(args: argparse.Namespace | None = None) -> None:
             "reprojection_threshold_px": float(args.reprojection_threshold_px),
             "source": "calibrate_landmark_matchability",
             "fields": sorted(pair_payload.keys()),
+            **build_pair_cache_split_metadata(
+                scene_root=scene_root,
+                phase_source_image_ids=pair_phase_image_ids,
+            ),
         }
         if pair_format == "listwise":
             attach_listwise_landmark_bank(

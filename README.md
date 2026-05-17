@@ -142,41 +142,34 @@ selection, and LoFTR replacement routes are archived in
 `docs/archive/static_prior_branch_selection_20260512.md`; keep them as
 diagnostic ablations, not as the primary method.
 
-The current mainline is baseline-preserving and single-path:
+The current clean mainline is baseline-preserving and single-path, but it has
+shifted from descriptor residuals to a localization-aware sampling field:
 
 ```text
 STDLoc/PLY descriptor backbone
   -> virtual self-localization feedback
-  -> protected tiny descriptor residual, capped inside the PLY trust region
-  -> optional diagnostics: feedback detector / SceneMatchNet pair scoring
+  -> unified localization utility / selector / sampling field
+  -> STDLoc-compatible native-descriptor map export
   -> one OpenCV PROSAC PnP path
   -> STDLoc-style dense refinement
 ```
 
-The active 2026-05-15 paper story is reconstruction-time/self-localization
-feedback, not inference-time multi-path pose selection. The strongest evidence
-is the self-map quality gate: a fixed rule evaluates candidate reconstructed
-feature fields on virtual self-localization before deployment, rejects weak
-GreatCourt/KingsCollege fields, and keeps one selected field per scene for real
-queries. This improves native STDLoc parity from
-`9.127cm / 0.156deg, R5 0.3712, R2 0.1331` to
-`8.682cm / 0.151deg, R5 0.4144, R2 0.1459`. This is the current
-paper-facing strong claim: localization feedback during reconstruction yields a
-feature field that is selected and trusted according to downstream localization
-quality.
+The active 2026-05-16 paper story is reconstruction-time/self-localization
+feedback distilled into a localization utility field, not inference-time
+multi-path pose selection and not descriptor replacement. The current clean
+candidate is `selector005_native_desc`: native STDLoc descriptors are kept
+unchanged, while the learned selector is exported into locability and detector
+score payloads. Full Cambridge dense metrics move from
+`12.5725cm / 0.1578deg, R5 0.2776, R2 0.0848` to
+`12.4238cm / 0.1593deg, R5 0.2815, R2 0.0879`. This is positive but still
+small; it supports the selector/sampling-field direction, not a strong SOTA
+claim.
 
-The native-backed soft self-map prior remains the clean single-backend
-conservative ablation. Train-time self-localization produces a continuous
-reliability weight `rho`; `rho=0` is exactly the source-of-truth STDLoc
-evaluator, while positive `rho` softly updates the rendered locability field
-consumed by STDLoc dense refinement. With boost-only fusion, `prior_blend=0.25`,
-and R5-tempered reliability, full Cambridge improves native STDLoc to
-`9.124cm / 0.157deg, R5 0.3731`. The newer native LFF descriptor export keeps
-the same STDLoc backend and writes a bounded residual into `loc_*`, preserving
-the original descriptor norm; with `alpha=0.10` it reaches
-`9.097cm / 0.157deg, R5 0.3704`. These are useful ablations, but the
-submission-level evidence currently comes from quality-gated reconstruction
-selection, not from eval-time score nudges.
+The next structural step is selector-guided landmark resampling under the same
+landmark budget, so the learned field changes `sampled_idx.pkl` rather than only
+nudging existing `sampled_scores.pkl`. Residual descriptor reconstruction,
+SceneMatchNet, quality gates, and LoFTR replacements are diagnostics or
+ablations unless future full-split, paper-audited results promote them.
 
 ```bash
 /root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_stdloc_native_soft_prior_cambridge \

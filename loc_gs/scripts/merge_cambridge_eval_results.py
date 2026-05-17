@@ -17,21 +17,24 @@ def merge_eval_dirs(input_dirs: list[Path], output_dir: Path) -> dict[str, objec
         raise ValueError("at least one input directory is required")
     summaries = []
     details = []
-    seen_images: set[str] = set()
+    seen_images: set[tuple[str, str]] = set()
     for input_dir in input_dirs:
         summary_path = input_dir / "summary.json"
         results_path = input_dir / "results.json"
         if not summary_path.exists() or not results_path.exists():
             raise FileNotFoundError(f"missing summary/results in {input_dir}")
-        summaries.append(json.loads(summary_path.read_text(encoding="utf-8")))
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summaries.append(summary)
+        scene = str(summary.get("scene") or input_dir.name)
         for row in json.loads(results_path.read_text(encoding="utf-8")):
             name = str(row.get("image_name", ""))
-            if name in seen_images:
-                raise ValueError(f"duplicate image_name in merged results: {name}")
-            seen_images.add(name)
-            details.append(row)
+            key = (scene, name)
+            if key in seen_images:
+                raise ValueError(f"duplicate image_name in merged results for scene {scene}: {name}")
+            seen_images.add(key)
+            details.append({**row, "scene": str(row.get("scene") or scene)})
 
-    details.sort(key=lambda row: str(row.get("image_name", "")))
+    details.sort(key=lambda row: (str(row.get("scene", "")), str(row.get("image_name", ""))))
     sparse_rows = [row for row in details if row.get("sparse_te") is not None and row.get("sparse_ae") is not None]
     dense_rows = [row for row in details if row.get("dense_te") is not None and row.get("dense_ae") is not None]
     base = dict(summaries[0])
