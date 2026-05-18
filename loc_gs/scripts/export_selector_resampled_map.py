@@ -18,11 +18,13 @@ from plyfile import PlyData
 from loc_gs.stdloc_native.selector_resampling import (
     hard_negative_risk_from_episode_cache,
     hard_query_support_from_episode_cache,
+    native_support_reservation_from_episode_cache,
     positive_support_from_episode_cache,
     pose_information_from_episode_cache,
     query_coverage_reservation_from_episode_cache,
     resample_detector_landmarks,
     selector_from_checkpoint,
+    support_preservation_audit_from_episode_cache,
     write_resampled_detector_payload,
 )
 from loc_gs.stdloc_native.unified_lff_export import build_unified_lff_map
@@ -72,6 +74,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--hard_query_support_weight", type=float, default=0.0)
     parser.add_argument("--hard_query_support_score_threshold", type=float, default=0.0)
     parser.add_argument("--hard_query_support_reprojection_threshold_px", type=float, default=None)
+    parser.add_argument("--support_guard_cache", default="")
+    parser.add_argument("--support_guard_fraction", type=float, default=0.0)
+    parser.add_argument("--support_guard_score_threshold", type=float, default=0.0)
+    parser.add_argument("--support_guard_reprojection_threshold_px", type=float, default=None)
+    parser.add_argument("--support_guard_margin_threshold", type=float, default=None)
+    parser.add_argument("--support_guard_hard_query_fraction", type=float, default=0.25)
+    parser.add_argument("--support_guard_preserve_counts", action="store_true")
     parser.add_argument("--query_coverage_cache", default="")
     parser.add_argument("--query_coverage_fraction", type=float, default=0.0)
     parser.add_argument("--query_coverage_score_threshold", type=float, default=0.0)
@@ -125,6 +134,7 @@ def _command_from_args(args: argparse.Namespace) -> str:
 def _feedback_split_from_payload(payload: dict[str, Any]) -> str:
     for key in (
         "query_coverage_metadata",
+        "support_guard_metadata",
         "hard_query_support_metadata",
         "pose_information_metadata",
         "positive_support_metadata",
@@ -173,6 +183,12 @@ def _resampling_manifest(
         "hard_query_support_weight": float(args.hard_query_support_weight),
         "hard_query_support_score_threshold": float(args.hard_query_support_score_threshold),
         "hard_query_support_reprojection_threshold_px": args.hard_query_support_reprojection_threshold_px,
+        "support_guard_fraction": float(payload.get("support_guard_fraction", 0.0)),
+        "support_guard_score_threshold": float(args.support_guard_score_threshold),
+        "support_guard_reprojection_threshold_px": args.support_guard_reprojection_threshold_px,
+        "support_guard_margin_threshold": args.support_guard_margin_threshold,
+        "support_guard_hard_query_fraction": float(args.support_guard_hard_query_fraction),
+        "support_guard_preserve_counts": bool(args.support_guard_preserve_counts),
         "query_coverage_fraction": float(payload.get("query_coverage_fraction", 0.0)),
         "query_coverage_score_threshold": float(args.query_coverage_score_threshold),
         "query_coverage_reprojection_threshold_px": args.query_coverage_reprojection_threshold_px,
@@ -236,6 +252,16 @@ def _resampling_manifest(
         "hard_query_support_score_threshold": float(args.hard_query_support_score_threshold),
         "hard_query_support_reprojection_threshold_px": args.hard_query_support_reprojection_threshold_px,
         "hard_query_support": dict(payload.get("hard_query_support_metadata", {})),
+        "support_guard_cache": str(args.support_guard_cache),
+        "support_guard_fraction": float(payload.get("support_guard_fraction", 0.0)),
+        "support_guard_score_threshold": float(args.support_guard_score_threshold),
+        "support_guard_reprojection_threshold_px": args.support_guard_reprojection_threshold_px,
+        "support_guard_margin_threshold": args.support_guard_margin_threshold,
+        "support_guard_hard_query_fraction": float(args.support_guard_hard_query_fraction),
+        "support_guard_preserve_counts": bool(args.support_guard_preserve_counts),
+        "support_guard_reserved_count": int(payload.get("support_guard_reserved_count", 0)),
+        "support_guard": dict(payload.get("support_guard_metadata", {})),
+        "support_audit": dict(payload.get("support_audit", {})),
         "query_coverage_cache": str(args.query_coverage_cache),
         "query_coverage_fraction": float(payload.get("query_coverage_fraction", 0.0)),
         "query_coverage_score_threshold": float(args.query_coverage_score_threshold),
@@ -284,6 +310,14 @@ def _load_protected_source_idx(args: argparse.Namespace) -> tuple[torch.Tensor |
     }
     fraction = 1.0 if args.protected_source_fraction is None else float(args.protected_source_fraction)
     return protected_idx, metadata, fraction
+
+
+def _load_source_sampled_idx(source_map: Path) -> torch.Tensor:
+    sampled_idx_path = source_map / "detector" / "sampled_idx.pkl"
+    if not sampled_idx_path.exists():
+        raise FileNotFoundError(f"missing sampled_idx.pkl: {sampled_idx_path}")
+    with sampled_idx_path.open("rb") as handle:
+        return torch.as_tensor(pickle.load(handle), dtype=torch.long).reshape(-1).cpu()
 
 
 def main(args: argparse.Namespace | None = None) -> int:
@@ -341,6 +375,21 @@ def main(args: argparse.Namespace | None = None) -> int:
             score_threshold=float(args.hard_query_support_score_threshold),
             reprojection_threshold_px=args.hard_query_support_reprojection_threshold_px,
         )
+    source_sampled_idx = _load_source_sampled_idx(source_map)
+    support_guard_idx = None
+    support_guard_metadata: dict[str, Any] | None = None
+    if str(args.support_guard_cache):
+        support_guard_idx, support_guard_metadata = native_support_reservation_from_episode_cache(
+            args.support_guard_cache,
+            source_idx=source_sampled_idx,
+            num_gaussians=int(xyz.shape[0]),
+            base_gaussian_id=checkpoint.get("base_gaussian_id"),
+            score_threshold=float(args.support_guard_score_threshold),
+            reprojection_threshold_px=args.support_guard_reprojection_threshold_px,
+            margin_threshold=args.support_guard_margin_threshold,
+            hard_query_fraction=float(args.support_guard_hard_query_fraction),
+            preserve_counts=bool(args.support_guard_preserve_counts),
+        )
     query_coverage_idx = None
     query_coverage_metadata: dict[str, Any] | None = None
     if str(args.query_coverage_cache):
@@ -388,6 +437,9 @@ def main(args: argparse.Namespace | None = None) -> int:
         hard_query_support=hard_query_support,
         hard_query_support_weight=float(args.hard_query_support_weight),
         hard_query_support_metadata=hard_query_support_metadata,
+        support_guard_idx=support_guard_idx,
+        support_guard_fraction=float(args.support_guard_fraction),
+        support_guard_metadata=support_guard_metadata,
         query_coverage_idx=query_coverage_idx,
         query_coverage_fraction=float(args.query_coverage_fraction),
         query_coverage_metadata=query_coverage_metadata,
@@ -398,6 +450,20 @@ def main(args: argparse.Namespace | None = None) -> int:
         protected_source_fraction=float(protected_source_fraction),
         protected_source_metadata=protected_source_metadata,
     )
+    support_audit: dict[str, Any] | None = None
+    if str(args.support_guard_cache):
+        support_audit = support_preservation_audit_from_episode_cache(
+            args.support_guard_cache,
+            source_idx=source_sampled_idx,
+            candidate_idx=payload["sampled_idx"],
+            num_gaussians=int(xyz.shape[0]),
+            base_gaussian_id=checkpoint.get("base_gaussian_id"),
+            score_threshold=float(args.support_guard_score_threshold),
+            reprojection_threshold_px=args.support_guard_reprojection_threshold_px,
+            margin_threshold=args.support_guard_margin_threshold,
+            hard_query_fraction=float(args.support_guard_hard_query_fraction),
+        )
+        payload["support_audit"] = support_audit
     manifest = _resampling_manifest(args, payload, source_ply, command=command)
     if args.dry_run:
         print(json.dumps(manifest, indent=2, sort_keys=True))
@@ -423,6 +489,11 @@ def main(args: argparse.Namespace | None = None) -> int:
         json.dumps(manifest, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    if support_audit is not None:
+        (output_map / "support_audit.json").write_text(
+            json.dumps(support_audit, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
     print(
         "[selector_resampling_export] wrote "
         f"{output_map} ({payload['source_count']} -> {payload['output_count']} sampled landmarks)"

@@ -547,6 +547,290 @@ def query_coverage_reservation_from_episode_cache(
     return selected_tensor, summary
 
 
+def _support_rows_from_episode_cache(
+    payload_or_path: dict[str, Any] | str | Path,
+    *,
+    num_gaussians: int,
+    base_gaussian_id: torch.Tensor | Any | None = None,
+    score_threshold: float | None = 0.0,
+    reprojection_threshold_px: float | None = None,
+    margin_threshold: float | None = None,
+    hard_query_fraction: float = 0.25,
+) -> dict[str, Any]:
+    payload = (
+        torch.load(Path(payload_or_path), map_location="cpu")
+        if isinstance(payload_or_path, (str, Path))
+        else dict(payload_or_path)
+    )
+    metadata = _cache_metadata(payload_or_path, payload)
+    ids = _cache_tensor(payload, "candidate_landmark_ids", "landmark_id")
+    if ids is None:
+        raise KeyError("episode cache is missing candidate_landmark_ids or landmark_id")
+    ids = ids.long()
+    if ids.dim() != 2:
+        raise ValueError("candidate landmark ids must have shape [N,K]")
+    mask = _cache_tensor(payload, "candidate_mask")
+    valid = torch.ones_like(ids, dtype=torch.bool) if mask is None else mask.bool()
+    if valid.shape != ids.shape:
+        raise ValueError("candidate_mask must match candidate landmark ids")
+    scores = _cache_tensor(payload, "candidate_cosine", "cosine")
+    score_tensor = torch.ones_like(ids, dtype=torch.float32) if scores is None else scores.float()
+    if score_tensor.shape != ids.shape:
+        raise ValueError("candidate scores must match candidate landmark ids")
+    errors = _cache_tensor(payload, "candidate_reprojection_error", "reprojection_error")
+    pair_label = _cache_tensor(payload, "pair_label")
+    if errors is None and pair_label is None:
+        raise KeyError("episode cache needs reprojection_error or pair_label to build support constraints")
+    if reprojection_threshold_px is None:
+        reprojection_threshold_px = float(metadata.get("reprojection_threshold_px", 8.0))
+    if errors is not None:
+        error_tensor = errors.float()
+        if error_tensor.shape != ids.shape:
+            raise ValueError("reprojection_error must match candidate landmark ids")
+        finite = torch.isfinite(error_tensor)
+        positive = finite & (error_tensor <= float(reprojection_threshold_px))
+        valid = valid & finite
+        reproj_quality = (1.0 - error_tensor / float(reprojection_threshold_px)).clamp(0.0, 1.0)
+    else:
+        positive = pair_label.bool()
+        if positive.shape != ids.shape:
+            raise ValueError("pair_label must match candidate landmark ids")
+        reproj_quality = torch.ones_like(score_tensor)
+    if score_threshold is not None:
+        positive = positive & (score_tensor >= float(score_threshold))
+    positive = valid & positive
+    margin = _cache_tensor(payload, "margin")
+    selected_margin_threshold: float | None = None
+    if margin is None:
+        hard_queries = positive.any(dim=1)
+    else:
+        margin_tensor = torch.as_tensor(margin, dtype=torch.float32).reshape(-1).cpu()
+        if margin_tensor.shape[0] != ids.shape[0]:
+            raise ValueError("margin must have one value per query/candidate row")
+        if margin_threshold is not None:
+            selected_margin_threshold = float(margin_threshold)
+        else:
+            fraction = min(max(float(hard_query_fraction), 0.0), 1.0)
+            if fraction <= 0.0:
+                selected_margin_threshold = float("-inf")
+            else:
+                order = torch.sort(margin_tensor).values
+                kth = min(max(int(round(float(order.numel()) * fraction)) - 1, 0), int(order.numel()) - 1)
+                selected_margin_threshold = float(order[kth].item())
+        hard_queries = (margin_tensor <= selected_margin_threshold) & positive.any(dim=1)
+    if base_gaussian_id is not None:
+        base_ids = torch.as_tensor(base_gaussian_id, dtype=torch.long).reshape(-1).cpu()
+        if ids.numel() and (int(ids.min().item()) < 0 or int(ids.max().item()) >= int(base_ids.numel())):
+            raise IndexError("episode cache landmark ids are outside base_gaussian_id")
+        mapped_ids = base_ids[ids.clamp_min(0)]
+    else:
+        mapped_ids = ids
+    num_gaussians = int(num_gaussians)
+    if mapped_ids.numel() and (int(mapped_ids.min().item()) < 0 or int(mapped_ids.max().item()) >= num_gaussians):
+        raise IndexError("mapped landmark ids are outside num_gaussians")
+    return {
+        "mapped_ids": mapped_ids,
+        "positive": positive,
+        "weights": reproj_quality * score_tensor.clamp_min(0.0),
+        "hard_queries": hard_queries,
+        "margin_threshold": selected_margin_threshold,
+        "metadata": metadata,
+        "score_threshold": score_threshold,
+        "reprojection_threshold_px": float(reprojection_threshold_px),
+        "hard_query_fraction": float(hard_query_fraction),
+    }
+
+
+def native_support_reservation_from_episode_cache(
+    payload_or_path: dict[str, Any] | str | Path,
+    *,
+    source_idx: torch.Tensor | Any,
+    num_gaussians: int,
+    base_gaussian_id: torch.Tensor | Any | None = None,
+    score_threshold: float | None = 0.0,
+    reprojection_threshold_px: float | None = None,
+    margin_threshold: float | None = None,
+    hard_query_fraction: float = 0.25,
+    max_landmarks: int | None = None,
+    preserve_counts: bool = False,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Greedily reserve native landmarks that cover low-margin self-map queries."""
+
+    rows = _support_rows_from_episode_cache(
+        payload_or_path,
+        num_gaussians=num_gaussians,
+        base_gaussian_id=base_gaussian_id,
+        score_threshold=score_threshold,
+        reprojection_threshold_px=reprojection_threshold_px,
+        margin_threshold=margin_threshold,
+        hard_query_fraction=hard_query_fraction,
+    )
+    mapped_ids: torch.Tensor = rows["mapped_ids"]
+    positive: torch.Tensor = rows["positive"]
+    weights: torch.Tensor = rows["weights"]
+    hard_queries: torch.Tensor = rows["hard_queries"]
+    source = torch.as_tensor(source_idx, dtype=torch.long).reshape(-1).cpu()
+    source_set = {int(idx) for idx in source.tolist() if 0 <= int(idx) < int(num_gaussians)}
+    candidate_rows: dict[int, set[int]] = {}
+    candidate_weight: dict[int, float] = {}
+    hard_row_ids = torch.where(hard_queries)[0].tolist()
+    for row in hard_row_ids:
+        cols = torch.where(positive[row])[0].tolist()
+        for col in cols:
+            gid = int(mapped_ids[row, col].item())
+            if gid not in source_set:
+                continue
+            candidate_rows.setdefault(gid, set()).add(int(row))
+            candidate_weight[gid] = candidate_weight.get(gid, 0.0) + float(weights[row, col].item())
+    limit = len(candidate_rows) if max_landmarks is None else max(0, int(max_landmarks))
+    selected: list[int] = []
+    covered: set[int] = set()
+    while len(selected) < limit and len(selected) < len(candidate_rows):
+        best_gid: int | None = None
+        best_key: tuple[int, float, int] | None = None
+        for gid, query_rows in candidate_rows.items():
+            if gid in selected:
+                continue
+            new_cover = len(query_rows - covered)
+            key = (new_cover, candidate_weight.get(gid, 0.0), -gid)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_gid = gid
+        if best_gid is None or best_key is None or best_key[0] <= 0:
+            break
+        selected.append(best_gid)
+        covered.update(candidate_rows[best_gid])
+    if bool(preserve_counts) and len(selected) < limit:
+        remaining = [
+            gid
+            for gid, _rows in sorted(
+                candidate_rows.items(),
+                key=lambda item: (-candidate_weight.get(item[0], 0.0), item[0]),
+            )
+            if gid not in selected
+        ]
+        for gid in remaining:
+            if len(selected) >= limit:
+                break
+            selected.append(gid)
+    selected_tensor = torch.tensor(selected, dtype=torch.long)
+    metadata = rows["metadata"]
+    source_supported_rows = {
+        row for query_rows in candidate_rows.values() for row in query_rows
+    }
+    summary = {
+        "cache_path": metadata.get("cache_path", ""),
+        "feedback_bank_split_name": metadata.get("feedback_bank_split_name", metadata.get("split_name", "")),
+        "score_threshold": rows["score_threshold"],
+        "reprojection_threshold_px": rows["reprojection_threshold_px"],
+        "margin_threshold": rows["margin_threshold"],
+        "hard_query_fraction": rows["hard_query_fraction"],
+        "hard_query_count": int(hard_queries.sum().item()),
+        "hard_query_with_source_support_count": int(len(source_supported_rows)),
+        "covered_query_count": int(len(covered)),
+        "source_support_landmarks": int(len(candidate_rows)),
+        "selected_count": int(selected_tensor.numel()),
+        "preserve_counts": bool(preserve_counts),
+        "split_audit": metadata.get("split_audit", {}),
+    }
+    return selected_tensor, summary
+
+
+def support_preservation_audit_from_episode_cache(
+    payload_or_path: dict[str, Any] | str | Path,
+    *,
+    source_idx: torch.Tensor | Any,
+    candidate_idx: torch.Tensor | Any,
+    num_gaussians: int,
+    base_gaussian_id: torch.Tensor | Any | None = None,
+    score_threshold: float | None = 0.0,
+    reprojection_threshold_px: float | None = None,
+    margin_threshold: float | None = None,
+    hard_query_fraction: float = 0.25,
+    max_examples: int = 10,
+) -> dict[str, Any]:
+    """Summarize whether a candidate sampled set preserves native query support."""
+
+    rows = _support_rows_from_episode_cache(
+        payload_or_path,
+        num_gaussians=num_gaussians,
+        base_gaussian_id=base_gaussian_id,
+        score_threshold=score_threshold,
+        reprojection_threshold_px=reprojection_threshold_px,
+        margin_threshold=margin_threshold,
+        hard_query_fraction=hard_query_fraction,
+    )
+    mapped_ids: torch.Tensor = rows["mapped_ids"]
+    positive: torch.Tensor = rows["positive"]
+    hard_queries: torch.Tensor = rows["hard_queries"]
+    source = torch.as_tensor(source_idx, dtype=torch.long).reshape(-1).cpu()
+    candidate = torch.as_tensor(candidate_idx, dtype=torch.long).reshape(-1).cpu()
+    source_set = {int(idx) for idx in source.tolist() if 0 <= int(idx) < int(num_gaussians)}
+    candidate_set = {int(idx) for idx in candidate.tolist() if 0 <= int(idx) < int(num_gaussians)}
+    source_counts: list[int] = []
+    candidate_counts: list[int] = []
+    source_support_landmarks: set[int] = set()
+    candidate_support_landmarks: set[int] = set()
+    examples: list[dict[str, int]] = []
+    for row in range(int(mapped_ids.shape[0])):
+        ids = {int(mapped_ids[row, col].item()) for col in torch.where(positive[row])[0].tolist()}
+        native_ids = ids & source_set
+        sampled_ids = ids & candidate_set
+        source_counts.append(len(native_ids))
+        candidate_counts.append(len(sampled_ids))
+        if bool(hard_queries[row].item()):
+            source_support_landmarks.update(native_ids)
+            candidate_support_landmarks.update(sampled_ids)
+        delta = len(sampled_ids) - len(native_ids)
+        if delta < 0:
+            examples.append(
+                {
+                    "query_index": int(row),
+                    "source_support": int(len(native_ids)),
+                    "candidate_support": int(len(sampled_ids)),
+                    "support_delta": int(delta),
+                    "hard_query": int(bool(hard_queries[row].item())),
+                }
+            )
+    source_tensor = torch.tensor(source_counts, dtype=torch.int64)
+    candidate_tensor = torch.tensor(candidate_counts, dtype=torch.int64)
+    delta_tensor = candidate_tensor - source_tensor
+    active = source_tensor > 0
+    hard_active = active & hard_queries
+    losses = active & (delta_tensor < 0)
+    hard_losses = hard_active & (delta_tensor < 0)
+    metadata = rows["metadata"]
+    worst_delta = int(delta_tensor[active].min().item()) if bool(active.any().item()) else 0
+    hard_worst_delta = int(delta_tensor[hard_active].min().item()) if bool(hard_active.any().item()) else 0
+    examples = sorted(examples, key=lambda item: (item["support_delta"], -item["source_support"], item["query_index"]))
+    return {
+        "cache_path": metadata.get("cache_path", ""),
+        "feedback_bank_split_name": metadata.get("feedback_bank_split_name", metadata.get("split_name", "")),
+        "score_threshold": rows["score_threshold"],
+        "reprojection_threshold_px": rows["reprojection_threshold_px"],
+        "margin_threshold": rows["margin_threshold"],
+        "hard_query_fraction": rows["hard_query_fraction"],
+        "query_count": int(mapped_ids.shape[0]),
+        "supported_query_count": int(active.sum().item()),
+        "hard_query_count": int(hard_queries.sum().item()),
+        "hard_supported_query_count": int(hard_active.sum().item()),
+        "query_loss_count": int(losses.sum().item()),
+        "hard_query_loss_count": int(hard_losses.sum().item()),
+        "worst_support_delta": worst_delta,
+        "hard_query_worst_support_delta": hard_worst_delta,
+        "mean_support_delta": float(delta_tensor[active].float().mean().item()) if bool(active.any().item()) else 0.0,
+        "source_support_landmarks": int(len(source_support_landmarks)),
+        "candidate_support_landmarks": int(len(candidate_support_landmarks)),
+        "source_sampled_count": int(source.numel()),
+        "candidate_sampled_count": int(candidate.numel()),
+        "native_kept_count": int(len(source_set & candidate_set)),
+        "native_dropped_count": int(len(source_set - candidate_set)),
+        "added_non_native_count": int(len(candidate_set - source_set)),
+        "loss_examples": examples[: max(0, int(max_examples))],
+        "split_audit": metadata.get("split_audit", {}),
+    }
+
+
 def _load_source_scores(source_detector_dir: Path, *, num_gaussians: int) -> torch.Tensor:
     scores_path = source_detector_dir / "sampled_scores.pkl"
     sampled_idx_path = source_detector_dir / "sampled_idx.pkl"
@@ -755,6 +1039,9 @@ def resample_detector_landmarks(
     hard_query_support: torch.Tensor | Any | None = None,
     hard_query_support_weight: float = 0.0,
     hard_query_support_metadata: dict[str, Any] | None = None,
+    support_guard_idx: torch.Tensor | Any | None = None,
+    support_guard_fraction: float = 0.0,
+    support_guard_metadata: dict[str, Any] | None = None,
     query_coverage_idx: torch.Tensor | Any | None = None,
     query_coverage_fraction: float = 0.0,
     query_coverage_metadata: dict[str, Any] | None = None,
@@ -817,6 +1104,32 @@ def resample_detector_landmarks(
             budget=strict_budget,
             coverage_grid=int(coverage_grid),
         )
+    support_guard_fraction = min(max(float(support_guard_fraction), 0.0), 1.0)
+    support_guard_selected = torch.empty(0, dtype=torch.long)
+    support_guard_metadata_out = dict(support_guard_metadata or {})
+    if support_guard_idx is not None:
+        support_candidates, support_counts = _ordered_unique_candidate_ids(
+            support_guard_idx,
+            candidate_ids=candidate_ids,
+            num_gaussians=int(selector_tensor.shape[0]),
+        )
+        support_guard_metadata_out.update(support_counts)
+        if support_guard_fraction > 0.0:
+            strict_exclude = set(int(item) for item in strict_selected.tolist())
+            if strict_exclude:
+                keep = torch.tensor(
+                    [int(idx) not in strict_exclude for idx in support_candidates.tolist()],
+                    dtype=torch.bool,
+                )
+                support_candidates = support_candidates[keep]
+            support_guard_metadata_out["available_count"] = int(support_candidates.numel())
+            support_budget = min(
+                int(round(float(output_budget) * support_guard_fraction)),
+                int(output_budget) - int(strict_selected.numel()),
+                int(support_candidates.numel()),
+            )
+            if support_budget > 0:
+                support_guard_selected = support_candidates[:support_budget].long()
     query_coverage_fraction = min(max(float(query_coverage_fraction), 0.0), 1.0)
     query_coverage_selected = torch.empty(0, dtype=torch.long)
     query_coverage_metadata_out = dict(query_coverage_metadata or {})
@@ -828,17 +1141,17 @@ def resample_detector_landmarks(
         )
         query_coverage_metadata_out.update(query_counts)
         if query_coverage_fraction > 0.0:
-            strict_exclude = set(int(item) for item in strict_selected.tolist())
-            if strict_exclude:
+            reserved_exclude = set(int(item) for item in torch.cat([strict_selected, support_guard_selected]).tolist())
+            if reserved_exclude:
                 keep = torch.tensor(
-                    [int(idx) not in strict_exclude for idx in query_candidates.tolist()],
+                    [int(idx) not in reserved_exclude for idx in query_candidates.tolist()],
                     dtype=torch.bool,
                 )
                 query_candidates = query_candidates[keep]
             query_coverage_metadata_out["available_count"] = int(query_candidates.numel())
             query_budget = min(
                 int(round(float(output_budget) * query_coverage_fraction)),
-                int(output_budget) - int(strict_selected.numel()),
+                int(output_budget) - int(strict_selected.numel()) - int(support_guard_selected.numel()),
                 int(query_candidates.numel()),
             )
             if query_budget > 0:
@@ -854,7 +1167,10 @@ def resample_detector_landmarks(
         )
         protected_metadata.update(protected_counts)
         if protected_fraction > 0.0:
-            reserved_exclude = set(int(item) for item in torch.cat([strict_selected, query_coverage_selected]).tolist())
+            reserved_exclude = set(
+                int(item)
+                for item in torch.cat([strict_selected, support_guard_selected, query_coverage_selected]).tolist()
+            )
             if reserved_exclude:
                 keep = torch.tensor(
                     [int(idx) not in reserved_exclude for idx in protected_candidates.tolist()],
@@ -864,7 +1180,10 @@ def resample_detector_landmarks(
             protected_metadata["available_count"] = int(protected_candidates.numel())
             protected_budget = min(
                 int(round(float(output_budget) * protected_fraction)),
-                int(output_budget) - int(strict_selected.numel()) - int(query_coverage_selected.numel()),
+                int(output_budget)
+                - int(strict_selected.numel())
+                - int(support_guard_selected.numel())
+                - int(query_coverage_selected.numel()),
                 int(protected_candidates.numel()),
             )
             if protected_budget > 0:
@@ -876,12 +1195,15 @@ def resample_detector_landmarks(
         valid_source = source_idx[(source_idx >= 0) & (source_idx < selector_tensor.shape[0])]
         reserved_exclude = set(
             int(item)
-            for item in torch.cat([strict_selected, query_coverage_selected, protected_selected]).tolist()
+            for item in torch.cat(
+                [strict_selected, support_guard_selected, query_coverage_selected, protected_selected]
+            ).tolist()
         )
         retain_count = min(
             int(round(float(output_budget) * retention_fraction)),
             int(output_budget)
             - int(strict_selected.numel())
+            - int(support_guard_selected.numel())
             - int(query_coverage_selected.numel())
             - int(protected_selected.numel()),
             int(valid_source.numel()),
@@ -894,7 +1216,10 @@ def resample_detector_landmarks(
             coverage_grid=int(coverage_grid),
             exclude=reserved_exclude,
         )
-    selected_prefix = torch.cat([strict_selected, query_coverage_selected, protected_selected, retained], dim=0)
+    selected_prefix = torch.cat(
+        [strict_selected, support_guard_selected, query_coverage_selected, protected_selected, retained],
+        dim=0,
+    )
     exclude_ids = set(int(item) for item in selected_prefix.tolist())
     fill_count = int(output_budget) - int(selected_prefix.numel())
     fill = _topk_from_candidates(
@@ -932,6 +1257,9 @@ def resample_detector_landmarks(
         "source_retained_count": int(retained.numel()),
         "strict_support_fraction": strict_fraction,
         "strict_support_reserved_count": int(strict_selected.numel()),
+        "support_guard_fraction": support_guard_fraction if support_guard_idx is not None else 0.0,
+        "support_guard_reserved_count": int(support_guard_selected.numel()),
+        "support_guard_metadata": support_guard_metadata_out,
         "query_coverage_fraction": query_coverage_fraction if query_coverage_idx is not None else 0.0,
         "query_coverage_reserved_count": int(query_coverage_selected.numel()),
         "query_coverage_metadata": query_coverage_metadata_out,

@@ -11,10 +11,12 @@ from loc_gs.stdloc_native.selector_resampling import (
     hard_negative_risk_from_episode_cache,
     hard_query_support_from_episode_cache,
     coverage_constrained_topk,
+    native_support_reservation_from_episode_cache,
     positive_support_from_episode_cache,
     pose_information_from_episode_cache,
     query_coverage_reservation_from_episode_cache,
     resample_detector_landmarks,
+    support_preservation_audit_from_episode_cache,
 )
 
 
@@ -279,6 +281,96 @@ def test_query_coverage_reservation_from_episode_cache_covers_low_margin_queries
     assert metadata["covered_query_count"] == 2
     assert metadata["selected_count"] == 2
     assert metadata["split_audit"]["audit_status"] == "passed"
+
+
+def test_native_support_reservation_from_episode_cache_keeps_low_margin_native_support():
+    payload = {
+        "landmark_id": torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.long),
+        "cosine": torch.tensor([[0.9, 0.1], [0.95, 0.9], [0.8, 0.7]], dtype=torch.float32),
+        "candidate_mask": torch.ones((3, 2), dtype=torch.bool),
+        "reprojection_error": torch.tensor([[1.0, 1.0], [1.0, 1.0], [1.0, 20.0]], dtype=torch.float32),
+        "margin": torch.tensor([0.1, 0.9, 0.2], dtype=torch.float32),
+        "metadata": {
+            "reprojection_threshold_px": 8.0,
+            "split_audit": {
+                "audit_status": "passed",
+            },
+        },
+    }
+
+    selected, metadata = native_support_reservation_from_episode_cache(
+        payload,
+        source_idx=torch.tensor([0, 2, 4], dtype=torch.long),
+        num_gaussians=6,
+        margin_threshold=0.2,
+    )
+
+    assert selected.tolist() == [0, 4]
+    assert metadata["hard_query_count"] == 2
+    assert metadata["covered_query_count"] == 2
+    assert metadata["source_support_landmarks"] == 2
+    assert metadata["split_audit"]["audit_status"] == "passed"
+
+
+def test_native_support_reservation_from_episode_cache_can_preserve_hard_query_counts():
+    payload = {
+        "landmark_id": torch.tensor([[0, 2], [4, 5]], dtype=torch.long),
+        "cosine": torch.tensor([[0.9, 0.8], [0.7, 0.6]], dtype=torch.float32),
+        "candidate_mask": torch.ones((2, 2), dtype=torch.bool),
+        "reprojection_error": torch.tensor([[1.0, 1.0], [1.0, 20.0]], dtype=torch.float32),
+        "margin": torch.tensor([0.1, 0.2], dtype=torch.float32),
+        "metadata": {
+            "reprojection_threshold_px": 8.0,
+            "split_audit": {
+                "audit_status": "passed",
+            },
+        },
+    }
+
+    selected, metadata = native_support_reservation_from_episode_cache(
+        payload,
+        source_idx=torch.tensor([0, 2, 4], dtype=torch.long),
+        num_gaussians=6,
+        margin_threshold=0.2,
+        preserve_counts=True,
+    )
+
+    assert set(selected.tolist()) == {0, 2, 4}
+    assert metadata["preserve_counts"] is True
+    assert metadata["source_support_landmarks"] == 3
+    assert metadata["selected_count"] == 3
+
+
+def test_support_preservation_audit_from_episode_cache_reports_hard_query_losses():
+    payload = {
+        "landmark_id": torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.long),
+        "cosine": torch.tensor([[0.9, 0.1], [0.95, 0.9], [0.8, 0.7]], dtype=torch.float32),
+        "candidate_mask": torch.ones((3, 2), dtype=torch.bool),
+        "reprojection_error": torch.tensor([[1.0, 1.0], [1.0, 1.0], [1.0, 20.0]], dtype=torch.float32),
+        "margin": torch.tensor([0.1, 0.9, 0.2], dtype=torch.float32),
+        "metadata": {
+            "reprojection_threshold_px": 8.0,
+            "split_audit": {
+                "audit_status": "passed",
+            },
+        },
+    }
+
+    audit = support_preservation_audit_from_episode_cache(
+        payload,
+        source_idx=torch.tensor([0, 2, 4], dtype=torch.long),
+        candidate_idx=torch.tensor([0, 2, 5], dtype=torch.long),
+        num_gaussians=6,
+        margin_threshold=0.2,
+    )
+
+    assert audit["hard_query_count"] == 2
+    assert audit["hard_query_loss_count"] == 1
+    assert audit["hard_query_worst_support_delta"] == -1
+    assert audit["worst_support_delta"] == -1
+    assert audit["source_support_landmarks"] == 2
+    assert audit["candidate_support_landmarks"] == 1
+    assert audit["split_audit"]["audit_status"] == "passed"
 
 
 def test_coverage_constrained_topk_keeps_budget_and_spreads_cells():
@@ -1163,6 +1255,90 @@ def test_export_selector_resampled_map_records_strict_support_cache(tmp_path):
     assert manifest["strict_support_score_threshold"] == 0.7
     assert manifest["strict_support_reprojection_threshold_px"] == 3.0
     assert manifest["strict_support"]["split_audit"]["audit_status"] == "passed"
+
+
+def test_export_selector_resampled_map_records_support_guard_audit(tmp_path):
+    source = tmp_path / "source"
+    pc_dir = source / "point_cloud" / "iteration_30000"
+    detector = source / "detector"
+    pc_dir.mkdir(parents=True)
+    detector.mkdir()
+    _write_ply(pc_dir / "point_cloud.ply")
+    with (detector / "sampled_idx.pkl").open("wb") as handle:
+        pickle.dump(torch.tensor([0, 1, 2], dtype=torch.long), handle)
+    checkpoint = tmp_path / "selector.pt"
+    torch.save(
+        {
+            "export_descriptors": F.normalize(torch.ones((5, 2), dtype=torch.float32), p=2, dim=-1),
+            "gate": torch.tensor([0.1, 0.2, 0.3, 0.9, 0.8], dtype=torch.float32),
+        },
+        checkpoint,
+    )
+    cache = tmp_path / "support_guard_cache.pt"
+    torch.save(
+        {
+            "landmark_id": torch.tensor([[1, 3], [2, 4]], dtype=torch.long),
+            "cosine": torch.tensor([[0.9, 0.8], [0.7, 0.9]], dtype=torch.float32),
+            "candidate_mask": torch.ones((2, 2), dtype=torch.bool),
+            "reprojection_error": torch.tensor([[1.0, 20.0], [1.0, 1.0]], dtype=torch.float32),
+            "margin": torch.tensor([0.1, 0.9], dtype=torch.float32),
+            "metadata": {
+                "feedback_bank_split_name": "selfmap_train_rendered",
+                "reprojection_threshold_px": 8.0,
+                "split_audit": {
+                    "audit_status": "passed",
+                },
+            },
+        },
+        cache,
+    )
+    output = tmp_path / "resampled"
+    args = build_argparser().parse_args(
+        [
+            "--source_map",
+            str(source),
+            "--checkpoint_path",
+            str(checkpoint),
+            "--output_map",
+            str(output),
+            "--descriptor_mode",
+            "native",
+            "--budget",
+            "same_as_source",
+            "--selector_weight",
+            "1.0",
+            "--source_score_weight",
+            "0.0",
+            "--support_guard_cache",
+            str(cache),
+            "--support_guard_fraction",
+            "0.34",
+            "--support_guard_margin_threshold",
+            "0.2",
+            "--support_guard_preserve_counts",
+            "--candidate_pool",
+            "all_gaussians",
+            "--no-preserve_source_order",
+        ]
+    )
+
+    assert main(args) == 0
+
+    with (output / "detector" / "sampled_idx.pkl").open("rb") as handle:
+        sampled_idx = pickle.load(handle)
+    manifest = __import__("json").loads((output / "selector_resampling_manifest.json").read_text(encoding="utf-8"))
+    support_audit = __import__("json").loads((output / "support_audit.json").read_text(encoding="utf-8"))
+    assert sampled_idx.tolist() == [1, 3, 4]
+    assert manifest["support_guard_cache"] == str(cache)
+    assert manifest["support_guard_fraction"] == 0.34
+    assert manifest["support_guard_preserve_counts"] is True
+    assert manifest["support_guard_reserved_count"] == 1
+    assert manifest["support_guard"]["covered_query_count"] == 1
+    assert manifest["support_audit"]["hard_query_loss_count"] == 0
+    assert support_audit["hard_query_loss_count"] == 0
+    assert support_audit["native_dropped_count"] == 2
+    assert support_audit["added_non_native_count"] == 2
+    assert support_audit["split_audit"]["audit_status"] == "passed"
 
 
 def test_export_selector_resampled_map_records_source_retention_fraction(tmp_path):
