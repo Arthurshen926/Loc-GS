@@ -1,4 +1,8 @@
+import pickle
+import sys
 from pathlib import Path
+
+import pytest
 
 from loc_gs.stdloc_native.commands import CommandJob
 from loc_gs.scripts import eval_stdloc_native
@@ -29,8 +33,283 @@ def test_eval_stdloc_native_dry_run_prints_command(capsys):
 
     out = capsys.readouterr().out
     assert "python-test stdloc.py" in out
-    assert "--cfg configs/stdloc_cambridge.yaml" in out
+    expected_cfg = eval_stdloc_native.repo_root() / "third_party/stdloc/configs/stdloc_cambridge.yaml"
+    assert expected_cfg.exists()
+    assert f"--cfg {expected_cfg}" in out
     assert "--output_path /out/eval_shop" in out
+
+
+def test_eval_stdloc_native_accepts_explicit_opencv_cfg_when_variant_evaluator_is_present(
+    capsys, monkeypatch
+):
+    monkeypatch.setattr(eval_stdloc_native, "_third_party_stdloc_evaluator_modified", lambda: True)
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            "/data/cambridge",
+            "--map_root",
+            "/maps/stdloc",
+            "--output_dir",
+            "/out/eval_shop",
+            "--cfg",
+            "configs/stdloc_cambridge_opencv.yaml",
+            "--dry_run",
+        ]
+    )
+
+    eval_stdloc_native.main(args)
+
+    out = capsys.readouterr().out
+    expected_cfg = eval_stdloc_native.repo_root() / "configs/stdloc_cambridge_opencv.yaml"
+    assert expected_cfg.exists()
+    assert f"--cfg {expected_cfg}" in out
+
+
+def test_eval_stdloc_native_rejects_opencv_variant_cfg_with_unmodified_evaluator(
+    monkeypatch,
+):
+    monkeypatch.setattr(eval_stdloc_native, "_third_party_stdloc_evaluator_modified", lambda: False)
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            "/data/cambridge",
+            "--map_root",
+            "/maps/stdloc",
+            "--output_dir",
+            "/out/eval_shop",
+            "--cfg",
+            "configs/stdloc_cambridge_opencv.yaml",
+            "--dry_run",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="requires the OpenCV variant evaluator"):
+        eval_stdloc_native.main(args)
+
+
+def test_eval_stdloc_native_rejects_modified_evaluator_when_official_parity_required(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(eval_stdloc_native, "_third_party_stdloc_evaluator_modified", lambda: True)
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            "/data/cambridge",
+            "--map_root",
+            str(tmp_path / "maps"),
+            "--output_dir",
+            str(tmp_path / "eval_shop"),
+            "--require_official_stdloc_parity",
+            "--dry_run",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="official STDLoc parity"):
+        eval_stdloc_native.main(args)
+
+
+def test_eval_stdloc_native_rejects_non_vendored_cfg_when_official_parity_required(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(eval_stdloc_native, "_third_party_stdloc_evaluator_modified", lambda: False)
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            "/data/cambridge",
+            "--map_root",
+            str(tmp_path / "maps"),
+            "--output_dir",
+            str(tmp_path / "eval_shop"),
+            "--cfg",
+            "configs/stdloc_cambridge_opencv.yaml",
+            "--require_official_stdloc_parity",
+            "--dry_run",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="vendored STDLoc config"):
+        eval_stdloc_native.main(args)
+
+
+def test_eval_stdloc_native_accepts_poselib_method_cfg_when_paper_safe_evaluator_required(
+    capsys, monkeypatch
+):
+    monkeypatch.setattr(eval_stdloc_native, "_third_party_stdloc_evaluator_modified", lambda: False)
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            "/data/cambridge",
+            "--map_root",
+            "/maps/stdloc",
+            "--output_dir",
+            "/out/eval_shop",
+            "--cfg",
+            "third_party/stdloc/configs/stdloc_spgs_cambridge_dense1.yaml",
+            "--require_paper_safe_poselib_evaluator",
+            "--dry_run",
+        ]
+    )
+
+    eval_stdloc_native.main(args)
+
+    out = capsys.readouterr().out
+    expected_cfg = eval_stdloc_native.repo_root() / "third_party/stdloc/configs/stdloc_spgs_cambridge_dense1.yaml"
+    assert expected_cfg.exists()
+    assert f"--cfg {expected_cfg}" in out
+
+
+def test_eval_stdloc_native_rejects_opencv_when_paper_safe_evaluator_required(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(eval_stdloc_native, "_third_party_stdloc_evaluator_modified", lambda: False)
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            "/data/cambridge",
+            "--map_root",
+            str(tmp_path / "maps"),
+            "--output_dir",
+            str(tmp_path / "eval_shop"),
+            "--cfg",
+            "configs/stdloc_cambridge_opencv.yaml",
+            "--require_paper_safe_poselib_evaluator",
+            "--dry_run",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="sparse and dense solver=poselib"):
+        eval_stdloc_native.main(args)
+
+
+def test_eval_stdloc_native_rejects_modified_evaluator_when_paper_safe_required(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(eval_stdloc_native, "_third_party_stdloc_evaluator_modified", lambda: True)
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            "/data/cambridge",
+            "--map_root",
+            str(tmp_path / "maps"),
+            "--output_dir",
+            str(tmp_path / "eval_shop"),
+            "--cfg",
+            "third_party/stdloc/configs/stdloc_spgs_cambridge_dense1.yaml",
+            "--require_paper_safe_poselib_evaluator",
+            "--dry_run",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="unmodified third_party/stdloc evaluator"):
+        eval_stdloc_native.main(args)
+
+
+def test_eval_stdloc_native_defaults_to_current_python(capsys):
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            "/data/cambridge",
+            "--map_root",
+            "/maps/stdloc",
+            "--output_dir",
+            "/out/eval_shop",
+            "--dry_run",
+        ]
+    )
+
+    eval_stdloc_native.main(args)
+
+    out = capsys.readouterr().out
+    assert out.startswith(f"{sys.executable} stdloc.py")
+
+
+def test_eval_stdloc_native_writes_audit_bundle_after_run(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run_job(job):
+        calls.append(job)
+        output_dir = tmp_path / "eval_shop"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "summary.json").write_text(
+            '{"model_path": "/maps/stdloc/ShopFacade", "eval_split": "train", '
+            '"dense": {"median_ae": 0.1, "median_te": 2.0}}',
+            encoding="utf-8",
+        )
+        (output_dir / "stdloc_cambridge.yaml").write_text(
+            "sparse:\n  solver: poselib\n"
+            "dense:\n  solver: poselib\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(eval_stdloc_native, "run_job", fake_run_job)
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            "/data/cambridge",
+            "--map_root",
+            "/maps/stdloc",
+            "--output_dir",
+            str(tmp_path / "eval_shop"),
+            "--python_bin",
+            "python-test",
+            "--eval_split",
+            "train",
+        ]
+    )
+
+    eval_stdloc_native.main(args)
+
+    assert calls
+    assert (tmp_path / "eval_shop" / "manifest.json").exists()
+    assert (tmp_path / "eval_shop" / "command.txt").exists()
+    assert (tmp_path / "eval_shop" / "metrics_summary.json").exists()
+    assert (tmp_path / "eval_shop" / "split_audit.json").exists()
+
+
+def test_eval_stdloc_native_rejects_unexpected_native_sampled_count(monkeypatch, tmp_path):
+    calls = []
+    detector = tmp_path / "maps" / "ShopFacade" / "detector"
+    detector.mkdir(parents=True)
+    with (detector / "sampled_idx.pkl").open("wb") as handle:
+        pickle.dump([1, 2], handle)
+
+    monkeypatch.setattr(eval_stdloc_native, "run_job", lambda job: calls.append(job))
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            "/data/cambridge",
+            "--map_root",
+            str(tmp_path / "maps"),
+            "--output_dir",
+            str(tmp_path / "eval_shop"),
+            "--expected_sampled_count",
+            "16384",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="sampled count"):
+        eval_stdloc_native.main(args)
+    assert calls == []
 
 
 def test_train_stdloc_native_dry_run_prints_command(capsys):

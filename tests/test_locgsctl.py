@@ -1,4 +1,5 @@
 import json
+import pickle
 import sys
 from pathlib import Path
 
@@ -139,6 +140,54 @@ def test_list_scenes_uses_stdloc_cambridge_default_root(capsys):
     payload = _run_cli(capsys, "list-scenes")
 
     assert payload["scenes"][0]["data_root"].startswith("/mnt/pool/sqy/Cambridge_stdloc/")
+
+
+def test_list_scenes_reports_native_sampled_count_status(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    detector = repo / "maps" / "ShopFacade" / "detector"
+    detector.mkdir(parents=True)
+    with (detector / "sampled_idx.pkl").open("wb") as handle:
+        pickle.dump([1, 2], handle)
+
+    payload = _run_cli(capsys, "--repo-root", str(repo), "list-scenes", "--map-root", "maps")
+
+    shop = next(scene for scene in payload["scenes"] if scene["scene"] == "ShopFacade")
+    assert shop["sampled_count"] == 2
+    assert shop["native_sampled_count_expected"] == 16384
+    assert shop["native_sampled_count_status"] == "mismatch"
+
+
+def test_smoke_flags_native_sampled_count_mismatch(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    data_root = tmp_path / "Cambridge"
+    checkpoint_root = tmp_path / "checkpoints"
+    detector = repo / "maps" / "ShopFacade" / "detector"
+    detector.mkdir(parents=True)
+    (data_root / "ShopFacade").mkdir(parents=True)
+    (checkpoint_root / "ShopFacade").mkdir(parents=True)
+    (checkpoint_root / "ShopFacade" / "latest.pth").write_bytes(b"ckpt")
+    with (detector / "sampled_idx.pkl").open("wb") as handle:
+        pickle.dump([1, 2], handle)
+
+    payload = _run_cli(
+        capsys,
+        "--repo-root",
+        str(repo),
+        "smoke",
+        "--scene",
+        "ShopFacade",
+        "--map-root",
+        "maps",
+        "--checkpoint-root",
+        str(checkpoint_root),
+        "--data-root",
+        str(data_root),
+        "--dry-run",
+    )
+
+    assert payload["ok"] is False
+    assert payload["checks"]["native_sampled_count"]["status"] == "mismatch"
+    assert payload["failed"] == ["native_sampled_count"]
 
 
 def test_manifest_includes_experiment_audit_fields(tmp_path, capsys):

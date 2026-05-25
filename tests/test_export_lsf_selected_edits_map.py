@@ -72,3 +72,47 @@ def test_export_lsf_selected_edits_map_writes_non_prefix_subset(tmp_path):
     assert manifest["method"] == "loc_gs_lsf_selected_edits_resampling"
     assert manifest["selected_edit_indices_one_based"] == [1, 3]
     assert manifest["selected_edits"]["same_budget"] is True
+
+
+def test_export_lsf_selected_edits_map_rejects_source_as_output_without_deleting_it(tmp_path):
+    source = tmp_path / "source_map"
+    candidate = tmp_path / "candidate_map"
+    _dump_pickle(source / "detector" / "sampled_idx.pkl", torch.tensor([0, 1], dtype=torch.long))
+    _dump_pickle(source / "detector" / "sampled_scores.pkl", torch.ones(2, dtype=torch.float32))
+    _dump_pickle(
+        candidate / "detector" / "sampled_scores.pkl",
+        {
+            "sampled_scores": torch.ones(2, dtype=torch.float32),
+            "score_avg": torch.ones(3, dtype=torch.float32),
+        },
+    )
+    edit_manifest = candidate / "manifest.json"
+    edit_manifest.write_text(
+        json.dumps({"edits": [{"add_id": 2, "drop_id": 1, "utility_gain": 1.0}]}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loc_gs.scripts.export_lsf_selected_edits_map",
+            "--source_map",
+            str(source),
+            "--candidate_map",
+            str(candidate),
+            "--edit_manifest",
+            str(edit_manifest),
+            "--select_edits",
+            "1",
+            "--output_map",
+            str(source),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "must differ" in result.stderr
+    assert (source / "detector" / "sampled_idx.pkl").exists()

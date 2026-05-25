@@ -148,3 +148,38 @@ def test_compute_pose_reliability_stats_reports_residuals_and_inlier_ratio():
     assert stats["all_reprojection_p90_px"] == 1.8
     assert stats["inlier_reprojection_mean_px"] == 0.5
     assert stats["inlier_reprojection_median_px"] == 0.5
+
+
+def test_cuda_memory_snapshot_reports_peak_gpu_mb(monkeypatch):
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def synchronize():
+            return None
+
+        @staticmethod
+        def current_device():
+            return 2
+
+        @staticmethod
+        def max_memory_allocated(device):
+            assert device == 2
+            return 2 * 1024 * 1024
+
+        @staticmethod
+        def max_memory_reserved(device):
+            assert device == 2
+            return 3 * 1024 * 1024
+
+    monkeypatch.setattr(profile_stdloc_native.torch, "cuda", FakeCuda)
+
+    snapshot = profile_stdloc_native._cuda_memory_snapshot()
+
+    assert snapshot["available"] is True
+    assert snapshot["device_index"] == 2
+    assert snapshot["peak_allocated_mb"] == 2.0
+    assert snapshot["peak_reserved_mb"] == 3.0
+    assert snapshot["peak_gpu_mb"] == 3.0

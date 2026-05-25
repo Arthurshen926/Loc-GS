@@ -47,6 +47,22 @@ def test_dense_transition_labels_mark_pose_and_recall_transitions():
     assert by_id["same"]["r2_transition"] == "stable_ok"
 
 
+def test_dense_transition_labels_use_image_name_as_real_query_id_when_query_id_missing():
+    rows = [
+        {
+            "image_name": "seq1/frame00001.png",
+            "sparse_TE": 6.0,
+            "sparse_AE": 1.0,
+            "dense_TE": 4.0,
+            "dense_AE": 1.0,
+        }
+    ]
+
+    labels = dense_transition_labels(rows)
+
+    assert labels[0]["query_id"] == "seq1/frame00001.png"
+
+
 def test_summarize_stage_transitions_cli_writes_json_and_markdown(tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

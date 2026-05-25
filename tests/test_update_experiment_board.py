@@ -72,6 +72,13 @@ def test_update_experiment_board_writes_markdown_and_json(tmp_path):
     by_name = {row["run_name"]: row for row in rows}
     assert by_name["main_safe"]["paper_safe"] is True
     assert by_name["main_safe"]["run_role"] == "main_candidate"
+    assert by_name["main_safe"]["submission_alignment"]["missing_dense_metrics"] == []
+    assert by_name["main_safe"]["submission_alignment"]["missing_reporting_fields"] == [
+        "runtime",
+        "memory",
+        "map_size",
+        "edit_budget",
+    ]
     assert by_name["missing_audit"]["paper_safe"] is False
     assert by_name["missing_audit"]["run_role"] == "diagnostic"
     assert "missing manifest" in by_name["missing_audit"]["paper_safety_reason"]
@@ -334,3 +341,58 @@ def test_update_experiment_board_prefers_metrics_summary_for_direct_summary_file
     rows = json.loads(js.read_text(encoding="utf-8"))["runs"]
     assert len(rows) == 1
     assert rows[0]["metrics"]["dense"]["median_te_cm"] == 2.25
+
+
+def test_update_experiment_board_extracts_submission_reporting_fields(tmp_path):
+    root = tmp_path / "results"
+    run = _write_run(root, "reporting_complete", role="main_candidate")
+    summary = json.loads((run / "metrics_summary.json").read_text(encoding="utf-8"))
+    summary.update(
+        {
+            "online_timing_digest": {"mean_total_ms": 12.0},
+            "peak_gpu_mb": 2048,
+            "map_size_mb": 11.5,
+        }
+    )
+    (run / "metrics_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    manifest["solver_aware"] = {"max_edits": 64, "same_budget": True}
+    (run / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    js = tmp_path / "board.json"
+    args = build_argparser().parse_args(
+        [
+            "--result_roots",
+            str(root),
+            "--output_json",
+            str(js),
+        ]
+    )
+
+    assert main(args) == 0
+
+    row = json.loads(js.read_text(encoding="utf-8"))["runs"][0]
+    assert row["submission_alignment"]["missing_reporting_fields"] == []
+    assert row["submission_alignment"]["ready_for_main_table"] is True
+
+
+def test_update_experiment_board_accepts_rho_feedback_enabled_alias(tmp_path):
+    root = tmp_path / "results"
+    run = _write_run(root, "rho_alias", role="diagnostic")
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    manifest.pop("rho", None)
+    manifest["rho_feedback_enabled"] = False
+    (run / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    js = tmp_path / "board.json"
+    args = build_argparser().parse_args(
+        [
+            "--result_roots",
+            str(root),
+            "--output_json",
+            str(js),
+        ]
+    )
+
+    assert main(args) == 0
+
+    row = json.loads(js.read_text(encoding="utf-8"))["runs"][0]
+    assert "rho" not in row["paper_safety_reason"]

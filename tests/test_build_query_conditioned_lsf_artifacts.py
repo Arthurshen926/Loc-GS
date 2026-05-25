@@ -92,6 +92,38 @@ def _save_bank(path, *, split_name="selfmap_train"):
     )
 
 
+def _save_v2_bank_with_repeated_keypoint_ids(path):
+    records = []
+    for image_id, gid in (("seq1/frame00001.png", 1), ("seq1/frame00002.png", 2)):
+        records.append(
+            {
+                "scene": "ToyScene",
+                "query_id": f"{image_id}::kp_000000",
+                "image_id": image_id,
+                "keypoint_id": "kp_000000",
+                "matched_gaussian_id": str(gid),
+                "matched_landmark_id": str(gid),
+                "descriptor_score": 0.95,
+                "match_rank": 1,
+                "pnp_inlier": True,
+                "reprojection_error_px": 1.0,
+                "dense_transition": "improved",
+                "pnp_success": True,
+            }
+        )
+    save_feedback_bank(
+        path,
+        records,
+        {
+            "scene": "ToyScene",
+            "split_name": "selfmap_train",
+            "schema_version": "feedback_bank_v2",
+            "query_id_source": "image_id",
+            "split_audit": {"audit_status": "passed"},
+        },
+    )
+
+
 def test_build_query_conditioned_lsf_artifacts_writes_solver_inputs(tmp_path):
     source_map = tmp_path / "source_map"
     _write_source_map(source_map, [1, 2, 3])
@@ -166,4 +198,32 @@ def test_build_query_conditioned_lsf_artifacts_rejects_test_split(tmp_path):
     )
 
     with pytest.raises(ValueError, match="test split"):
+        main(args)
+
+
+def test_build_query_conditioned_lsf_artifacts_rejects_v2_until_string_ids_are_supported(tmp_path):
+    source_map = tmp_path / "source_map"
+    _write_source_map(source_map, [1, 2, 3])
+    bank = tmp_path / "feedback_bank_v2.jsonl"
+    _save_v2_bank_with_repeated_keypoint_ids(bank)
+    output = tmp_path / "artifacts"
+
+    args = build_argparser().parse_args(
+        [
+            "--feedback_bank",
+            str(bank),
+            "--source_map",
+            str(source_map),
+            "--output_dir",
+            str(output),
+            "--num_gaussians",
+            "8",
+            "--hard_query_topk",
+            "2",
+            "--positive_reprojection_threshold_px",
+            "4.0",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="does not preserve feedback_bank_v2 string query ids"):
         main(args)

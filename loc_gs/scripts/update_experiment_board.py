@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from loc_gs.reporting.submission_alignment import build_submission_alignment_report
 from loc_gs.scripts.locgsctl import summarize_path
 
 
@@ -21,7 +22,7 @@ MANIFEST_FIELD_GROUPS = (
     ("map_path", ("map_path", "map", "baseline_map")),
     ("data_roots", ("data_roots", "data_root")),
     ("hyperparameters", ("hyperparameters",)),
-    ("rho", ("rho",)),
+    ("rho", ("rho", "rho_feedback_enabled")),
     ("feedback_enabled", ("feedback_enabled",)),
     ("residual_enabled", ("residual_enabled",)),
     ("selector_enabled", ("selector_enabled",)),
@@ -140,6 +141,59 @@ def _audit_bundle_consistency(
     return reasons
 
 
+def _first_present(payload: dict[str, Any] | None, names: tuple[str, ...]) -> Any:
+    if not payload:
+        return None
+    for name in names:
+        if name in payload and payload[name] is not None:
+            return payload[name]
+    return None
+
+
+def _extract_reporting_fields(
+    summary: dict[str, Any] | None,
+    manifest: dict[str, Any] | None,
+    *,
+    run_dir: Path,
+) -> dict[str, Any]:
+    """Extract ULF/STDLoc-style reporting sidecars without changing evaluator output."""
+
+    reporting: dict[str, Any] = {}
+    timing_profile = _load_json(run_dir / "timing_profile.json")
+    runtime = _first_present(
+        summary,
+        ("online_timing_digest", "online_timing", "runtime", "runtime_ms", "latency_ms", "timing", "timing_profile"),
+    )
+    if runtime is None:
+        runtime = timing_profile
+    if runtime is not None:
+        reporting["runtime"] = runtime
+    memory = _first_present(
+        summary,
+        ("memory", "memory_mb", "peak_memory_mb", "peak_gpu_mb", "gpu_memory_mb"),
+    )
+    if memory is None:
+        memory = _first_present(manifest, ("memory", "memory_mb", "peak_memory_mb", "peak_gpu_mb", "gpu_memory_mb"))
+    if memory is not None:
+        reporting["memory"] = memory
+    map_size = _first_present(summary, ("map_size", "map_size_mb", "landmark_count", "sampled_count"))
+    if map_size is None:
+        map_size = _first_present(manifest, ("map_size", "map_size_mb", "landmark_count", "sampled_count"))
+    if map_size is not None:
+        reporting["map_size"] = map_size
+    solver_aware = manifest.get("solver_aware", {}) if isinstance(manifest, dict) else {}
+    selected_edits = manifest.get("selected_edits", {}) if isinstance(manifest, dict) else {}
+    edit_budget = _first_present(
+        solver_aware if isinstance(solver_aware, dict) else {},
+        ("max_edits", "same_budget", "native_dropped_count", "added_non_native_count"),
+    )
+    if edit_budget is None:
+        edit_budget = _first_present(selected_edits if isinstance(selected_edits, dict) else {}, ("requested_edit_count", "available_edit_count"))
+    if edit_budget is not None:
+        reporting["edit_budget"] = edit_budget
+    return reporting
+
+
 def _paper_safety(
     manifest: dict[str, Any] | None,
     split_audit: dict[str, Any] | None,
@@ -184,6 +238,7 @@ def _row_from_summary(summary_path: Path) -> dict[str, Any]:
     run_dir = summary_path.parent
     manifest = _load_json(run_dir / "manifest.json")
     split_audit = _load_json(run_dir / "split_audit.json")
+    raw_summary = _load_json(summary_path)
     compact = summarize_path(summary_path)
     paper_safe, reason = _paper_safety(manifest, split_audit, compact_metrics=compact, run_dir=run_dir)
     role = _classify_run(manifest, split_audit, paper_safe=paper_safe)
@@ -193,7 +248,7 @@ def _row_from_summary(summary_path: Path) -> dict[str, Any]:
             (manifest or {}).get("scene", ""),
         )
     )
-    return {
+    row = {
         "run_name": run_dir.name,
         "run_dir": str(run_dir),
         "scene": scene,
@@ -204,9 +259,12 @@ def _row_from_summary(summary_path: Path) -> dict[str, Any]:
             "dense": compact.get("dense", {}),
             "sparse": compact.get("sparse", {}),
         },
+        "reporting": _extract_reporting_fields(raw_summary, manifest, run_dir=run_dir),
         "manifest_path": str(run_dir / "manifest.json") if manifest is not None else "",
         "split_audit_path": str(run_dir / "split_audit.json") if split_audit is not None else "",
     }
+    row["submission_alignment"] = build_submission_alignment_report({"runs": [row]})["runs"][0]
+    return row
 
 
 def build_board(result_roots: list[str]) -> dict[str, Any]:
@@ -229,11 +287,12 @@ def board_to_markdown(board: dict[str, Any]) -> str:
     lines = [
         "# Experiment Board",
         "",
-        "| Run | Scene | Role | Paper-safe | Median cm | Median deg | R@10 | R@5 | R@2 | Reason |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Run | Scene | Role | Paper-safe | Submit-ready | Median cm | Median deg | R@10 | R@5 | R@2 | Missing reporting | Reason |",
+        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for row in board.get("runs", []):
         dense = row.get("metrics", {}).get("dense", {})
+        alignment = row.get("submission_alignment", {})
         lines.append(
             "| "
             + " | ".join(
@@ -242,11 +301,13 @@ def board_to_markdown(board: dict[str, Any]) -> str:
                     str(row.get("scene", "")),
                     str(row.get("run_role", "")),
                     "yes" if row.get("paper_safe") else "no",
+                    "yes" if alignment.get("ready_for_main_table") else "no",
                     _fmt_metric(dense, "median_te_cm"),
                     _fmt_metric(dense, "median_re_deg"),
                     _fmt_metric(dense, "recall_10cm_5deg"),
                     _fmt_metric(dense, "recall_5cm_5deg"),
                     _fmt_metric(dense, "recall_2cm_2deg"),
+                    ",".join(str(item) for item in alignment.get("missing_reporting_fields", [])),
                     str(row.get("paper_safety_reason", "")),
                 ]
             )

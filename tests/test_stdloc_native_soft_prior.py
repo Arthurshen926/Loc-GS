@@ -72,6 +72,33 @@ def test_build_soft_prior_map_with_zero_rho_preserves_scores_and_disables_prior(
     assert manifest["rho"] == 0.0
 
 
+def test_build_soft_prior_map_does_not_write_back_through_mirrored_detector_symlink(tmp_path):
+    source_map = tmp_path / "source_map"
+    output_map = tmp_path / "soft_map"
+    calibration_path = tmp_path / "calib.pt"
+    base_cfg = tmp_path / "stdloc.yaml"
+    _write_source_map(source_map)
+    _write_base_cfg(base_cfg)
+    torch.save({"landmark_matchability": torch.tensor([0.9, 0.1], dtype=torch.float32)}, calibration_path)
+
+    soft_prior.build_soft_prior_map(
+        source_map=source_map,
+        output_map=output_map,
+        calibration_path=calibration_path,
+        base_cfg_path=base_cfg,
+        output_cfg_path=output_map / "stdloc_soft_prior.yaml",
+        rho=1.0,
+        update_point_cloud_locability=False,
+    )
+
+    source_scores = pickle.load((source_map / "detector/sampled_scores.pkl").open("rb"))
+    output_scores_path = output_map / "detector/sampled_scores.pkl"
+    output_scores = pickle.load(output_scores_path.open("rb"))
+    assert not output_scores_path.is_symlink()
+    assert torch.allclose(source_scores["sampled_scores"], torch.tensor([0.2, 0.6]))
+    assert torch.allclose(output_scores["sampled_scores"], torch.tensor([1.0, 0.0]))
+
+
 def test_build_soft_prior_map_blends_ranked_selfmap_scores_into_stdloc_map(tmp_path):
     source_map = tmp_path / "source_map"
     output_map = tmp_path / "soft_map"

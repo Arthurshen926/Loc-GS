@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from loc_gs.stdloc_native.soft_prior import _reset_path
+from loc_gs.stdloc_native.soft_prior import _assert_safe_output_map, _reset_path
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -135,6 +135,7 @@ def build_clean_detector_source_map(
         raise FileNotFoundError(f"rebuilt detector has no sampled_idx.pkl: {sampled_idx_path}")
     if not sampled_scores_path.exists():
         raise FileNotFoundError(f"rebuilt detector has no sampled_scores.pkl: {sampled_scores_path}")
+    _assert_safe_output_map(source_map, output_map)
     if output_map.exists() or output_map.is_symlink():
         if not overwrite:
             raise FileExistsError(f"output map already exists: {output_map}")

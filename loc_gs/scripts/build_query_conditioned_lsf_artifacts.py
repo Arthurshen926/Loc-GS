@@ -108,6 +108,14 @@ def _query_int(query_id: str, fallback: int) -> int:
     return int(fallback)
 
 
+def _query_group_key(record: dict[str, Any]) -> str:
+    image_id = str(record.get("image_id", "")).strip()
+    if image_id:
+        return image_id
+    query_id = str(record.get("query_id", "")).strip()
+    return query_id.split("::", 1)[0] if "::" in query_id else ""
+
+
 def _gid(record: dict[str, Any]) -> int | None:
     for key in ("matched_gaussian_id", "matched_landmark_id", "gaussian_id", "landmark_id"):
         raw = record.get(key)
@@ -212,6 +220,11 @@ def _build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
     split_name = str(manifest.get("split_name", manifest.get("split", "")))
     if split_name.strip().lower() == "test":
         raise ValueError("query-conditioned LSF artifacts cannot use test split")
+    if str(manifest.get("schema_version", "")).strip() == "feedback_bank_v2":
+        raise ValueError(
+            "build_query_conditioned_lsf_artifacts does not preserve feedback_bank_v2 string query ids; "
+            "use solver_consensus_support or build_solver_tuple_bank_v2 instead"
+        )
 
     records = [dict(record) for record in bank.get("records", [])]
     num_gaussians = int(args.num_gaussians)
@@ -238,9 +251,15 @@ def _build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
         if gid is None or gid < 0 or gid >= num_gaussians:
             continue
         raw_qid = str(record.get("query_id", ""))
-        if raw_qid not in query_fallback:
-            query_fallback[raw_qid] = len(query_fallback)
-        qid = _query_int(raw_qid, query_fallback[raw_qid])
+        group_key = _query_group_key(record)
+        if group_key:
+            if group_key not in query_fallback:
+                query_fallback[group_key] = len(query_fallback)
+            qid = query_fallback[group_key]
+        else:
+            if raw_qid not in query_fallback:
+                query_fallback[raw_qid] = len(query_fallback)
+            qid = _query_int(raw_qid, query_fallback[raw_qid])
         score = _float(record, "descriptor_score", 0.0)
         is_pos = _is_positive(record, float(args.positive_reprojection_threshold_px))
         is_hn = _is_hard_negative(

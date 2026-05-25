@@ -1,6 +1,14 @@
-# Loc-GS LFF / SceneMatch Mainline
+# Archived Loc-GS LFF / SceneMatch Diagnostic History
 
 Date: 2026-05-12
+
+Archive status, 2026-05-21: this document is retained for reproducibility and
+negative/diagnostic context only. It is superseded by
+`docs/mainline_lsf_20260521.md`. Protected descriptor residuals,
+SceneMatchNet, soft locability priors, quality gates, oracle ordering, and
+branch-selection variants described below are not the active paper-facing
+mainline unless they are rerun under the current LSF audit gates and promoted by
+a new full-split result.
 
 This note supersedes the static-prior and branch-selection direction. The
 implementation claim is:
@@ -69,12 +77,13 @@ region.
   vendored STDLoc implementation. These are now the required parity anchor
   before any Loc-GS contribution is evaluated.
 - `loc_gs.scripts.eval_cambridge_hybrid --selfmap_reliability_path ...`:
-  active unified route. A train-time self-map summary is converted to a
+  archived unified route. A train-time self-map summary is converted to a
   continuous reliability weight and softly scales LFF residuals, calibrated
   priors, match filters, and SceneMatchNet scores inside the same localization
   path.
 - Empirical control is `lff_residual_prosac`; `covisibility_prosac` is the
-  required STDLoc/PLY control, and hard branch selection is diagnostic only.
+  historical STDLoc/PLY control for this note, and hard branch selection is
+  diagnostic only.
 
 ## 2026-05-13 LFF Implementation Closure
 
@@ -85,7 +94,7 @@ The expert plan's architecture-level changes are now implemented at code level:
 | PLY/STDLoc descriptor trust region | `localization_descriptor_source=hybrid_ply_gated_residual`, alpha cap 0.03 in training launcher | full Cambridge: best current mean, 12.456 cm / 0.156 deg, R5 0.284 |
 | PnP-feedback scene-specific detector | `StdlocKeypointDetector` trained from `pnp_out["query_inlier_score"]`; launcher now initializes it from the STDLoc detector, anchors it to the initialization, and can train on the full-resolution dense feature canvas | full Cambridge: no mainline gain; mean 13.211 cm / 0.165 deg, R5 0.281 |
 | Query detector usable at test time | `--query_detector feedback --feedback_detector_full_res` in eval and calibration keeps the detector canvas aligned with STDLoc | parser/CLI tests pass |
-| Residual-only feature-field ablation | `lff_residual_prosac` uses `hybrid_ply_gated_residual` with the stable STDLoc detector, isolating protected descriptor residuals from feedback-detector failures | validated as the current default |
+| Residual-only feature-field ablation | `lff_residual_prosac` uses `hybrid_ply_gated_residual` with the stable STDLoc detector, isolating protected descriptor residuals from feedback-detector failures | archived ablation; not active mainline |
 | Pairwise matcher sees query detector confidence | pair cache writes `query_score`; `train_scene_matcher` trains with 5 scalar channels; eval passes `kp_scores` when checkpoint expects it | full Cambridge negative so far; w=0.35 and w=0.1 both trail residual |
 | LFF-distribution calibration | calibration launcher accepts fixed train/rendered pair budgets, `stdloc` or `feedback` detector, and residual descriptors | 50/50 train/rendered refined run completed; useful diagnostic but not mainline |
 | Single-path, no branch selection | all current recipes run one PROSAC path; multi-hypothesis pose selection remains archived | implemented |
@@ -221,9 +230,9 @@ Full Cambridge dense aggregate for the native-backed route:
 | Native STDLoc parity | 9.127 cm / 0.156 deg | 0.3712 | 0.1331 | source-of-truth baseline |
 | Soft locability, `prior_blend=0.25`, median-only rho | 9.139 cm / 0.156 deg | **0.3742** | 0.1307 | higher R5 but worse TE |
 | Soft locability, `prior_blend=0.1`, R5-tempered rho | 9.126 cm / 0.157 deg | 0.3727 | 0.1319 | safer R2 ablation |
-| Soft locability, `prior_blend=0.25`, R5-tempered rho | **9.124 cm / 0.157 deg** | 0.3731 | 0.1300 | current mainline |
+| Soft locability, `prior_blend=0.25`, R5-tempered rho | **9.124 cm / 0.157 deg** | 0.3731 | 0.1300 | archived ablation |
 
-Per-scene behavior for the current mainline:
+Per-scene behavior for the archived soft-locability ablation:
 
 | Scene | rho | Native dense | Soft dense | Delta R5 |
 | --- | ---: | ---: | ---: | ---: |
@@ -306,9 +315,8 @@ native STDLoc map.  With `rho=1`, `alpha=0.10`, and the same
 by `-0.148 cm TE`, `+0.0083 R5`, and `-0.0042 R2`. Increasing `alpha` to
 `0.30` or using a uniform gate was less stable. This is useful negative
 evidence: the strong self-map gain is not explained by a simple descriptor
-replacement. It depends on the localization-guided feature field and its
-query/render-time use, so the paper should keep the quality gate as the main
-method and the native export as a conservative compatibility ablation.
+replacement. Under the current LSF reset, this quality-gate result is retained
+as a diagnostic/teacher signal, not as the deployed main method.
 
 ## 2026-05-14 Self-Map Quality Gate Diagnostic
 
@@ -348,8 +356,8 @@ Full Cambridge dense aggregate:
 | Guarded train-view selector | 9.078 cm / 0.153 deg | 0.5742 | 0.3731 | 0.1331 |
 | Self-map quality gate | **8.682 cm / 0.151 deg** | **0.5947** | **0.4144** | **0.1459** |
 
-This is now the strongest paper-facing evidence, not merely an oracle over test
-queries. It uses a fixed rule on reconstruction-time self-localization results
+This was the strongest historical quality-gate diagnostic, not a deployed LSF
+method. It used a fixed rule on reconstruction-time self-localization results
 before real-query deployment:
 
 1. Generate candidate feature fields under fixed reconstruction recipes.
@@ -378,10 +386,9 @@ Self-map quality: 8.682 cm / 0.151 deg, R5 0.4144, R2 0.1459
 Delta:           -0.446 cm, -0.005 deg, +4.32 R5 points, +1.29 R2 points
 ```
 
-This is the current投稿级主线: reconstruction-time/self-map localization
-feedback chooses and validates the localization-oriented feature field before
-deployment; test-time localization still runs a single selected path, not
-per-query N-way pose selection.
+Under the current LSF reset, this remains diagnostic evidence for self-map
+feedback. It is not the active投稿级主线 because it selects among scene-level
+branches rather than exporting one solver-support field.
 
 ## Archived Or Diagnostic Routes
 
@@ -422,7 +429,7 @@ Metrics are dense-refined Cambridge test results; recalls are at 10 cm / 5 deg,
 | Variant | Role | Median cm | Median deg | R10 | R5 | R2 | sparse R5 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `covisibility_prosac` | STDLoc/PLY control | 12.603 | 0.159 | 0.485 | 0.278 | **0.086** | 0.195 |
-| `lff_residual_prosac` | current default | **12.456** | 0.156 | 0.485 | **0.284** | 0.085 | 0.196 |
+| `lff_residual_prosac` | historical residual default | **12.456** | 0.156 | 0.485 | **0.284** | 0.085 | 0.196 |
 | `lff_feedback_prosac` | feedback detector diagnostic | 13.211 | 0.165 | 0.470 | 0.281 | 0.078 | 0.193 |
 | `oracle_prosac` | GT sorting upper bound | 12.461 | **0.154** | **0.493** | 0.283 | 0.084 | **0.203** |
 | `scene_matcher_prosac`, beta=0.35 | 50/50 train/render SceneMatchNet | 12.766 | 0.159 | 0.477 | 0.275 | **0.086** | 0.200 |
@@ -430,8 +437,9 @@ Metrics are dense-refined Cambridge test results; recalls are at 10 cm / 5 deg,
 
 Interpretation:
 
-- The only learned component with a positive full-split mean is the protected
-  residual descriptor field.
+- In this archived run, the protected residual descriptor field was the only
+  learned component with a positive full-split mean. It is now an ablation, not
+  the active main method.
 - The refined feedback detector no longer catastrophically fails, but it still
   hurts the mean because GreatCourt/Kings remain weak.
 - Oracle ordering has small headroom; pure sorting/selector improvements cannot
@@ -449,7 +457,7 @@ three query shards over GPUs 0,1,2, and the same
 
 | Probe | Change | Median cm | Median deg | R10 | R5 | R2 | sparse R5 | Decision |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `lff_residual_prosac` | default alpha 0.03, reproj 8px | **12.456** | **0.156** | 0.485 | 0.284 | 0.085 | 0.196 | default |
+| `lff_residual_prosac` | historical default alpha 0.03, reproj 8px | **12.456** | **0.156** | 0.485 | 0.284 | 0.085 | 0.196 | archived ablation |
 | residual alpha 0.05 | wider trust region at eval only | 12.551 | 0.157 | 0.488 | **0.286** | 0.084 | 0.201 | recall ablation; not a clean default |
 | q-score 0.10 | add query keypoint confidence to match filtering | 12.481 | 0.159 | 0.488 | 0.281 | 0.085 | **0.203** | sparse/recall diagnostic |
 | q-score 0.25 | stronger query confidence prior | 12.509 | 0.163 | **0.493** | 0.277 | 0.088 | 0.196 | coarse-recall diagnostic |
@@ -474,36 +482,23 @@ Interpretation:
 
 ## Fixed Experiment Plan
 
-0. First freeze a clean STDLoc-native control path. Use
-   `loc_gs.scripts.eval_stdloc_native`, `loc_gs.scripts.train_stdloc_native`,
-   and `loc_gs.scripts.launch_stdloc_native_cambridge` to run the
-   source-of-truth STDLoc flow from `third_party/stdloc`; keep matchability,
-   SceneMatcher, calibrated priors, and residual descriptor branches out of
-   this baseline.
-1. Keep `covisibility_prosac` as the STDLoc/PLY control and
-   `lff_residual_prosac` as the current empirical default.
-2. Report `lff_feedback_prosac` as a detector-feedback ablation, not the main
-   method, until it improves GreatCourt/Kings under the same fixed recipe.
-3. Use `oracle_prosac` to show the headroom of sorting existing matches. The
-   current small gap means future gains must come from better candidate
-   generation, descriptors, or dense refinement, not only PROSAC priority.
-4. Keep SceneMatchNet experiments, but change the next version before claiming
-   it: split train/render validation, learn a calibrated ranking loss, and
-   constrain it to a weak prior unless full Cambridge improves.
-5. Use rendered perturbed/interpolated views for coverage analysis and
-   hard-negative mining. Do not directly mix them into pair training as a
-   default unless a full fixed-recipe Cambridge table beats the residual
-   default.
+This fixed experiment plan is archived. The active LSF plan is:
+
+0. Keep the vendored native STDLoc path as the parity control.
+1. Require `feedback_bank_v2` with real query/image/keypoint identity, dense
+   transition supervision, and a passed split audit before training or exporting
+   a paper-facing LSF candidate.
+2. Use solver-tuple diagnostics to show why support count and unary
+   matchability are insufficient.
+3. Implement solver-admissible, same-budget landmark sampling with hard-query
+   tuple mass/logdet and ambiguity constraints.
+4. Treat dense LSF targets as dense residual support teachers, not sparse
+   selectors by themselves.
+5. Validate one fixed recipe on train-dev/hard-scene gates before any full/test
+   Cambridge promotion.
 
 ## Immediate Success Criteria
 
-The next paper-grade milestone is either:
-
-- a full Cambridge table where the residual default beats the local STDLoc/PLY
-  reproduction by a meaningful margin and can be explained as localization
-  feedback inside a descriptor trust region; or
-- a revised matcher/detector table that improves both median and strict recall
-  over `lff_residual_prosac` using one fixed recipe across all scenes.
-
-Until then, the project is implementation-complete for the expert plan but not
-yet SOTA-complete.
+The next paper-grade milestone is a full Cambridge table for one audited
+LSF-Loc recipe that improves native STDLoc parity while preserving the
+single-path OpenCV PROSAC/RANSAC PnP and STDLoc-style dense refinement backend.

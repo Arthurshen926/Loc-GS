@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from loc_gs.feedback.audit import audit_feedback_bank_v2
 from loc_gs.feedback.io import save_feedback_bank, summarize_feedback_bank
 from loc_gs.feedback.labels import derive_scene_reliability_baseline_relative
 from loc_gs.feedback.schema import FeedbackMatchRecord
@@ -82,6 +83,51 @@ def _scalar(value: Any) -> float | None:
     return out if math.isfinite(out) else None
 
 
+def _reprojection_value(value: Any) -> float:
+    out = _scalar(value)
+    return float(out) if out is not None else float("inf")
+
+
+def _string_sequence(payload: dict[str, Any], keys: tuple[str, ...], count: int) -> list[str] | None:
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if torch.is_tensor(value):
+            flat = value.detach().cpu().reshape(-1).tolist()
+            if len(flat) != int(count):
+                raise ValueError(f"{key} must have {count} values")
+            return [str(int(item)) if isinstance(item, (int, float)) and float(item).is_integer() else str(item) for item in flat]
+        if isinstance(value, (list, tuple)):
+            if len(value) != int(count):
+                raise ValueError(f"{key} must have {count} values")
+            return [str(item) for item in value]
+        if isinstance(value, str) and int(count) == 1:
+            return [value]
+        raise TypeError(f"{key} must be a tensor, list, tuple, or single string")
+    return None
+
+
+def _float_sequence(payload: dict[str, Any], keys: tuple[str, ...], count: int) -> list[float | None] | None:
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if torch.is_tensor(value):
+            flat = value.detach().cpu().reshape(-1)
+            if flat.numel() != int(count):
+                raise ValueError(f"{key} must have {count} values")
+            return [_scalar(item) for item in flat]
+        if isinstance(value, (list, tuple)):
+            if len(value) != int(count):
+                raise ValueError(f"{key} must have {count} values")
+            return [_scalar(item) for item in value]
+        if int(count) == 1:
+            return [_scalar(value)]
+        raise TypeError(f"{key} must be a tensor, list, or tuple")
+    return None
+
+
 def _dense_pose_metrics(summary_path: str | Path) -> dict[str, float | None]:
     summary = summarize_path(summary_path)
     dense = summary.get("dense", {})
@@ -91,6 +137,102 @@ def _dense_pose_metrics(summary_path: str | Path) -> dict[str, float | None]:
         "pose_error_t_cm": _scalar(dense.get("median_te_cm")),
         "pose_error_r_deg": _scalar(dense.get("median_re_deg")),
     }
+
+
+def _load_dense_transition_labels(path: str | Path) -> dict[str, dict[str, Any]]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    labels = payload.get("labels") if isinstance(payload, dict) else None
+    if not isinstance(labels, list):
+        raise ValueError(f"dense transition labels must contain a labels list: {path}")
+    index: dict[str, dict[str, Any]] = {}
+    for item in labels:
+        if not isinstance(item, dict):
+            continue
+        query_id = str(item.get("query_id", item.get("image_id", ""))).strip()
+        if not query_id:
+            continue
+        transition = str(item.get("pose_transition", item.get("dense_transition", ""))).strip()
+        delta = _scalar(item.get("dense_minus_sparse_te_cm", item.get("dense_delta_te_cm")))
+        index[query_id] = {
+            "dense_transition": transition,
+            "dense_delta_te_cm": delta,
+        }
+    return index
+
+
+def _label_key_variants(value: str) -> list[str]:
+    text = str(value)
+    base = text.split("::", 1)[0]
+    variants = [text, base]
+    for item in list(variants):
+        if item.startswith("rendered_from:"):
+            variants.append(item.split(":", 1)[1])
+    out: list[str] = []
+    for item in variants:
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def _synthetic_profile_label_key(value: str) -> bool:
+    text = str(value)
+    return text.startswith("query_") and text.removeprefix("query_").isdigit()
+
+
+def _augment_synthetic_dense_labels_by_record_order(
+    labels: dict[str, dict[str, Any]],
+    records: list[FeedbackMatchRecord],
+) -> dict[str, dict[str, Any]]:
+    """Map legacy query_000xxx profile labels onto real image ids.
+
+    Older native profile sidecars store dense transition labels by positional
+    keys only.  Newly generated v2 pair caches carry real image ids; when the
+    labels are purely positional, align them to the first-seen real image order
+    in the records.  This keeps v2 dense supervision explicit without relaxing
+    the "every record has a dense label" guard.
+    """
+
+    synthetic_items = [
+        (key, value)
+        for key, value in labels.items()
+        if _synthetic_profile_label_key(key)
+    ]
+    if not synthetic_items or len(synthetic_items) != len(labels):
+        return labels
+
+    ordered_images: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        for variant in _label_key_variants(str(record.image_id)):
+            if variant.startswith("rendered_from:"):
+                continue
+            image_id = variant.split("::", 1)[0]
+            if image_id and image_id not in seen:
+                seen.add(image_id)
+                ordered_images.append(image_id)
+            break
+
+    augmented = dict(labels)
+    for image_id, (_, label) in zip(ordered_images, synthetic_items):
+        augmented.setdefault(image_id, label)
+        augmented.setdefault(f"rendered_from:{image_id}", label)
+    return augmented
+
+
+def _apply_dense_transition_labels(records: list[FeedbackMatchRecord], path: str | Path) -> None:
+    labels = _augment_synthetic_dense_labels_by_record_order(
+        _load_dense_transition_labels(path),
+        records,
+    )
+    for record in records:
+        keys = _label_key_variants(str(record.query_id)) + _label_key_variants(str(record.image_id))
+        match = next((labels[key] for key in keys if key in labels), None)
+        if match is None:
+            continue
+        if not record.dense_transition:
+            record.dense_transition = str(match.get("dense_transition", ""))
+        if record.dense_delta_te_cm is None:
+            record.dense_delta_te_cm = _scalar(match.get("dense_delta_te_cm"))
 
 
 def _gaussian_id(
@@ -132,6 +274,7 @@ def _listwise_records(
     source_view_id: str,
     pose_source: str,
     pose_metrics: dict[str, float | None],
+    schema_version: str = "feedback_bank_v1",
 ) -> list[FeedbackMatchRecord]:
     cosine = _tensor(payload, "cosine")
     label = _tensor(payload, "label")
@@ -151,9 +294,16 @@ def _listwise_records(
     query_score = _tensor(payload, "query_score", torch.ones(num_queries)).float().reshape(-1)
     landmark_prior = _tensor(payload, "landmark_prior", torch.zeros_like(cosine)).float()
     query_yx = _tensor(payload, "query_yx")
+    query_ids = _string_sequence(payload, ("query_id", "query_ids"), num_queries)
+    image_ids = _string_sequence(payload, ("image_id", "image_ids", "query_image_id", "image_name"), num_queries)
+    keypoint_ids = _string_sequence(payload, ("keypoint_id", "keypoint_ids"), num_queries)
+    dense_transitions = _string_sequence(payload, ("dense_transition", "dense_transitions"), num_queries)
+    dense_deltas = _float_sequence(payload, ("dense_delta_te_cm", "dense_delta_te", "dense_minus_sparse_te_cm"), num_queries)
+    if schema_version == "feedback_bank_v2" and (query_ids is None or image_ids is None or keypoint_ids is None):
+        raise ValueError("feedback_bank_v2 export requires query_id, image_id, and keypoint_id fields in the pair cache")
     records: list[FeedbackMatchRecord] = []
     for row in range(num_queries):
-        query_id = f"query_{row:06d}"
+        query_id = query_ids[row] if query_ids is not None else f"query_{row:06d}"
         label_idx = int(labels[row].item())
         pnp_success = 0 <= label_idx < topk
         for col in range(topk):
@@ -166,8 +316,10 @@ def _listwise_records(
                     {
                         "scene": scene,
                         "query_id": query_id,
+                        "image_id": "" if image_ids is None else image_ids[row],
                         "source_view_id": source_view_id,
                         "pose_source": pose_source,
+                        "keypoint_id": "" if keypoint_ids is None else keypoint_ids[row],
                         "keypoint_xy": _query_xy(query_yx, row),
                         "matched_landmark_id": str(landmark_id),
                         "matched_gaussian_id": _gaussian_id(
@@ -188,6 +340,8 @@ def _listwise_records(
                         "pose_error_r_deg": pose_metrics["pose_error_r_deg"],
                         "pnp_success": pnp_success,
                         "dense_refine_success": pose_metrics["pose_error_t_cm"] is not None,
+                        "dense_transition": "" if dense_transitions is None else dense_transitions[row],
+                        "dense_delta_te_cm": None if dense_deltas is None else dense_deltas[row],
                     }
                 )
             )
@@ -201,6 +355,7 @@ def _pairwise_records(
     source_view_id: str,
     pose_source: str,
     pose_metrics: dict[str, float | None],
+    schema_version: str = "feedback_bank_v1",
 ) -> list[FeedbackMatchRecord]:
     label = _tensor(payload, "label")
     if label is None:
@@ -211,6 +366,13 @@ def _pairwise_records(
     query_score = _tensor(payload, "query_score", torch.ones(count)).float().reshape(-1)
     landmark_prior = _tensor(payload, "landmark_prior", torch.zeros(count)).float().reshape(-1)
     landmark_ids = _tensor(payload, "landmark_id", torch.arange(count, dtype=torch.long)).long().reshape(-1)
+    query_ids = _string_sequence(payload, ("query_id", "query_ids"), count)
+    image_ids = _string_sequence(payload, ("image_id", "image_ids", "query_image_id", "image_name"), count)
+    keypoint_ids = _string_sequence(payload, ("keypoint_id", "keypoint_ids"), count)
+    dense_transitions = _string_sequence(payload, ("dense_transition", "dense_transitions"), count)
+    dense_deltas = _float_sequence(payload, ("dense_delta_te_cm", "dense_delta_te", "dense_minus_sparse_te_cm"), count)
+    if schema_version == "feedback_bank_v2" and (query_ids is None or image_ids is None or keypoint_ids is None):
+        raise ValueError("feedback_bank_v2 export requires query_id, image_id, and keypoint_id fields in the pair cache")
     records: list[FeedbackMatchRecord] = []
     for idx in range(count):
         landmark_id = int(landmark_ids[idx].item()) if landmark_ids.numel() > idx else idx
@@ -219,9 +381,11 @@ def _pairwise_records(
             FeedbackMatchRecord.from_mapping(
                 {
                     "scene": scene,
-                    "query_id": f"pair_{idx:06d}",
+                    "query_id": query_ids[idx] if query_ids is not None else f"pair_{idx:06d}",
+                    "image_id": "" if image_ids is None else image_ids[idx],
                     "source_view_id": source_view_id,
                     "pose_source": pose_source,
+                    "keypoint_id": "" if keypoint_ids is None else keypoint_ids[idx],
                     "keypoint_xy": [None, None],
                     "matched_landmark_id": str(landmark_id),
                     "matched_gaussian_id": _gaussian_id(payload, landmark_id=landmark_id, flat_index=idx),
@@ -229,13 +393,15 @@ def _pairwise_records(
                     "detector_score": _scalar(query_score[idx]) if query_score.numel() > idx else None,
                     "match_rank": 1,
                     "pnp_inlier": inlier,
-                    "reprojection_error_px": 0.0 if inlier else None,
+                    "reprojection_error_px": 0.0 if inlier else _reprojection_value(None),
                     "depth_consistency": None,
                     "visibility_score": _scalar(landmark_prior[idx]) if landmark_prior.numel() > idx else None,
                     "pose_error_t_cm": pose_metrics["pose_error_t_cm"],
                     "pose_error_r_deg": pose_metrics["pose_error_r_deg"],
                     "pnp_success": inlier,
                     "dense_refine_success": pose_metrics["pose_error_t_cm"] is not None,
+                    "dense_transition": "" if dense_transitions is None else dense_transitions[idx],
+                    "dense_delta_te_cm": None if dense_deltas is None else dense_deltas[idx],
                 }
             )
         )
@@ -247,6 +413,7 @@ def load_pair_cache_records(
     *,
     scene: str,
     selfmap_summary: str | Path,
+    schema_version: str = "feedback_bank_v1",
 ) -> tuple[list[FeedbackMatchRecord], dict[str, Any]]:
     path = Path(pair_cache)
     if not path.exists():
@@ -267,6 +434,7 @@ def load_pair_cache_records(
             source_view_id=source_view_id,
             pose_source=pose_source,
             pose_metrics=pose_metrics,
+            schema_version=schema_version,
         )
     else:
         records = _pairwise_records(
@@ -275,6 +443,7 @@ def load_pair_cache_records(
             source_view_id=source_view_id,
             pose_source=pose_source,
             pose_metrics=pose_metrics,
+            schema_version=schema_version,
         )
     return records, metadata
 
@@ -306,13 +475,28 @@ def export_feedback_bank(args: argparse.Namespace) -> dict[str, Any]:
         args.pair_cache,
         scene=args.scene,
         selfmap_summary=args.selfmap_summary,
+        schema_version=args.schema_version,
     )
+    split_audit = pair_metadata.get("split_audit", {})
+    if args.split_audit_json:
+        split_audit = json.loads(Path(args.split_audit_json).read_text(encoding="utf-8"))
+    if args.dense_transition_labels:
+        _apply_dense_transition_labels(records, args.dense_transition_labels)
+    if str(args.schema_version) == "feedback_bank_v2":
+        if not isinstance(split_audit, dict) or split_audit.get("audit_status") != "passed":
+            raise ValueError("feedback_bank_v2 export requires a passed split_audit")
+        if any(not record.dense_transition and record.dense_delta_te_cm is None for record in records):
+            raise ValueError("feedback_bank_v2 export requires dense_transition or dense_delta_te_cm for every record")
     manifest: dict[str, Any] = {
         "scene": args.scene,
         "split_name": args.split_name,
+        "schema_version": args.schema_version,
+        "query_id_source": args.query_id_source,
+        "split_audit": split_audit,
         "pair_cache": str(args.pair_cache),
         "selfmap_summary": str(args.selfmap_summary),
         "baseline_summary": str(args.baseline_summary),
+        "dense_transition_labels": str(args.dense_transition_labels),
         "pair_cache_metadata": pair_metadata,
         "source": "export_feedback_bank_from_cambridge",
         "git_commit": _git_commit(),
@@ -326,6 +510,10 @@ def export_feedback_bank(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     save_feedback_bank(paths["feedback_bank"], records, manifest)
+    if str(args.schema_version) == "feedback_bank_v2":
+        audit = audit_feedback_bank_v2(paths["feedback_bank"])
+        if audit["audit_status"] != "passed":
+            raise ValueError(f"exported feedback_bank_v2 failed audit: {audit['reasons']}")
     summary = summarize_feedback_bank(paths["feedback_bank"])
     paths["output_dir"].mkdir(parents=True, exist_ok=True)
     paths["feedback_summary"].write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -349,6 +537,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--split_name", required=True)
     parser.add_argument("--baseline_summary", default="")
+    parser.add_argument("--schema_version", default="feedback_bank_v1", choices=("feedback_bank_v1", "feedback_bank_v2"))
+    parser.add_argument("--query_id_source", default="image_id")
+    parser.add_argument("--split_audit_json", default="")
+    parser.add_argument("--dense_transition_labels", default="")
     parser.add_argument("--dry_run", action="store_true")
     return parser
 

@@ -1500,6 +1500,9 @@ def test_write_resampled_detector_payload_does_not_mutate_symlink_targets(tmp_pa
             "sampled_scores": torch.tensor([0.9, 0.8], dtype=torch.float32),
             "score_avg": torch.tensor([0.1, 0.8, 0.9], dtype=torch.float32),
             "selector": torch.tensor([0.2, 0.3, 0.4], dtype=torch.float32),
+            "source_count": 3,
+            "output_count": 2,
+            "sampled_idx_changed": True,
         },
     )
 
@@ -1507,7 +1510,12 @@ def test_write_resampled_detector_payload_does_not_mutate_symlink_targets(tmp_pa
         source_idx = pickle.load(handle)
     with (output / "sampled_idx.pkl").open("rb") as handle:
         output_idx = pickle.load(handle)
+    with (output / "sampled_scores.pkl").open("rb") as handle:
+        output_scores = pickle.load(handle)
     assert not (output / "sampled_idx.pkl").is_symlink()
     assert not (output / "sampled_scores.pkl").is_symlink()
     assert source_idx.tolist() == [0, 1, 2]
     assert output_idx.tolist() == [2, 1]
+    assert output_scores["source_count"] == 3
+    assert output_scores["output_count"] == 2
+    assert output_scores["sampled_idx_changed"] is True

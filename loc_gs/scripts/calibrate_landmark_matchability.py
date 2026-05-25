@@ -145,6 +145,44 @@ def attach_listwise_landmark_bank(
     metadata["base_descriptor_dim"] = int(desc.shape[1])
 
 
+def make_pair_cache_row_identity(
+    *,
+    image_id: str,
+    keypoint_indices: torch.Tensor,
+    phase: str,
+) -> dict[str, list[str]]:
+    """Create per-row identity fields for feedback_bank_v2-compatible pair caches."""
+
+    image = str(image_id)
+    phase_name = str(phase)
+    indices = torch.as_tensor(keypoint_indices, dtype=torch.long).detach().cpu().reshape(-1).tolist()
+    keypoint_ids = [f"kp_{int(index):06d}" for index in indices]
+    return {
+        "query_id": [f"{image}::{keypoint_id}" for keypoint_id in keypoint_ids],
+        "image_id": [image for _ in keypoint_ids],
+        "keypoint_id": keypoint_ids,
+        "source_phase": [phase_name for _ in keypoint_ids],
+    }
+
+
+def select_scene_match_group_indices(
+    group_score: torch.Tensor,
+    *,
+    remaining: int,
+    max_per_image: int = 0,
+) -> torch.Tensor:
+    """Select top-scoring query groups with an optional per-image cap."""
+
+    scores = torch.as_tensor(group_score).float().reshape(-1)
+    limit = max(0, int(remaining))
+    per_image = int(max_per_image)
+    if per_image > 0:
+        limit = min(limit, per_image)
+    if scores.numel() == 0 or limit <= 0:
+        return torch.empty((0,), dtype=torch.long, device=scores.device)
+    return torch.argsort(scores, descending=True)[:limit]
+
+
 def _read_cambridge_split_image_ids(scene_root: str | Path, split: str) -> list[str] | None:
     path = Path(scene_root) / ("dataset_test.txt" if str(split) == "test" else "dataset_train.txt")
     if not path.exists():
@@ -312,6 +350,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--scene_match_pair_output_path", default="")
     parser.add_argument("--scene_match_pair_format", choices=["pair", "listwise"], default="pair")
     parser.add_argument("--scene_match_pair_sample_limit", type=int, default=200000)
+    parser.add_argument(
+        "--scene_match_pair_max_per_image",
+        type=int,
+        default=0,
+        help="Optional cap on pair-cache rows contributed by each source image; 0 preserves natural filling.",
+    )
     parser.add_argument(
         "--scene_match_pair_train_fraction",
         type=float,
@@ -506,7 +550,22 @@ def main(args: argparse.Namespace | None = None) -> None:
             "landmark_prior": [],
             "label": [],
         }
+    pair_identity_chunks: dict[str, list[str]] = {
+        "query_id": [],
+        "image_id": [],
+        "keypoint_id": [],
+        "source_phase": [],
+    }
     pair_sample_count = 0
+
+    def append_pair_identity(*, phase: str, source_image_id: str, keypoint_indices: torch.Tensor) -> None:
+        identity = make_pair_cache_row_identity(
+            image_id=str(source_image_id),
+            keypoint_indices=keypoint_indices,
+            phase=str(phase),
+        )
+        for key, values in identity.items():
+            pair_identity_chunks[key].extend(values)
 
     def should_collect_scene_match_pairs(phase: str) -> bool:
         if not collect_scene_pairs:
@@ -527,6 +586,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         labels: torch.Tensor,
         margins: torch.Tensor,
         query_scores_all: torch.Tensor | None = None,
+        source_image_id: str = "",
     ) -> None:
         nonlocal pair_sample_count
         phase = str(phase)
@@ -537,6 +597,11 @@ def main(args: argparse.Namespace | None = None) -> None:
         if not should_collect_scene_match_pairs(phase):
             return
         remaining = phase_limit - phase_count
+        per_image_cap = int(getattr(args, "scene_match_pair_max_per_image", 0))
+        if per_image_cap > 0:
+            remaining = min(remaining, per_image_cap)
+        if remaining <= 0:
+            return
         labels = labels.bool().reshape(-1)
         scores = scores.float().reshape(-1)
         pos = torch.where(labels)[0]
@@ -553,6 +618,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         keep = torch.cat(selected, dim=0)
         if keep.numel() > remaining:
             keep = keep[:remaining]
+        append_pair_identity(phase=phase, source_image_id=source_image_id, keypoint_indices=q_ids[keep])
         pair_chunks["query_desc"].append(query_desc_all[q_ids[keep]].detach().cpu().half())
         pair_chunks["landmark_desc"].append(landmark_desc[lm_ids[keep]].detach().cpu().half())
         pair_chunks["cosine"].append(scores[keep].detach().cpu().float())
@@ -580,6 +646,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         margins: torch.Tensor,
         query_yx_all: torch.Tensor | None = None,
         query_scores_all: torch.Tensor | None = None,
+        source_image_id: str = "",
     ) -> None:
         nonlocal pair_sample_count
         phase = str(phase)
@@ -595,7 +662,14 @@ def main(args: argparse.Namespace | None = None) -> None:
         group_score = scores_topk.float().amax(dim=1)
         if labels.numel() == 0:
             return
-        keep = torch.argsort(group_score, descending=True)[:remaining]
+        keep = select_scene_match_group_indices(
+            group_score,
+            remaining=remaining,
+            max_per_image=int(getattr(args, "scene_match_pair_max_per_image", 0)),
+        )
+        if keep.numel() == 0:
+            return
+        append_pair_identity(phase=phase, source_image_id=source_image_id, keypoint_indices=keep)
         if query_scores_all is None:
             query_scores = torch.ones(query_desc_all.shape[0], device=scores_topk.device, dtype=scores_topk.dtype)
         else:
@@ -628,6 +702,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         query_scores: torch.Tensor | None = None,
         depth_map: torch.Tensor | None = None,
         alpha_map: torch.Tensor | None = None,
+        source_image_id: str = "",
     ) -> None:
         if query_desc.numel() == 0:
             return
@@ -668,6 +743,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 margins=margin_by_query,
                 query_yx_all=query_yx,
                 query_scores_all=query_scores,
+                source_image_id=source_image_id,
             )
         elif should_collect_scene_match_pairs(phase):
             pair_labels = label_scene_match_pairs(
@@ -693,6 +769,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 labels=pair_labels,
                 margins=margin_by_query[q_ids],
                 query_scores_all=query_scores,
+                source_image_id=source_image_id,
             )
         accumulate_matchability_counts(
             tp,
@@ -802,6 +879,7 @@ def main(args: argparse.Namespace | None = None) -> None:
             query_scores=_scores,
             depth_map=depth_map,
             alpha_map=alpha_map,
+            source_image_id=str(item["image_name"]),
         )
 
     rendered_rehearsal_views = max(0, int(args.rendered_rehearsal_views))
@@ -940,6 +1018,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 query_scores=_scores,
                 depth_map=depth_map,
                 alpha_map=alpha_map,
+                source_image_id=f"rendered_from:{item['image_name']}",
             )
 
     matchability = matchability_from_counts(tp, fp, alpha=args.smoothing_alpha)
@@ -1009,14 +1088,21 @@ def main(args: argparse.Namespace | None = None) -> None:
             key: torch.cat(chunks, dim=0) if chunks else torch.empty(0)
             for key, chunks in pair_chunks.items()
         }
+        for key, values in pair_identity_chunks.items():
+            pair_payload[key] = list(values)
         pair_payload["metadata"] = {
             "scene": scene,
             "checkpoint": str(args.checkpoint),
             "samples": int(pair_sample_count),
             "sample_limit": int(pair_sample_limit),
+            "max_per_image": int(args.scene_match_pair_max_per_image),
             "train_fraction": float(args.scene_match_pair_train_fraction),
             "format": pair_format,
-            "selection": "query_topk_score_natural" if pair_format == "listwise" else "balanced_pair_score",
+            "selection": (
+                "query_topk_score_per_image_capped"
+                if pair_format == "listwise" and int(args.scene_match_pair_max_per_image) > 0
+                else ("query_topk_score_natural" if pair_format == "listwise" else "balanced_pair_score")
+            ),
             "phase_limits": {key: int(value) for key, value in pair_phase_limits.items()},
             "phase_counts": {key: int(value) for key, value in pair_phase_counts.items()},
             "topk": int(args.topk),

@@ -61,6 +61,33 @@ def test_build_clean_detector_source_map_replaces_polluted_detector_with_rebuilt
     assert manifest["single_path_deployment"] is True
 
 
+def test_build_clean_detector_source_map_rejects_source_as_output_without_deleting_it(tmp_path):
+    source = tmp_path / "source"
+    detector = source / "detector"
+    rebuilt = source / "detector_rebuilt_16384"
+    detector.mkdir(parents=True)
+    rebuilt.mkdir(parents=True)
+    _dump_pickle(detector / "sampled_idx.pkl", torch.tensor([9], dtype=torch.long))
+    _dump_pickle(detector / "sampled_scores.pkl", {"sampled_scores": torch.tensor([9.0])})
+    _dump_pickle(rebuilt / "sampled_idx.pkl", torch.tensor([1, 2], dtype=torch.long))
+    _dump_pickle(rebuilt / "sampled_scores.pkl", {"sampled_scores": torch.tensor([0.1, 0.2])})
+
+    try:
+        build_clean_detector_source_map(
+            source_map=source,
+            rebuilt_detector_dir=rebuilt,
+            output_map=source,
+            scene="Scene",
+        )
+    except ValueError as exc:
+        assert "must differ" in str(exc)
+    else:
+        raise AssertionError("source/output equality should be rejected")
+
+    assert (source / "detector" / "sampled_idx.pkl").exists()
+    assert (rebuilt / "sampled_idx.pkl").exists()
+
+
 def test_build_clean_detector_source_map_preserves_source_detector_weights_when_rebuilt_payload_is_scores_only(tmp_path):
     source = tmp_path / "source"
     detector = source / "detector"

@@ -1,15 +1,22 @@
 # Loc-GS
 
-Localization-Oriented Gaussian Feature Fields for Accurate Camera Relocalization.
+Solvability-Guided Localization Support Fields for 3D Gaussian Relocalization.
 
-Loc-GS is an independent split of the SuperPoint feature-field and localization-guided reconstruction work. The repository is scoped to one main line:
+Loc-GS is an independent Cambridge/STDLoc research workspace.  The repository
+is being reset to one paper-facing line:
 
 ```text
-SuperPoint teacher features
-  -> low-dimensional per-Gaussian latent feature field
-  -> decoded descriptor and detector maps at novel views
-  -> geometry-aware matching and PnP camera relocalization
+STDLoc native Feature Gaussian map
+  -> audited train/rendered self-localization feedback
+  -> Localization Support Field for sparse landmarks, solver tuples, and dense residuals
+  -> STDLoc-compatible sampled landmarks and support masks
+  -> one OpenCV PROSAC/RANSAC PnP + STDLoc-style dense refinement path
 ```
+
+The core claim under development is **from matchability to solvability**:
+point-wise matchability and support count are insufficient proxies for PnP
+success, so landmark and dense residual selection should be guided by solver
+conditioning, hard-query risk, ambiguity, and dense-refinement reliability.
 
 The earlier RADIO feature reconstruction, open-vocabulary scene understanding, segmentation, depth-head, and grounding experiment entry points have been removed from the public workflow.
 
@@ -17,10 +24,11 @@ The earlier RADIO feature reconstruction, open-vocabulary scene understanding, s
 
 - SuperPoint descriptor and detector extraction.
 - Hybrid Gaussian feature-field training for SuperPoint reconstruction.
-- Localization-guided training losses with differentiable matching, reprojection proxy, observability, and per-Gaussian locability.
+- Localization-guided training losses with differentiable matching, reprojection proxy, observability, and support-field diagnostics.
 - SuperPoint reconstruction evaluation, localization evaluation, and qualitative visualization.
 - Minimal 3DGS asset preparation helpers.
 - A vendored STDLoc copy under `third_party/stdloc` for Cambridge localization experiments and reproducibility.
+- Feedback-bank-v2, solver-tuple, and dense-support diagnostics for LSF-Loc.
 
 ## Repository Layout
 
@@ -118,173 +126,80 @@ cd third_party/stdloc
 
 Large STDLoc maps, logs, and results are kept under `output/stdloc/` for reproducibility. The legacy paths under `third_party/stdloc/` are relative symlinks back to `output/stdloc/` so existing STDLoc commands keep working.
 
-## Cambridge Hybrid Localization
+## LSF-Loc Cambridge Mainline
 
-The stronger Cambridge research path now lives in native `loc_gs` code:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m loc_gs.scripts.train_cambridge_hybrid \
-  --scene ShopFacade \
-  --image_width 640 --image_height 360 \
-  --epochs 20 \
-  --output_dir output/stdloc_hybrid/ShopFacade
-
-CUDA_VISIBLE_DEVICES=0 python -m loc_gs.scripts.eval_cambridge_hybrid \
-  --checkpoint output/stdloc_hybrid/ShopFacade/latest.pth \
-  --landmark_source rendered \
-  --output_dir output/stdloc_hybrid/ShopFacade/eval
-```
-
-See `docs/cambridge_hybrid_localization.md` for implementation status and
-`docs/loc_gs_lff_scenematch_mainline_20260512.md` for the active paper-facing
-mainline. Branch selection, static calibrated matchability, hard landmark
-selection, and LoFTR replacement routes are archived in
-`docs/archive/static_prior_branch_selection_20260512.md`; keep them as
-diagnostic ablations, not as the primary method.
-
-The current clean mainline is baseline-preserving and single-path, but it has
-shifted from descriptor residuals to a localization-aware sampling field:
+The active Cambridge research path is **LSF-Loc: solvability-guided
+localization support fields for 3D Gaussian relocalization**.  The claim is not
+descriptor replacement.  The claim is that 3DGS localization feature selection
+must be optimized for the geometric solver, not only for point-wise
+matchability or support count.
 
 ```text
-STDLoc/PLY descriptor backbone
-  -> virtual self-localization feedback
-  -> unified localization utility / selector / sampling field
-  -> STDLoc-compatible native-descriptor map export
-  -> one OpenCV PROSAC PnP path
+STDLoc native Feature Gaussian map
+  -> train/rendered self-localization feedback_bank_v2
+  -> solver-consensus support estimation
+  -> solvability-aware landmark sampling
+  -> support-consistent dense residual verification
+  -> one STDLoc-compatible sparse-to-dense inference path
+```
+
+The deployed query path must remain fixed:
+
+```text
+query image
+  -> native STDLoc feature extraction and matching
+  -> OpenCV PROSAC/RANSAC PnP
   -> STDLoc-style dense refinement
+  -> final pose
 ```
 
-The active 2026-05-16 paper story is reconstruction-time/self-localization
-feedback distilled into a localization utility field, not inference-time
-multi-path pose selection and not descriptor replacement. The current clean
-candidate is `selector005_native_desc`: native STDLoc descriptors are kept
-unchanged, while the learned selector is exported into locability and detector
-score payloads. Full Cambridge dense metrics move from
-`12.5725cm / 0.1578deg, R5 0.2776, R2 0.0848` to
-`12.4238cm / 0.1593deg, R5 0.2815, R2 0.0879`. This is positive but still
-small; it supports the selector/sampling-field direction, not a strong SOTA
-claim.
+The active implementation note is `docs/mainline_lsf_20260521.md`.  The
+paper-safety contract is `docs/research_contract.md`, and split/evaluation
+rules are in `docs/experiment_protocol.md`.
 
-The next structural step is selector-guided landmark resampling under the same
-landmark budget, so the learned field changes `sampled_idx.pkl` rather than only
-nudging existing `sampled_scores.pkl`. Residual descriptor reconstruction,
-SceneMatchNet, quality gates, and LoFTR replacements are diagnostics or
-ablations unless future full-split, paper-audited results promote them.
+### Method Modules
+
+LSF-Loc is organized into three modules:
+
+- **Solver-consensus support estimation:** build `feedback_bank_v2` from
+  training, calibration, or rendered self-localization episodes with real
+  `query_id`, `image_id`, `keypoint_id`, PnP inliers, reprojection errors, and
+  dense transition labels.
+- **Solvability-aware landmark sampling:** generate STDLoc-compatible
+  `sampled_idx.pkl`, `sampled_scores.pkl`, and locability payloads using
+  hard-query tuple quality, pose-information proxies, ambiguity risk, and
+  same-budget replacement constraints.
+- **Support-consistent dense verification:** use LSF support as a dense
+  residual reliability signal to reduce cases where dense refinement worsens a
+  valid sparse pose.
+
+### Baselines And Diagnostics
+
+Native STDLoc through `third_party/stdloc` and
+`loc_gs.stdloc_native.commands` is the Cambridge baseline.  Feedback-disabled
+settings must reproduce native STDLoc parity before any Loc-GS contribution is
+claimed.
+
+The following lines are not the main method unless a future full-split,
+paper-audited result promotes them: residual descriptor reconstruction,
+SceneMatchNet, LoFTR or DIM replacement, quality gates, oracle ordering,
+per-query or scene-level branch selection, qcov/churn/retention scalar sweeps,
+support-count guards, and raw dense locability priors.  They may be kept only
+as diagnostics, ablations, or negative evidence.
+
+### Safe Entry Points
+
+Use `locgsctl` before writing long Cambridge commands by hand:
 
 ```bash
-/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_stdloc_native_soft_prior_cambridge \
-  --scenes GreatCourt KingsCollege OldHospital ShopFacade StMarysChurch \
-  --gpus 0 1 2 \
-  --source_map_root output/stdloc/map_cambridge_spgs \
-  --map_name_overrides GreatCourt=GreatCourt_stream_stable2 StMarysChurch=StMarysChurch_stream_fastsave \
-  --calibrated_matchability_template 'output/stdloc_hybrid/listwise_v4_verifier_20260514/calibration/{scene}/stdloc_bank_query_like.pt' \
-  --selfmap_reliability_template 'output/stdloc_hybrid/{scene}_lff_refined_20260513/eval_unified_soft_selfmap_calib_train_stride4_20260514_scene_matcher_residual_prosac/summary.json'
+/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.locgsctl status
+/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.locgsctl list-scenes
+/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.locgsctl smoke --scene ShopFacade --dry-run
 ```
 
-The quality gate is not per-query branching: real query localization still runs
-one selected model/path. Its role is closer to validation-time reconstruction
-model selection, except the validation signal is generated by 3DGS self-rendered
-and self-localized views, which is exactly the localization-guided
-reconstruction claim.
-
-Follow-up full-split probes on the same checkpoints found only small
-eval-time gains: raising the residual cap to `alpha=0.05` improved dense R@5
-from 0.284 to 0.286 but worsened median/R@2, query-score filtering improved
-R@10 or sparse R@5 while hurting dense R@5, and LoFTR rendered matching trailed
-the default.  Treat these as ablations; the next expected improvement has to
-come from training-time feedback labels and hard-negative mining, not more
-inference-time branching.
-
-For batched multi-GPU Cambridge training, launch one scene per idle GPU with the
-constrained Loc-GS-FT rehearsal recipe. The recipe keeps the STDLoc/PLY
-descriptor backbone as the trust region, caps the localization descriptor
-residual at `alpha=0.03`, fine-tunes a PnP-feedback query detector from the
-STDLoc detector initialization with an anchor regularizer, and rehearses
-localization from mixed perturbed/interpolated poses:
-
-```bash
-/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_reliability_recipe \
-  --scenes GreatCourt,KingsCollege,OldHospital,ShopFacade,StMarysChurch \
-  --batch_size 16 \
-  --localization_batch_size 8 \
-  --feedback_detector_anchor_weight 0.1 \
-  --gpus 0,1,2
-
-# Current empirical default: isolate the protected residual feature field from
-# feedback-detector and SceneMatchNet effects.
-/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_reliability_eval \
-  --scenes GreatCourt,KingsCollege,OldHospital,ShopFacade,StMarysChurch \
-  --tag reliability_recipe \
-  --recipes lff_residual_prosac \
-  --gpus 0,1,2
-
-# Evaluate the implemented LFF feedback detector + protected residual path.
-/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_reliability_eval \
-  --scenes GreatCourt,KingsCollege,OldHospital,ShopFacade,StMarysChurch \
-  --tag reliability_recipe \
-  --recipes lff_feedback_prosac \
-  --gpus 0,1,2
-
-# Baseline control without the residual descriptor.
-/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_reliability_eval \
-  --scenes GreatCourt,KingsCollege,OldHospital,ShopFacade,StMarysChurch \
-  --tag reliability_recipe \
-  --recipes covisibility_prosac \
-  --gpus 0,1,2
-
-# Generate query-like self-localization labels for SceneMatchNet diagnostics.
-# The 2026-05-13 refined run used a fixed 50/50 train/rendered split to cover
-# perturbed and interpolated views, but the resulting matcher did not beat the
-# residual default on full Cambridge.
-/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_matchability_calibration \
-  --scenes GreatCourt,KingsCollege,OldHospital,ShopFacade,StMarysChurch \
-  --checkpoint_tag reliability_recipe \
-  --output_root output/stdloc_hybrid/query_like_matchability_lff \
-  --scene_match_pair_output_root output/scenematch_pairs/lff \
-  --scene_match_pair_sample_limit 400000 \
-  --scene_match_pair_train_fraction 0.5 \
-  --query_detector stdloc \
-  --descriptor_source hybrid_ply_gated_residual \
-  --hybrid_residual_alpha_max 0.03 \
-  --rendered_query_source rendered_rgb_teacher \
-  --gpus 0,1,2
-
-# Train one scene-specific pair matcher from the self-localization labels.
-# The pair cache includes query detector score as an extra scalar feature.
-/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.train_scene_matcher \
-  --pair_files output/scenematch_pairs/lff/ShopFacade/scene_match_pairs.pt \
-  --output_path output/scenematch/ShopFacade/best.pt \
-  --batch_size 32768 \
-  --epochs 8 \
-  --samples_per_epoch 300000 \
-  --balanced_batches \
-  --balanced_positive_fraction 0.5 \
-  --device cuda:0
-
-# Once per-scene SceneMatchNet checkpoints exist, evaluate it as a diagnostic
-# weak prior. The full split should decide whether it graduates into the method.
-/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_reliability_eval \
-  --scenes GreatCourt,KingsCollege,OldHospital,ShopFacade,StMarysChurch \
-  --tag reliability_recipe \
-  --recipes scene_matcher_prosac \
-  --scene_matcher_template output/scenematch/{scene}/best.pt \
-  --scene_matcher_topk 4 \
-  --scene_matcher_weight 0.1 \
-  --gpus 0,1,2
-
-# Optional for long single-scene evals: split each recipe by query index and
-# merge shard summaries back into the recipe eval directory.
-/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.launch_cambridge_reliability_eval \
-  --scenes StMarysChurch \
-  --tag reliability_recipe \
-  --recipes covisibility_prosac \
-  --query_shards 3 \
-  --gpus 0,1,2
-```
-
-For headroom diagnostics, `oracle_prosac` ranks the already generated sparse
-matches by GT reprojection error before PROSAC. Use it only as an upper-bound
-analysis, not as a method result.
+Do not start full Cambridge training or evaluation unless the run is explicitly
+requested and the candidate has passed the audit gates in
+`docs/mainline_lsf_20260521.md`.
 
 ## Verification
 

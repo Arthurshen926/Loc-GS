@@ -38,7 +38,9 @@ for:
 
 - self-map reliability summaries;
 - feedback bank records;
-- per-Gaussian/per-landmark selector labels;
+- per-Gaussian/per-landmark LSF support labels;
+- solver-tuple admissibility diagnostics;
+- dense residual support labels;
 - hard-negative mining;
 - failure taxonomy diagnostics.
 
@@ -89,17 +91,35 @@ Report full Cambridge macro summaries and per-scene summaries:
 - Recall at 5 cm / 5 deg (`R@5`).
 - Recall at 2 cm / 2 deg (`R@2`).
 
-The README starting point is:
+The active starting point is native STDLoc parity plus the LSF audit gates.
+Older residual, locability-prior, quality-gate, SceneMatchNet, LoFTR, oracle,
+and selector-sweep rows are retained only as ablations or diagnostics unless
+they are rerun as one fixed LSF recipe with full audit material.
 
-| Variant | Median | R@10 | R@5 | R@2 |
-| --- | ---: | ---: | ---: | ---: |
-| Native STDLoc parity | 9.127 cm / 0.156 deg | 0.5761 | 0.3712 | 0.1331 |
-| Self-map quality gate diagnostic | 8.682 cm / 0.151 deg | 0.5947 | 0.4144 | 0.1459 |
-| Native-backed soft locability, R5-tempered | 9.124 cm / 0.157 deg | not recorded in README | 0.3731 | 0.1300 |
-| LFF descriptor export, alpha 0.10 | 9.097 cm / 0.157 deg | not recorded in README | 0.3704 | 0.1323 |
-| Unified gated LFF, reliability boost, alpha 0.10 | 9.087 cm / 0.157 deg | not recorded in README | 0.3704 | 0.1323 |
+Current reference rows:
+
+| Variant | Status | Median | R@10 | R@5 | R@2 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Native STDLoc parity | baseline | 9.127 cm / 0.156 deg | 0.5761 | 0.3712 | 0.1331 |
+| Self-map quality gate | diagnostic only | 8.682 cm / 0.151 deg | 0.5947 | 0.4144 | 0.1459 |
+| Native-backed soft locability, R5-tempered | historical ablation | 9.124 cm / 0.157 deg | not recorded | 0.3731 | 0.1300 |
+| LFF descriptor export, alpha 0.10 | historical ablation | 9.097 cm / 0.157 deg | not recorded | 0.3704 | 0.1323 |
+| Unified gated LFF, reliability boost, alpha 0.10 | historical ablation | 9.087 cm / 0.157 deg | not recorded | 0.3704 | 0.1323 |
 
 If a source summary lacks `R@10`, mark it missing rather than inferring it.
+
+## Result Categories
+
+Every experiment summary should use one of these labels:
+
+- `main_candidate`: one fixed LSF recipe with feedback-bank-v2 audit, split
+  audit, native parity control, train-dev gates, and single-path evaluation.
+- `ablation`: audited residual descriptor, dense mask, solver metric, sampling,
+  or selector variant that is not the main fixed recipe.
+- `diagnostic`: quality gate, oracle ordering, SceneMatchNet, LoFTR/DIM,
+  scalar sweep, support-count guard, or failure-mechanism report.
+- `rejected`: any method that uses test-query signal for training/selection,
+  modifies evaluator behavior, changes metrics, or fails paper-safety audits.
 
 ## Auxiliary Diagnostics
 
@@ -112,6 +132,10 @@ Use these only to explain behavior, not to replace the main metrics:
 - Landmark visibility, depth consistency, detector score, descriptor score.
 - Hard-negative rate by scene and by landmark.
 - Self-map reliability `rho` and self-map median/R@5.
+- Feedback-bank-v2 audit status and image-group coverage.
+- Viable solver-tuple mass, pose-information logdet/min-eigenvalue proxy, and
+  ambiguity risk.
+- Dense improved/worsened query counts and dense residual keep ratio.
 - Failure taxonomy by no-match, repeated-structure, low-visibility,
   pose-refinement divergence, and map/checkpoint mismatch.
 

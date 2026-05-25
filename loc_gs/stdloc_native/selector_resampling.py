@@ -1298,12 +1298,19 @@ def write_resampled_detector_payload(output_detector_dir: str | Path, payload: d
         sampled_idx_path.unlink()
     if sampled_scores_path.is_symlink():
         sampled_scores_path.unlink()
+    audit_fields: dict[str, Any] = {}
+    for key in ("source_count", "output_count"):
+        if key in payload:
+            audit_fields[key] = int(payload[key])
+    if "sampled_idx_changed" in payload:
+        audit_fields["sampled_idx_changed"] = bool(payload["sampled_idx_changed"])
     _dump_pickle(torch.as_tensor(payload["sampled_idx"], dtype=torch.long).cpu(), sampled_idx_path)
     _dump_pickle(
         {
             "sampled_scores": torch.as_tensor(payload["sampled_scores"], dtype=torch.float32).cpu(),
             "score_avg": torch.as_tensor(payload["score_avg"], dtype=torch.float32).cpu(),
             "selector": torch.as_tensor(payload.get("selector", payload["score_avg"]), dtype=torch.float32).cpu(),
+            **audit_fields,
             **(
                 {
                     "hard_negative_risk": torch.as_tensor(

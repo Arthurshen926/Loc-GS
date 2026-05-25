@@ -121,7 +121,37 @@ def _reset_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _resolve_for_safety(path: Path) -> Path:
+    path = Path(path)
+    if path.exists() or path.is_symlink():
+        return path.resolve()
+    parent = path.parent
+    if parent.exists():
+        return parent.resolve() / path.name
+    return path.absolute()
+
+
+def _assert_safe_output_map(source_map: Path, output_map: Path) -> None:
+    source_resolved = Path(source_map).resolve()
+    output_resolved = _resolve_for_safety(Path(output_map))
+    if output_resolved == source_resolved:
+        raise ValueError(f"source_map and output_map must differ: {source_map}")
+    try:
+        output_resolved.relative_to(source_resolved)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(f"output_map must not be inside source_map: {output_map}")
+    try:
+        source_resolved.relative_to(output_resolved)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(f"output_map must not contain source_map: {output_map}")
+
+
 def _mirror_map(source_map: Path, output_map: Path, *, overwrite: bool) -> None:
+    _assert_safe_output_map(source_map, output_map)
     if output_map.exists() or output_map.is_symlink():
         if not overwrite:
             raise FileExistsError(f"output map already exists: {output_map}")
@@ -153,6 +183,8 @@ def _load_pickle(path: Path) -> Any:
 
 def _dump_pickle(payload: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        path.unlink()
     with path.open("wb") as handle:
         pickle.dump(payload, handle)
 

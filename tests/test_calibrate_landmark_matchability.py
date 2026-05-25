@@ -7,7 +7,9 @@ from loc_gs.scripts.calibrate_landmark_matchability import (
     build_argparser,
     build_pair_cache_split_metadata,
     calibration_query_canvas_hw,
+    make_pair_cache_row_identity,
     matchability_from_counts,
+    select_scene_match_group_indices,
     write_matchability_calibration,
 )
 
@@ -50,6 +52,15 @@ def test_calibration_parser_defaults_to_baseline_preserving_descriptor_and_rende
     assert args.scene_match_pair_sample_limit == 200000
     assert args.scene_match_pair_train_fraction == 1.0
     assert args.scene_match_pair_format == "pair"
+    assert args.scene_match_pair_max_per_image == 0
+
+
+def test_select_scene_match_group_indices_can_cap_one_image_contribution():
+    scores = torch.tensor([0.1, 0.9, 0.4, 0.8], dtype=torch.float32)
+
+    selected = select_scene_match_group_indices(scores, remaining=10, max_per_image=2)
+
+    assert selected.tolist() == [1, 3]
 
 
 def test_calibration_parser_accepts_feedback_detector():
@@ -101,11 +112,13 @@ def test_query_like_calibration_launcher_can_emit_listwise_pairs():
         output_path="output/calib/KingsCollege/stdloc_bank.pt",
         scene_match_pair_output_path="output/scenematch_pairs/KingsCollege/listwise.pt",
         scene_match_pair_format="listwise",
+        scene_match_pair_max_per_image=512,
     )
 
     assert env["CUDA_VISIBLE_DEVICES"] == "0"
     assert cmd[cmd.index("--scene_match_pair_output_path") + 1] == "output/scenematch_pairs/KingsCollege/listwise.pt"
     assert cmd[cmd.index("--scene_match_pair_format") + 1] == "listwise"
+    assert cmd[cmd.index("--scene_match_pair_max_per_image") + 1] == "512"
 
 
 def test_query_like_calibration_launcher_can_disable_visibility_checks_for_pair_labels():
@@ -246,6 +259,19 @@ def test_attach_listwise_landmark_bank_records_descriptor_bank_and_gaussian_ids(
     assert payload["base_landmark_desc"].dtype == torch.float16
     assert payload["base_gaussian_id"].tolist() == [10, 20, 30]
     assert payload["metadata"]["base_landmark_count"] == 3
+
+
+def test_make_pair_cache_row_identity_uses_image_and_keypoint_ids():
+    identity = make_pair_cache_row_identity(
+        image_id="seq1/frame00001.png",
+        keypoint_indices=torch.tensor([2, 5]),
+        phase="train",
+    )
+
+    assert identity["query_id"] == ["seq1/frame00001.png::kp_000002", "seq1/frame00001.png::kp_000005"]
+    assert identity["image_id"] == ["seq1/frame00001.png", "seq1/frame00001.png"]
+    assert identity["keypoint_id"] == ["kp_000002", "kp_000005"]
+    assert identity["source_phase"] == ["train", "train"]
 
 
 def test_build_pair_cache_split_metadata_passes_when_source_ids_avoid_test(tmp_path):

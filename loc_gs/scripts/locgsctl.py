@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAP_ROOT = Path("output/stdloc/map_cambridge_spgs")
 DEFAULT_CHECKPOINT_ROOT = Path("output/stdloc_hybrid")
 DEFAULT_DATA_ROOT = Path("/mnt/pool/sqy/Cambridge_stdloc")
+EXPECTED_NATIVE_SAMPLED_COUNT = 16384
 DEFAULT_MAP_NAME_OVERRIDES = {
     "GreatCourt": "GreatCourt_stream_stable2",
     "StMarysChurch": "StMarysChurch_stream_fastsave",
@@ -53,6 +55,30 @@ def _git_commit(repo_root: Path) -> str:
 
 def _path_status(path: Path) -> dict[str, Any]:
     return {"path": str(path), "exists": path.exists()}
+
+
+def _sampled_count(map_path: Path) -> int | None:
+    sampled_idx = map_path / "detector" / "sampled_idx.pkl"
+    if not sampled_idx.exists():
+        return None
+    try:
+        with sampled_idx.open("rb") as handle:
+            payload = pickle.load(handle)
+    except Exception:
+        return None
+    try:
+        return int(len(payload))
+    except TypeError:
+        try:
+            return int(payload.numel())
+        except AttributeError:
+            return None
+
+
+def _native_sampled_count_status(count: int | None) -> str:
+    if count is None:
+        return "missing"
+    return "passed" if int(count) == EXPECTED_NATIVE_SAMPLED_COUNT else "mismatch"
 
 
 def command_status(args: argparse.Namespace) -> int:
@@ -96,12 +122,17 @@ def _scene_defaults(
     rows: list[dict[str, Any]] = []
     for scene in CAMBRIDGE_SCENES:
         map_scene = DEFAULT_MAP_NAME_OVERRIDES.get(scene, scene)
+        map_path = map_base / map_scene
+        count = _sampled_count(map_path)
         rows.append(
             {
                 "scene": scene,
                 "data_root": str(data_base / scene),
-                "map_path": str(map_base / map_scene),
+                "map_path": str(map_path),
                 "checkpoint_path": str(checkpoint_base / scene / "latest.pth"),
+                "sampled_count": count,
+                "native_sampled_count_expected": EXPECTED_NATIVE_SAMPLED_COUNT,
+                "native_sampled_count_status": _native_sampled_count_status(count),
             }
         )
     return rows
@@ -263,17 +294,27 @@ def command_smoke(args: argparse.Namespace) -> int:
         "loc_gs_package": _path_status(repo_root / "loc_gs"),
         "stdloc_root": _path_status(repo_root / "third_party" / "stdloc"),
     }
-    missing = [key for key, value in checks.items() if not value["exists"]]
+    count = _sampled_count(Path(row["map_path"]))
+    sampled_status = _native_sampled_count_status(count)
+    checks["native_sampled_count"] = {
+        "path": str(Path(row["map_path"]) / "detector" / "sampled_idx.pkl"),
+        "expected": EXPECTED_NATIVE_SAMPLED_COUNT,
+        "actual": count,
+        "status": sampled_status,
+    }
+    missing = [key for key, value in checks.items() if value.get("exists") is False]
+    failed = [key for key, value in checks.items() if value.get("status") in {"mismatch", "failed"}]
     payload = {
         "scene": scene,
         "dry_run": bool(args.dry_run),
         "checks": checks,
-        "ok": not missing,
+        "ok": not missing and not failed,
         "missing": missing,
+        "failed": failed,
         "would_run_long_experiment": False,
     }
     _print_json(payload)
-    return 0 if args.dry_run or not missing else 1
+    return 0 if args.dry_run or (not missing and not failed) else 1
 
 
 def command_manifest(args: argparse.Namespace) -> int:

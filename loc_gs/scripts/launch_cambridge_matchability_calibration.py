@@ -31,6 +31,7 @@ def build_calibration_command(
     scene_match_pair_output_path: str = "",
     scene_match_pair_format: str = "pair",
     scene_match_pair_sample_limit: int = 200000,
+    scene_match_pair_max_per_image: int = 0,
     scene_match_pair_train_fraction: float = 1.0,
 ) -> tuple[list[str], dict[str, str]]:
     cmd = [
@@ -95,6 +96,8 @@ def build_calibration_command(
                 str(scene_match_pair_format),
                 "--scene_match_pair_sample_limit",
                 str(int(scene_match_pair_sample_limit)),
+                "--scene_match_pair_max_per_image",
+                str(int(scene_match_pair_max_per_image)),
                 "--scene_match_pair_train_fraction",
                 str(float(scene_match_pair_train_fraction)),
             ]
@@ -140,6 +143,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--scene_match_pair_output_root", default="")
     parser.add_argument("--scene_match_pair_format", choices=["pair", "listwise"], default="pair")
     parser.add_argument("--scene_match_pair_sample_limit", type=int, default=200000)
+    parser.add_argument("--scene_match_pair_max_per_image", type=int, default=0)
     parser.add_argument("--scene_match_pair_train_fraction", type=float, default=1.0)
     parser.add_argument("--gpus", default="")
     parser.add_argument("--max_memory_used_mb", type=int, default=1000)
@@ -194,6 +198,7 @@ def main() -> None:
             scene_match_pair_output_path="" if pair_output_path is None else str(pair_output_path),
             scene_match_pair_format=args.scene_match_pair_format,
             scene_match_pair_sample_limit=args.scene_match_pair_sample_limit,
+            scene_match_pair_max_per_image=args.scene_match_pair_max_per_image,
             scene_match_pair_train_fraction=args.scene_match_pair_train_fraction,
         )
         print(" ".join(cmd), f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")

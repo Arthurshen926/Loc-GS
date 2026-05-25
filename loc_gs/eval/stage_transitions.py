@@ -8,9 +8,10 @@ from loc_gs.eval.query_partitions import _as_float, _stage_metric
 
 
 def _query_id(row: dict[str, Any], index: int) -> str:
-    value = row.get("query_id")
-    if value is not None:
-        return str(value)
+    for key in ("query_id", "image_name", "name", "query", "image"):
+        value = row.get(key)
+        if value is not None:
+            return str(value)
     return f"query_{index:06d}"
 
 

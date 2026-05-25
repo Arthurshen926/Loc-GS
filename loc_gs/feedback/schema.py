@@ -38,8 +38,10 @@ def _xy_value(value: Any) -> tuple[float | None, float | None]:
 class FeedbackMatchRecord:
     scene: str = ""
     query_id: str = ""
+    image_id: str = ""
     source_view_id: str = ""
     pose_source: str = ""
+    keypoint_id: str = ""
     keypoint_xy: tuple[float | None, float | None] = (None, None)
     matched_landmark_id: str = ""
     matched_gaussian_id: str = ""
@@ -54,6 +56,8 @@ class FeedbackMatchRecord:
     pose_error_r_deg: float | None = None
     pnp_success: bool = False
     dense_refine_success: bool = False
+    dense_transition: str = ""
+    dense_delta_te_cm: float | None = None
     jacobian_info_trace: float | None = None
     jacobian_info_logdet_proxy: float | None = None
 
@@ -65,8 +69,10 @@ class FeedbackMatchRecord:
         return cls(
             scene=str(item.get("scene", "")),
             query_id=str(item.get("query_id", "")),
+            image_id=str(item.get("image_id", "")),
             source_view_id=str(item.get("source_view_id", "")),
             pose_source=str(item.get("pose_source", "")),
+            keypoint_id=str(item.get("keypoint_id", "")),
             keypoint_xy=keypoint_xy,
             matched_landmark_id=str(item.get("matched_landmark_id", item.get("landmark_id", ""))),
             matched_gaussian_id=str(item.get("matched_gaussian_id", item.get("gaussian_id", ""))),
@@ -81,6 +87,8 @@ class FeedbackMatchRecord:
             pose_error_r_deg=_float_or_none(item.get("pose_error_r_deg")),
             pnp_success=_bool_value(item.get("pnp_success"), default=False),
             dense_refine_success=_bool_value(item.get("dense_refine_success"), default=False),
+            dense_transition=str(item.get("dense_transition", "")),
+            dense_delta_te_cm=_float_or_none(item.get("dense_delta_te_cm")),
             jacobian_info_trace=_float_or_none(item.get("jacobian_info_trace")),
             jacobian_info_logdet_proxy=_float_or_none(item.get("jacobian_info_logdet_proxy")),
         )

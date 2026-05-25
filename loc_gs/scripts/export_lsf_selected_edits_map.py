@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from loc_gs.stdloc_native.selector_resampling import write_resampled_detector_payload
+from loc_gs.stdloc_native.soft_prior import _assert_safe_output_map
 from loc_gs.stdloc_native.solver_aware_resampling import (
     apply_selected_local_edits,
     parse_edit_selection,
@@ -61,6 +62,7 @@ def _load_score_payload(candidate_map: Path, source_map: Path, source_idx: torch
 
 
 def _copy_source_map(source: Path, output: Path, overwrite: bool) -> None:
+    _assert_safe_output_map(source, output)
     if output.exists():
         if not overwrite:
             raise FileExistsError(f"output_map exists: {output}")

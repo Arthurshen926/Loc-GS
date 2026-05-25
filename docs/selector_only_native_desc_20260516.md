@@ -1,8 +1,16 @@
-# Selector-Only Native Descriptor Evidence, 2026-05-16
+# Archived Selector-Only Native Descriptor Evidence, 2026-05-16
+
+Archive status, 2026-05-21: this note is retained as historical ablation
+evidence only. It is superseded by `docs/mainline_lsf_20260521.md`. The
+selector-only native-descriptor result below is not the current paper-facing
+mainline and must not be used as a main-candidate claim unless rerun under the
+current LSF-Loc gates: `feedback_bank_v2` audit, real image grouping,
+solver-admissible sampling, fixed single-path OpenCV PROSAC/RANSAC PnP, and
+full manifest/split audit material.
 
 ## Mainline Decision
 
-The current paper-facing mainline is **Loc-GS Sampling Field**:
+The historical line evaluated here was **Loc-GS Sampling Field**:
 
 ```text
 native STDLoc descriptor / geometry / radiance field
@@ -12,10 +20,11 @@ native STDLoc descriptor / geometry / radiance field
   -> one descriptor matching + OpenCV PROSAC PnP + dense refinement path
 ```
 
-The method does **not** claim descriptor replacement. Protected descriptor
+This historical method did **not** claim descriptor replacement. Protected descriptor
 residuals are retained as ablations because they improve some medians but are
-less stable on strict recall. The clean candidate keeps `descriptor_mode=native`
-and only distills self-localization feedback into selection / locability.
+less stable on strict recall. The clean candidate kept `descriptor_mode=native`
+and only distilled self-localization feedback into selection / locability.
+Under the current LSF reset, this is an ablation rather than the active method.
 
 ## Current Results
 
@@ -46,9 +55,9 @@ Supported:
 
 - Self-localization feedback can be distilled into a single STDLoc-compatible
   localization utility / selector field.
-- The selector improves full Cambridge dense median, R@5, and R@2 while keeping
-  native descriptors and a single query-time path.
-- The result is evidence for feature selection / sampling-field reconstruction,
+- In this historical run, the selector improved full Cambridge dense median,
+  R@5, and R@2 while keeping native descriptors and a single query-time path.
+- The result is ablation evidence for feature selection / sampling-field reconstruction,
   not for descriptor replacement.
 
 Not supported yet:
@@ -56,7 +65,7 @@ Not supported yet:
 - Strong SOTA accuracy.
 - A learned Gaussian descriptor that beats native STDLoc descriptors.
 - Inference-time branch selection.
-- A paper-safe main-candidate label, because the current feedback cache audit
+- A paper-safe main-candidate label, because the feedback cache audit
   lacks recoverable per-image split id lists.
 
 ## Audit Bundle

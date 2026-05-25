@@ -33,14 +33,17 @@ branch-level selection do not solve query-conditioned ambiguity:
 
 ## Replacement Mainline
 
-Use `docs/loc_gs_lff_scenematch_mainline_20260512.md` as the current mainline:
+Use `docs/mainline_lsf_20260521.md` as the current mainline. The older
+`docs/loc_gs_lff_scenematch_mainline_20260512.md` note is now archived
+diagnostic history:
 
 ```text
-STDLoc/PLY descriptor backbone
-+ localization-feedback detector labels
-+ query-conditioned SceneMatchNet
-+ single-path PROSAC priority
+native STDLoc descriptor/backend
++ audited feedback_bank_v2 self-localization traces
++ solver-consensus support
++ solvability-aware sampling and dense support
++ single-path OpenCV PROSAC/RANSAC PnP and STDLoc-style dense refinement
 ```
 
 Static reliability can still appear in tables as a negative ablation showing
-why query-conditioned pair scoring is necessary.
+why solver-aware support selection is necessary.

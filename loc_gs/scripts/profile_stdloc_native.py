@@ -44,6 +44,32 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
+def _reset_cuda_peak_memory_stats() -> None:
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+
+
+def _cuda_memory_snapshot() -> dict[str, Any]:
+    if not torch.cuda.is_available():
+        return {"available": False}
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    peak_allocated = int(torch.cuda.max_memory_allocated(device))
+    peak_reserved = int(torch.cuda.max_memory_reserved(device))
+    peak_gpu_mb = max(peak_allocated, peak_reserved) / (1024.0 * 1024.0)
+    return {
+        "available": True,
+        "device_index": int(device),
+        "peak_allocated_bytes": peak_allocated,
+        "peak_reserved_bytes": peak_reserved,
+        "peak_allocated_mb": float(peak_allocated / (1024.0 * 1024.0)),
+        "peak_reserved_mb": float(peak_reserved / (1024.0 * 1024.0)),
+        "peak_gpu_mb": float(peak_gpu_mb),
+    }
+
+
 def _count_sampled_landmarks(model_path: str | Path, config: dict[str, Any]) -> int | None:
     landmark_path = config.get("sparse", {}).get("landmark_path")
     if not landmark_path:
@@ -549,6 +575,7 @@ def main() -> int:
     yaml.dump(config, open(os.path.join(output_path, cfg_path.name), "w"))
 
     stdloc = stdloc_module.STDLoc(gaussians, config)
+    _reset_cuda_peak_memory_stats()
     timing_rows, profiler = _attach_profiler(stdloc_module, stdloc)
     localize_with_profile, restore_profiler = profiler
 
@@ -610,6 +637,7 @@ def main() -> int:
     scene_name = args.scene_name or Path(dataset.source_path).name
     method_name = args.method_name or Path(dataset.model_path).name
     landmark_count = _count_sampled_landmarks(dataset.model_path, config)
+    memory_profile = _cuda_memory_snapshot()
     timing_profile = aggregate_timing_profile(
         timing_rows,
         scene=scene_name,
@@ -621,6 +649,9 @@ def main() -> int:
     timing_profile["test_stride"] = int(getattr(args, "test_stride", 1))
     timing_profile["max_test_cameras"] = getattr(args, "max_test_cameras", None)
     timing_profile["warmup_cameras"] = warmup_cameras
+    timing_profile["memory"] = memory_profile
+    if memory_profile.get("peak_gpu_mb") is not None:
+        timing_profile["peak_gpu_mb"] = memory_profile["peak_gpu_mb"]
     selector_manifest = _selector_manifest_for_model(dataset.model_path)
 
     results_summary = {
@@ -632,12 +663,15 @@ def main() -> int:
         "max_test_cameras": getattr(args, "max_test_cameras", None),
         "warmup_cameras": warmup_cameras,
         "landmark_count": landmark_count,
+        "memory": memory_profile,
+        "peak_gpu_mb": memory_profile.get("peak_gpu_mb"),
         "sparse": _pose_summary(sparse_aes, sparse_tes, sparse_inliers),
         "dense": _pose_summary(dense_aes, dense_tes, dense_inliers),
         "timing_profile": {
             "latency_ms": timing_profile["latency_ms"],
             "fps": timing_profile["fps"],
             "queries": timing_profile["queries"],
+            "memory": memory_profile,
         },
     }
     manifest = build_profile_manifest(
