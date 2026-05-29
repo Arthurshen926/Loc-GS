@@ -1,4 +1,5 @@
 import pickle
+import struct
 import sys
 from pathlib import Path
 
@@ -10,6 +11,18 @@ from loc_gs.scripts import launch_stdloc_native_cambridge
 from loc_gs.scripts import launch_stdloc_native_lff_cambridge
 from loc_gs.scripts import launch_stdloc_native_soft_prior_cambridge
 from loc_gs.scripts import train_stdloc_native
+
+
+def _write_images_bin(path: Path, *, image_name: str, qvec: tuple[float, float, float, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", 1))
+        handle.write(struct.pack("<i", 1))
+        handle.write(struct.pack("<4d", *qvec))
+        handle.write(struct.pack("<3d", 0.0, 0.0, 0.0))
+        handle.write(struct.pack("<i", 1))
+        handle.write(image_name.encode("utf-8") + b"\x00")
+        handle.write(struct.pack("<Q", 0))
 
 
 def test_eval_stdloc_native_dry_run_prints_command(capsys):
@@ -37,6 +50,37 @@ def test_eval_stdloc_native_dry_run_prints_command(capsys):
     assert expected_cfg.exists()
     assert f"--cfg {expected_cfg}" in out
     assert "--output_path /out/eval_shop" in out
+
+
+def test_eval_stdloc_native_rejects_non_unit_colmap_qvecs(tmp_path):
+    data_root = tmp_path / "cambridge"
+    scene_root = data_root / "StMarysChurch"
+    scene_root.mkdir(parents=True)
+    (scene_root / "dataset_test.txt").write_text(
+        "seq13/frame00174.png 0 0 0 0.0 0.0 1.045 0.0\n",
+        encoding="utf-8",
+    )
+    _write_images_bin(
+        scene_root / "sparse" / "0" / "images.bin",
+        image_name="seq13/frame00174.png",
+        qvec=(0.0, 0.0, 1.045, 0.0),
+    )
+    args = eval_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "StMarysChurch",
+            "--data_root",
+            str(data_root),
+            "--map_root",
+            str(tmp_path / "maps"),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--dry_run",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="non-unit COLMAP quaternion"):
+        eval_stdloc_native.main(args)
 
 
 def test_eval_stdloc_native_accepts_explicit_opencv_cfg_when_variant_evaluator_is_present(
@@ -333,6 +377,46 @@ def test_train_stdloc_native_dry_run_prints_command(capsys):
     assert "python-test train.py" in out
     assert "--train_detector" in out
     assert "--position_lr_init 0.000016" in out
+
+
+def test_train_stdloc_native_requires_semantic_masks_on_effective_images(tmp_path):
+    data_root = tmp_path / "cambridge"
+    (data_root / "ShopFacade" / "processed").mkdir(parents=True)
+    (data_root / "ShopFacade" / "processed" / "masks.pkl").write_bytes(pickle.dumps({}))
+    args = train_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "ShopFacade",
+            "--data_root",
+            str(data_root),
+            "--map_root",
+            str(tmp_path / "maps"),
+            "--require_semantic_masks",
+            "--dry_run",
+        ]
+    )
+
+    train_stdloc_native.main(args)
+
+
+def test_train_stdloc_native_rejects_missing_required_semantic_masks(tmp_path):
+    data_root = tmp_path / "cambridge"
+    (data_root / "KingsCollege").mkdir(parents=True)
+    args = train_stdloc_native.build_argparser().parse_args(
+        [
+            "--scene",
+            "KingsCollege",
+            "--data_root",
+            str(data_root),
+            "--map_root",
+            str(tmp_path / "maps"),
+            "--require_semantic_masks",
+            "--dry_run",
+        ]
+    )
+
+    with pytest.raises(FileNotFoundError, match="STDLoc semantic masks"):
+        train_stdloc_native.main(args)
 
 
 def test_launcher_assigns_scenes_round_robin_to_gpus(tmp_path):

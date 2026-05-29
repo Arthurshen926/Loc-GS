@@ -89,6 +89,7 @@ def distill_dense_lsf_targets(
     confidence = ((denom - 2.0 * smooth) / denom.clamp_min(1e-6)).clamp(0.0, 1.0)
     selected_idx = torch.where((observed > 0) & (target >= float(keep_threshold)))[0].long()
     manifest = dict(bank.get("manifest", {}))
+    split_name = str(manifest.get("split_name", ""))
     return {
         "dense_lsf_target": target,
         "dense_lsf_confidence": confidence,
@@ -102,7 +103,12 @@ def distill_dense_lsf_targets(
             "sparse_selector_safe": False,
             "feedback_bank": str(feedback_bank),
             "feedback_bank_schema": manifest.get("schema_version", ""),
-            "split_name": manifest.get("split_name", ""),
+            "split_name": split_name,
+            "feedback_bank_audit_status": str(audit.get("audit_status", "unknown")),
+            "split_audit": {
+                **audit,
+                "split_name": str(audit.get("split_name", split_name) or split_name),
+            },
             "smoothing": float(smooth),
             "keep_threshold": float(keep_threshold),
             "delta_scale_cm": float(delta_scale_cm),

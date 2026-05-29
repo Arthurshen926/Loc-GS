@@ -1,7 +1,9 @@
 import json
+import pickle
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 
 from loc_gs.data.cambridge_dataset import CambridgeHybridDataset
@@ -200,3 +202,89 @@ def test_camera_json_filters_to_cambridge_split_files(tmp_path):
 
     assert [record.image_name for record in train.records] == ["seq2/frame00001.png"]
     assert [record.image_name for record in test.records] == ["seq3/frame00001.png"]
+
+
+def test_cambridge_dataset_returns_resized_semantic_mask_when_enabled(tmp_path):
+    scene_root = tmp_path / "ShopFacade"
+    _write_rgb(scene_root / "processed" / "seq1" / "frame00001.png")
+    stuff_mask = torch.ones(8, 12, dtype=torch.bool)
+    sky_mask = torch.ones(8, 12, dtype=torch.bool)
+    distort_mask = torch.ones(8, 12, dtype=torch.bool)
+    stuff_mask[0, 0] = False
+    sky_mask[0, 1] = False
+    distort_mask[1, 0] = False
+    with (scene_root / "processed" / "masks.pkl").open("wb") as handle:
+        pickle.dump({"seq1/frame00001.png": (stuff_mask, sky_mask, distort_mask)}, handle)
+    cameras_json = tmp_path / "cameras.json"
+    cameras_json.write_text(
+        json.dumps(
+            [
+                {
+                    "id": 0,
+                    "img_name": "seq1/frame00001.png",
+                    "width": 12,
+                    "height": 8,
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    "fx": 10.0,
+                    "fy": 10.0,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ds = CambridgeHybridDataset(
+        scene_root=scene_root,
+        cameras_json=cameras_json,
+        split="train",
+        image_subdir="processed",
+        image_height=8,
+        image_width=12,
+        semantic_mask_mode="dynamic_sky",
+    )
+
+    item = ds[0]
+    assert item["semantic_valid_mask"].shape == (1, 8, 12)
+    assert item["semantic_mask_available"].item() is True
+    assert item["semantic_valid_mask"][0, 0, 0].item() is False
+    assert item["semantic_valid_mask"][0, 0, 1].item() is False
+    assert item["semantic_valid_mask"][0, 1, 0].item() is False
+    assert ds.semantic_mask_audit()["loaded"] is True
+
+
+def test_cambridge_dataset_missing_semantic_masks_falls_back_to_all_valid(tmp_path):
+    scene_root = tmp_path / "ShopFacade"
+    _write_rgb(scene_root / "processed" / "seq1" / "frame00001.png")
+    cameras_json = tmp_path / "cameras.json"
+    cameras_json.write_text(
+        json.dumps(
+            [
+                {
+                    "id": 0,
+                    "img_name": "seq1/frame00001.png",
+                    "width": 12,
+                    "height": 8,
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    "fx": 10.0,
+                    "fy": 10.0,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ds = CambridgeHybridDataset(
+        scene_root=scene_root,
+        cameras_json=cameras_json,
+        split="train",
+        image_subdir="processed",
+        image_height=8,
+        image_width=12,
+        semantic_mask_mode="dynamic_sky",
+    )
+
+    item = ds[0]
+    assert item["semantic_mask_available"].item() is False
+    assert item["semantic_valid_mask"].all()

@@ -108,6 +108,101 @@ def resize_teacher_outputs_to_feature_grid(
     return F.normalize(descriptor.float(), p=2, dim=1), detector_logits.float()
 
 
+def _resize_valid_mask(
+    valid_mask: torch.Tensor | None,
+    height: int,
+    width: int,
+) -> torch.Tensor | None:
+    if valid_mask is None:
+        return None
+    if valid_mask.dim() == 3:
+        valid_mask = valid_mask.unsqueeze(1)
+    if valid_mask.dim() != 4:
+        raise ValueError(f"valid_mask must be Bx1xHxW or BxHxW, got {tuple(valid_mask.shape)}")
+    valid_mask = valid_mask.to(dtype=torch.bool)
+    if valid_mask.shape[-2:] == (int(height), int(width)):
+        return valid_mask
+    return F.interpolate(
+        valid_mask.float(),
+        size=(int(height), int(width)),
+        mode="nearest",
+    ) > 0.5
+
+
+def descriptor_reconstruction_losses(
+    pred_desc: torch.Tensor,
+    target_desc: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Descriptor reconstruction loss with optional semantic valid-pixel mask."""
+    valid_mask = _resize_valid_mask(valid_mask, pred_desc.shape[-2], pred_desc.shape[-1])
+    if valid_mask is None:
+        desc_l2 = F.mse_loss(pred_desc.float(), target_desc.float())
+        desc_cos = 1.0 - F.cosine_similarity(
+            pred_desc.float().flatten(2),
+            target_desc.float().flatten(2),
+            dim=1,
+        ).mean()
+        return {"l2": desc_l2, "cos": desc_cos, "total": desc_l2 + 0.5 * desc_cos}
+
+    channel_mask = valid_mask.expand(-1, pred_desc.shape[1], -1, -1)
+    pixel_mask = valid_mask[:, 0]
+    if pixel_mask.sum() == 0:
+        zero = pred_desc.new_tensor(0.0)
+        return {"l2": zero, "cos": zero, "total": zero}
+    desc_l2 = (
+        (pred_desc.float() - target_desc.float()).pow(2) * channel_mask.float()
+    ).sum() / channel_mask.sum().clamp_min(1)
+    per_pixel_cos = 1.0 - F.cosine_similarity(pred_desc.float(), target_desc.float(), dim=1)
+    desc_cos = (per_pixel_cos * pixel_mask.float()).sum() / pixel_mask.sum().clamp_min(1)
+    return {"l2": desc_l2, "cos": desc_cos, "total": desc_l2 + 0.5 * desc_cos}
+
+
+def masked_detector_kl_loss(
+    pred_det: torch.Tensor,
+    target_det: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    valid_mask = _resize_valid_mask(valid_mask, pred_det.shape[-2], pred_det.shape[-1])
+    if valid_mask is None:
+        return F.kl_div(
+            F.log_softmax(pred_det.float(), dim=1),
+            F.softmax(target_det.float(), dim=1),
+            reduction="batchmean",
+        )
+    if valid_mask.sum() == 0:
+        return pred_det.new_tensor(0.0)
+    per_cell = F.kl_div(
+        F.log_softmax(pred_det.float(), dim=1),
+        F.softmax(target_det.float(), dim=1),
+        reduction="none",
+    ).sum(dim=1, keepdim=True)
+    return (per_cell * valid_mask.float()).sum() / valid_mask.float().sum().clamp_min(1.0)
+
+
+def filter_superpoint_query_mask_by_semantic_mask(
+    query_keypoints_yx: torch.Tensor,
+    query_mask: torch.Tensor,
+    semantic_valid_mask: torch.Tensor | None,
+    *,
+    stride: int = 8,
+) -> torch.Tensor:
+    if semantic_valid_mask is None:
+        return query_mask
+    if semantic_valid_mask.dim() == 3:
+        semantic_valid_mask = semantic_valid_mask.unsqueeze(1)
+    semantic_valid_mask = semantic_valid_mask.to(device=query_keypoints_yx.device, dtype=torch.bool)
+    B, Kp, _ = query_keypoints_yx.shape
+    height, width = semantic_valid_mask.shape[-2:]
+    y = torch.round(query_keypoints_yx[..., 0] * float(stride)).long().clamp(0, height - 1)
+    x = torch.round(query_keypoints_yx[..., 1] * float(stride)).long().clamp(0, width - 1)
+    batch_ids = torch.arange(B, device=query_keypoints_yx.device).view(B, 1).expand(B, Kp)
+    keep = semantic_valid_mask[batch_ids, 0, y, x]
+    return query_mask & keep
+
+
 def make_feature_renderer_intrinsics(K: torch.Tensor, stride: int = 8) -> dict[str, float]:
     return {
         "fx": float(K[0, 0] / stride),
@@ -994,6 +1089,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_feature_source", choices=["resized", "original"], default="resized")
     parser.add_argument("--image_width", type=int, default=640)
     parser.add_argument("--image_height", type=int, default=360)
+    parser.add_argument(
+        "--semantic_mask_mode",
+        choices=["none", "dynamic", "dynamic_sky"],
+        default="none",
+        help="Use STDLoc Cambridge Mask2Former masks for reconstruction/keypoint filtering.",
+    )
+    parser.add_argument(
+        "--require_semantic_masks",
+        action="store_true",
+        help="Fail if semantic masks are requested but the scene has no masks.pkl.",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -1176,6 +1282,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         image_height=args.image_height,
         image_width=args.image_width,
         max_frames=args.max_frames,
+        semantic_mask_mode=args.semantic_mask_mode,
+        require_semantic_masks=args.require_semantic_masks,
     )
     loader = DataLoader(
         dataset,
@@ -1381,6 +1489,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             "feature_height": feature_height,
             "feature_width": feature_width,
             "feature_intrinsics": intr,
+            "semantic_mask_audit": dataset.semantic_mask_audit(),
         }
     )
     (out_dir / "config.json").write_text(json.dumps(config_snapshot, indent=2), encoding="utf-8")
@@ -1411,6 +1520,11 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 break
             rgb = batch["rgb"].to(device, non_blocking=True).float()
             pose = batch["pose_w2c"].to(device, non_blocking=True).float()
+            semantic_valid_mask = None
+            semantic_feature_mask = None
+            if args.semantic_mask_mode != "none":
+                semantic_valid_mask = batch["semantic_valid_mask"].to(device, non_blocking=True).bool()
+                semantic_feature_mask = _resize_valid_mask(semantic_valid_mask, feature_height, feature_width)
 
             with torch.no_grad():
                 image_names = [str(name) for name in batch["image_name"]]
@@ -1442,6 +1556,12 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                     confidence_threshold=args.keypoint_threshold,
                     nms_radius=args.nms_radius,
                 )
+                query_mask = filter_superpoint_query_mask_by_semantic_mask(
+                    query_keypoints,
+                    query_mask,
+                    semantic_valid_mask,
+                    stride=8,
+                )
                 maybe_write_superpoint_metadata(
                     sp_cache,
                     image_names,
@@ -1455,23 +1575,26 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 gt_render = render_hybrid_superpoint(model, sp_head, renderer, pose)
                 pred_desc = gt_render["descriptor"]
                 pred_det = gt_render["detector"]
-                desc_l2 = F.mse_loss(pred_desc.float(), teacher_desc.float())
-                desc_cos = 1.0 - F.cosine_similarity(
-                    pred_desc.float().flatten(2),
-                    teacher_desc.float().flatten(2),
-                    dim=1,
-                ).mean()
+                desc_losses = descriptor_reconstruction_losses(
+                    pred_desc,
+                    teacher_desc,
+                    valid_mask=semantic_feature_mask,
+                )
+                desc_l2 = desc_losses["l2"]
+                desc_cos = desc_losses["cos"]
                 sp_recon = desc_l2 + 0.5 * desc_cos
-                det_recon = F.kl_div(
-                    F.log_softmax(pred_det.float(), dim=1),
-                    F.softmax(teacher_det.float(), dim=1),
-                    reduction="batchmean",
+                det_recon = masked_detector_kl_loss(
+                    pred_det,
+                    teacher_det,
+                    valid_mask=semantic_feature_mask,
                 )
                 same_valid = (
                     torch.isfinite(gt_render["depth"])
                     & (gt_render["depth"] > 0.05)
                     & (gt_render["alpha"].float() > float(args.same_view_alpha_threshold))
                 )
+                if semantic_feature_mask is not None:
+                    same_valid = same_valid & semantic_feature_mask
                 same_match = geometric_keypoint_match_loss(
                     query_descs=query_descs,
                     query_keypoints_yx=query_keypoints,

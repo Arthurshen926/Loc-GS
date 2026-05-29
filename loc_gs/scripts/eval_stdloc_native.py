@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from loc_gs.data.colmap_pose_repair import cambridge_pose_qnorm_issue_map
 from loc_gs.stdloc_native.commands import (
     StdlocEvalConfig,
     build_eval_job,
@@ -115,6 +116,34 @@ def _check_expected_sampled_count(map_path: Path, expected: int) -> None:
         )
 
 
+def _resolve_scene_root(data_root: Path, scene: str) -> Path:
+    root = _resolve_repo_path(data_root)
+    if (root / "dataset_train.txt").exists() or (root / "dataset_test.txt").exists():
+        return root
+    return root / scene
+
+
+def _check_cambridge_pose_qnorms(data_root: Path, scene: str, split: str, *, allow_outliers: bool) -> None:
+    scene_root = _resolve_scene_root(data_root, scene)
+    if not scene_root.exists():
+        return
+    issues = cambridge_pose_qnorm_issue_map(scene_root, split=split)
+    if not issues:
+        return
+    examples = ", ".join(
+        f"{name}: qnorm={issue.qnorm:.6f}" for name, issue in list(issues.items())[:5]
+    )
+    message = (
+        f"non-unit COLMAP quaternion(s) found in {scene_root} for split={split}: "
+        f"{examples}. Use a qvec-normalized repaired scene root for paper-facing "
+        "STDLoc eval, or pass --allow_pose_qnorm_outliers only for diagnostics."
+    )
+    if allow_outliers:
+        print(f"[warning] {message}", file=sys.stderr)
+        return
+    raise ValueError(message)
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the source-of-truth STDLoc evaluator from Loc-GS.")
     parser.add_argument("--scene", required=True)
@@ -144,6 +173,11 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Reject the run unless sparse/dense solvers are poselib and the vendored evaluator is unmodified.",
     )
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument(
+        "--allow_pose_qnorm_outliers",
+        action="store_true",
+        help="Allow non-unit COLMAP camera quaternions. Diagnostic only; not paper-facing.",
+    )
     return parser
 
 
@@ -158,6 +192,12 @@ def main(args: argparse.Namespace | None = None) -> None:
     if bool(args.require_paper_safe_poselib_evaluator):
         _check_paper_safe_poselib_evaluator(resolved_cfg)
     _check_cfg_supported_by_current_evaluator(resolved_cfg)
+    _check_cambridge_pose_qnorms(
+        Path(args.data_root),
+        args.scene,
+        args.eval_split,
+        allow_outliers=bool(args.allow_pose_qnorm_outliers),
+    )
     cfg = StdlocEvalConfig(
         scene=args.scene,
         map_scene=args.map_scene or None,

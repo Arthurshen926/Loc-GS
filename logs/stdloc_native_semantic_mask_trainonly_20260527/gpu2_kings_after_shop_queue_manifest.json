@@ -1,0 +1,11 @@
+{
+  "format": "loc_gs_delayed_kings_launch_v1",
+  "started_at_utc": "2026-05-27T08:10:41.530101+00:00",
+  "pid": 26621,
+  "wait_for_pid": 27010,
+  "scene": "KingsCollege",
+  "gpu": "2",
+  "log_path": "/root/Loc-GS/logs/stdloc_native_semantic_mask_trainonly_20260527/KingsCollege.log",
+  "queue_log": "/root/Loc-GS/logs/stdloc_native_semantic_mask_trainonly_20260527/gpu2_kings_after_shop_queue.log",
+  "command": "/root/miniconda3/envs/cybersim_agent/bin/python -m loc_gs.scripts.train_stdloc_native --scene KingsCollege --data_root /mnt/pool/sqy/Cambridge_stdloc --map_root /root/Loc-GS/output/stdloc/map_cambridge_spgs_semantic_mask_trainonly_20260527 --python_bin /root/miniconda3/envs/cybersim_agent/bin/python --train_only_cameras --iterations 30000 --detector_iterations 30000 --landmark_num 16384 --landmark_k 32 --require_semantic_masks --gpu 2"
+}

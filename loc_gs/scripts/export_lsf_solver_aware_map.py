@@ -17,6 +17,8 @@ import torch
 
 from loc_gs.reporting.artifact_audit import artifact_split_audit, write_artifact_audit_bundle
 from loc_gs.stdloc_native.evidence_gate import build_evidence_gate
+from loc_gs.stdloc_native.failure_aware_coreset import select_failure_aware_replacements
+from loc_gs.stdloc_native.negative_support_memory import normalize_negative_support_graph
 from loc_gs.stdloc_native.selector_resampling import write_resampled_detector_payload
 from loc_gs.stdloc_native.soft_prior import _assert_safe_output_map, _latest_point_cloud_path, _write_point_cloud_locability
 from loc_gs.stdloc_native.solver_admissibility import make_replacement_admissibility_checker
@@ -104,6 +106,117 @@ def _load_solver_admissibility_payload(path: str | Path | None) -> dict[str, Any
     if not path:
         return None
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _load_negative_support_graph(path: str | Path | None) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if not path:
+        return None, {"enabled": False}
+    payload = torch.load(Path(path), map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError("negative support graph artifact must be a dict")
+    graph = payload.get("graph", payload)
+    if not isinstance(graph, dict):
+        raise TypeError("negative support graph artifact graph must be a dict")
+    metadata = dict(payload.get("metadata", {})) if isinstance(payload.get("metadata", {}), dict) else {}
+    split = str(metadata.get("split_name", metadata.get("split", ""))).strip().lower()
+    if split == "test":
+        raise ValueError("test split negative support graph artifacts are not allowed")
+    normalized = normalize_negative_support_graph(graph)
+    return normalized, {
+        "enabled": True,
+        "path": str(path),
+        "split_name": str(metadata.get("split_name", metadata.get("split", "unknown"))),
+        "edge_count": int(normalized.get("edge_count", 0) or 0),
+        "unary_count": int(len(normalized.get("unary_risk", {}))),
+        "metadata": metadata,
+    }
+
+
+def _metric_like_scalar(value: Any) -> float:
+    if isinstance(value, dict):
+        if "value" in value:
+            return float(value["value"] or 0.0)
+        if "gain" in value:
+            return float(value["gain"] or 0.0)
+        if "risk" in value:
+            return float(value["risk"] or 0.0)
+        weights = {
+            "support": 1.0,
+            "viable_tuple_mass": 1.0,
+            "logdet_H": 1.0,
+            "min_eigenvalue": 1.0,
+            "min_eigen": 1.0,
+            "dense_worsen_risk": -1.0,
+            "dense_worsen": -1.0,
+            "ambiguity": -1.0,
+            "ambiguity_risk": -1.0,
+        }
+        return float(sum(float(value.get(key, 0.0) or 0.0) * weight for key, weight in weights.items()))
+    return float(value or 0.0)
+
+
+def _normalize_landmark_query_float_table(payload: Any) -> dict[int, dict[str, float]]:
+    out: dict[int, dict[str, float]] = {}
+    if not payload:
+        return out
+    if not isinstance(payload, dict):
+        raise TypeError("failure profile query tables must be mappings")
+    for raw_landmark, raw_query_map in payload.items():
+        landmark_id = int(raw_landmark)
+        out[landmark_id] = {}
+        for raw_query, raw_value in dict(raw_query_map).items():
+            out[landmark_id][str(raw_query)] = _metric_like_scalar(raw_value)
+    return out
+
+
+def _normalize_float_map(payload: Any) -> dict[int, float]:
+    out: dict[int, float] = {}
+    if not payload:
+        return out
+    if not isinstance(payload, dict):
+        raise TypeError("failure profile scalar tables must be mappings")
+    for raw_key, raw_value in payload.items():
+        out[int(raw_key)] = _metric_like_scalar(raw_value)
+    return out
+
+
+def _load_failure_profile(path: str | Path | None) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if not path:
+        return None, {"enabled": False}
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("failure profile must be a JSON object")
+    split_name = str(payload.get("split_name", payload.get("split", "unknown"))).strip()
+    if split_name.lower() == "test":
+        raise ValueError("test split failure profiles are not allowed")
+    baseline = {
+        str(query_id): float(te_cm)
+        for query_id, te_cm in dict(payload.get("query_baseline_dense_te_cm", {})).items()
+    }
+    if not baseline:
+        raise ValueError("failure profile must contain query_baseline_dense_te_cm")
+    candidate_gain = _normalize_landmark_query_float_table(payload.get("candidate_query_gain", {}))
+    profile = {
+        "query_baseline_dense_te_cm": baseline,
+        "candidate_query_gain": candidate_gain,
+        "candidate_regression_risk": _normalize_landmark_query_float_table(
+            payload.get("candidate_regression_risk", {})
+        ),
+        "dense_worsened_query_ids": [str(item) for item in payload.get("dense_worsened_query_ids", [])],
+        "source_loss": _normalize_float_map(payload.get("source_loss", {})),
+        "dense_worsen_risk": _normalize_float_map(payload.get("dense_worsen_risk", {})),
+        "ambiguity_risk": _normalize_float_map(payload.get("ambiguity_risk", {})),
+    }
+    metadata = {
+        "enabled": True,
+        "path": str(path),
+        "split_name": split_name or "unknown",
+        "query_count": int(len(baseline)),
+        "candidate_gain_count": int(len(candidate_gain)),
+        "dense_worsened_query_count": int(len(profile["dense_worsened_query_ids"])),
+        "schema": str(payload.get("schema", "loc_gs_failure_profile_v1")),
+    }
+    return profile, metadata
 
 
 def _load_solver_admissibility(path: str | Path | None, *, require_candidate_gain: bool = False):
@@ -273,8 +386,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--safe_core_path", default="")
     parser.add_argument("--candidate_pool_path", default="")
     parser.add_argument("--solver_admissibility_path", default="")
+    parser.add_argument("--negative_support_graph_path", default="")
+    parser.add_argument("--failure_profile_path", default="")
     parser.add_argument("--require_candidate_gain", action="store_true")
-    parser.add_argument("--selection_policy", choices=("local", "coverage"), default="local")
+    parser.add_argument("--selection_policy", choices=("local", "coverage", "failure_aware"), default="local")
     parser.add_argument("--require_candidate_pool", action="store_true")
     parser.add_argument("--min_positive_support", type=float, default=0.0)
     parser.add_argument("--max_hard_negative_risk", type=float, default=1.0)
@@ -331,6 +446,102 @@ def build_argparser() -> argparse.ArgumentParser:
         default=1.0,
         help="Per-query source support floor protected by --selection_policy coverage.",
     )
+    parser.add_argument(
+        "--coverage_saturation_mode",
+        choices=("none", "native_percentile", "native_fraction"),
+        default="none",
+        help="Saturate hard-query coverage gains for large-edit coverage policies.",
+    )
+    parser.add_argument(
+        "--coverage_saturation_percentile",
+        type=float,
+        default=0.75,
+        help="Native query coverage percentile used by --coverage_saturation_mode native_percentile.",
+    )
+    parser.add_argument(
+        "--coverage_saturation_fraction",
+        type=float,
+        default=1.0,
+        help="Per-query native coverage fraction used by --coverage_saturation_mode native_fraction.",
+    )
+    parser.add_argument(
+        "--easy_query_gain_decay",
+        type=float,
+        default=0.0,
+        help="Residual positive gain multiplier for queries already above the saturation target.",
+    )
+    parser.add_argument(
+        "--tail_cvar_alpha",
+        type=float,
+        default=0.0,
+        help="Fraction of lowest coverage-ratio hard queries boosted during coverage selection.",
+    )
+    parser.add_argument(
+        "--tail_query_gain_boost",
+        type=float,
+        default=1.0,
+        help="Additional gain multiplier for tail queries selected by --tail_cvar_alpha.",
+    )
+    parser.add_argument(
+        "--hard_query_min_gain",
+        type=float,
+        default=0.0,
+        help="Minimum positive gain on under-covered hard queries required for a coverage candidate.",
+    )
+    parser.add_argument(
+        "--saturation_drop_protection_weight",
+        type=float,
+        default=0.0,
+        help="Penalty weight for dropping source landmarks below saturation targets.",
+    )
+    parser.add_argument(
+        "--negative_conflict_pair_weight",
+        type=float,
+        default=0.0,
+        help="Penalty weight for selected pairwise hard-negative conflicts.",
+    )
+    parser.add_argument(
+        "--negative_conflict_unary_weight",
+        type=float,
+        default=0.0,
+        help="Penalty weight for adding unary hard-negative landmarks from the graph.",
+    )
+    parser.add_argument(
+        "--failure_protected_te_cm",
+        type=float,
+        default=15.0,
+        help="Baseline dense TE below which queries are protected by --selection_policy failure_aware.",
+    )
+    parser.add_argument(
+        "--failure_hard_te_cm",
+        type=float,
+        default=20.0,
+        help="Baseline dense TE above which queries receive hard-query gain under --selection_policy failure_aware.",
+    )
+    parser.add_argument(
+        "--failure_max_protected_regression_cm",
+        type=float,
+        default=0.0,
+        help="Maximum total protected-query regression risk allowed for a failure-aware candidate.",
+    )
+    parser.add_argument(
+        "--failure_dense_worsen_weight",
+        type=float,
+        default=1.0,
+        help="Dense-worsen risk penalty weight for --selection_policy failure_aware.",
+    )
+    parser.add_argument(
+        "--failure_ambiguity_weight",
+        type=float,
+        default=1.0,
+        help="Ambiguity risk penalty weight for --selection_policy failure_aware.",
+    )
+    parser.add_argument(
+        "--failure_conflict_weight",
+        type=float,
+        default=1.0,
+        help="Pairwise hard-negative conflict penalty weight for --selection_policy failure_aware.",
+    )
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
     return parser
@@ -351,6 +562,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("candidate_pool_path is required when require_candidate_pool is enabled")
     if str(args.selection_policy) == "coverage" and not str(args.solver_admissibility_path).strip():
         raise ValueError("solver_admissibility_path is required when selection_policy=coverage")
+    if str(args.selection_policy) == "failure_aware" and not str(args.failure_profile_path).strip():
+        raise ValueError("failure_profile_path is required when selection_policy=failure_aware")
     source_map = Path(args.source_map)
     output_map = Path(args.output_map)
     source_idx = _load_source_idx(source_map)
@@ -426,6 +639,8 @@ def main(argv: list[str] | None = None) -> int:
         args.solver_admissibility_path,
         require_candidate_gain=bool(args.require_candidate_gain),
     )
+    negative_graph, negative_graph_metadata = _load_negative_support_graph(args.negative_support_graph_path)
+    failure_profile, failure_profile_metadata = _load_failure_profile(args.failure_profile_path)
     effective_max_edits, adaptive_edit_budget = _resolve_effective_max_edits(
         int(args.max_edits),
         admissibility_metadata,
@@ -448,7 +663,8 @@ def main(argv: list[str] | None = None) -> int:
                 if safe_core_tensor is None
                 else torch.unique(torch.cat([safe_core_tensor, protected], dim=0)).long().cpu()
             )
-    if str(args.selection_policy) == "local":
+    selection_policy = str(args.selection_policy)
+    if selection_policy == "local":
         edit = solver_aware_local_edit(
             source_idx=source_idx,
             candidate_pool=candidate_pool.long().reshape(-1).cpu(),
@@ -459,7 +675,7 @@ def main(argv: list[str] | None = None) -> int:
             max_edits=int(effective_max_edits),
             max_drop_scan=int(args.admissibility_drop_scan),
         )
-    else:
+    elif selection_policy == "coverage":
         solver_payload = _load_solver_admissibility_payload(args.solver_admissibility_path) or {}
         edit = solver_coverage_local_edit(
             source_idx=source_idx,
@@ -473,7 +689,54 @@ def main(argv: list[str] | None = None) -> int:
             max_drop_scan=int(args.admissibility_drop_scan),
             min_coverage_gain=float(args.min_coverage_gain),
             min_query_coverage=float(args.min_query_coverage),
+            coverage_saturation_mode=str(args.coverage_saturation_mode),
+            coverage_saturation_percentile=float(args.coverage_saturation_percentile),
+            coverage_saturation_fraction=float(args.coverage_saturation_fraction),
+            easy_query_gain_decay=float(args.easy_query_gain_decay),
+            tail_cvar_alpha=float(args.tail_cvar_alpha),
+            tail_query_gain_boost=float(args.tail_query_gain_boost),
+            hard_query_min_gain=float(args.hard_query_min_gain),
+            saturation_drop_protection_weight=float(args.saturation_drop_protection_weight),
+            negative_support_graph=negative_graph,
+            negative_conflict_pair_weight=float(args.negative_conflict_pair_weight),
+            negative_conflict_unary_weight=float(args.negative_conflict_unary_weight),
         )
+    else:
+        if failure_profile is None:
+            raise ValueError("failure_profile_path is required when selection_policy=failure_aware")
+        pool = candidate_pool.long().reshape(-1).cpu()
+        evidence = gate["mask"].bool().reshape(-1).cpu()
+        gated_candidates = [
+            int(item)
+            for item in pool.tolist()
+            if 0 <= int(item) < int(evidence.numel()) and bool(evidence[int(item)].item())
+        ]
+        protected_sources = safe_core_tensor.long().reshape(-1).cpu().tolist() if safe_core_tensor is not None else []
+        failure_result = select_failure_aware_replacements(
+            source_ids=[int(item) for item in source_idx.tolist()],
+            candidate_ids=gated_candidates,
+            query_baseline_dense_te_cm=failure_profile["query_baseline_dense_te_cm"],
+            candidate_query_gain=failure_profile["candidate_query_gain"],
+            candidate_regression_risk=failure_profile["candidate_regression_risk"],
+            dense_worsened_query_ids=failure_profile["dense_worsened_query_ids"],
+            source_loss=failure_profile["source_loss"],
+            dense_worsen_risk=failure_profile["dense_worsen_risk"],
+            ambiguity_risk=failure_profile["ambiguity_risk"],
+            negative_support_graph=negative_graph,
+            protected_source_ids=protected_sources,
+            max_edits=int(effective_max_edits),
+            protected_te_cm=float(args.failure_protected_te_cm),
+            hard_te_cm=float(args.failure_hard_te_cm),
+            max_protected_regression_cm=float(args.failure_max_protected_regression_cm),
+            dense_worsen_weight=float(args.failure_dense_worsen_weight),
+            ambiguity_weight=float(args.failure_ambiguity_weight),
+            conflict_weight=float(args.failure_conflict_weight),
+        )
+        edit = {
+            "sampled_idx": torch.as_tensor(failure_result["selected_ids"], dtype=torch.long).reshape(-1).cpu(),
+            "edits": list(failure_result["edits"]),
+            "metadata": dict(failure_result["metadata"]),
+        }
     edit["metadata"]["protected_source_score_count"] = int(protected_source_score_count)
     edit["metadata"]["effective_max_edits"] = int(effective_max_edits)
     payload = {
@@ -494,12 +757,13 @@ def main(argv: list[str] | None = None) -> int:
             lsf_metadata.get("split", support_metadata.get("split_name", support_metadata.get("split", "unknown"))),
         )
     )
+    method_by_policy = {
+        "local": "loc_gs_lsf_solver_aware_resampling",
+        "coverage": "loc_gs_lsf_solver_coverage_coreset",
+        "failure_aware": "loc_gs_lsf_failure_aware_coreset",
+    }
     manifest = {
-        "method": (
-            "loc_gs_lsf_solver_coverage_coreset"
-            if str(args.selection_policy) == "coverage"
-            else "loc_gs_lsf_solver_aware_resampling"
-        ),
+        "method": method_by_policy[str(args.selection_policy)],
         "git_commit": _git_commit(),
         "timestamp_utc": _datetime.datetime.now(_datetime.timezone.utc).isoformat(),
         "command": _command_from_argv(),
@@ -521,6 +785,8 @@ def main(argv: list[str] | None = None) -> int:
         "candidate_pool_path": str(args.candidate_pool_path),
         "candidate_pool_required": bool(args.require_candidate_pool),
         "solver_admissibility_path": str(args.solver_admissibility_path),
+        "negative_support_graph_path": str(args.negative_support_graph_path),
+        "failure_profile_path": str(args.failure_profile_path),
         "selection_policy": str(args.selection_policy),
         "single_path_deployment": True,
         "branch_selection": False,
@@ -543,6 +809,22 @@ def main(argv: list[str] | None = None) -> int:
             "selection_policy": str(args.selection_policy),
             "min_coverage_gain": float(args.min_coverage_gain),
             "min_query_coverage": float(args.min_query_coverage),
+            "coverage_saturation_mode": str(args.coverage_saturation_mode),
+            "coverage_saturation_percentile": float(args.coverage_saturation_percentile),
+            "coverage_saturation_fraction": float(args.coverage_saturation_fraction),
+            "easy_query_gain_decay": float(args.easy_query_gain_decay),
+            "tail_cvar_alpha": float(args.tail_cvar_alpha),
+            "tail_query_gain_boost": float(args.tail_query_gain_boost),
+            "hard_query_min_gain": float(args.hard_query_min_gain),
+            "saturation_drop_protection_weight": float(args.saturation_drop_protection_weight),
+            "negative_conflict_pair_weight": float(args.negative_conflict_pair_weight),
+            "negative_conflict_unary_weight": float(args.negative_conflict_unary_weight),
+            "failure_protected_te_cm": float(args.failure_protected_te_cm),
+            "failure_hard_te_cm": float(args.failure_hard_te_cm),
+            "failure_max_protected_regression_cm": float(args.failure_max_protected_regression_cm),
+            "failure_dense_worsen_weight": float(args.failure_dense_worsen_weight),
+            "failure_ambiguity_weight": float(args.failure_ambiguity_weight),
+            "failure_conflict_weight": float(args.failure_conflict_weight),
             "disable_lsf_sparse_risk": bool(args.disable_lsf_sparse_risk),
             "protect_source_score_min": float(args.protect_source_score_min),
             "extra_dense_worsen_penalty": extra_dense_worsen_penalty,
@@ -555,6 +837,8 @@ def main(argv: list[str] | None = None) -> int:
         },
         "solver_aware": edit["metadata"],
         "solver_admissibility": admissibility_metadata,
+        "negative_support_graph": negative_graph_metadata,
+        "failure_profile": failure_profile_metadata,
         "solver_consensus_support": support_metadata,
         "localization_support_field": lsf_metadata,
         "dense_support": {
@@ -567,6 +851,8 @@ def main(argv: list[str] | None = None) -> int:
         support_metadata,
         lsf_metadata,
         admissibility_metadata,
+        negative_graph_metadata,
+        failure_profile_metadata,
         branch_selection=False,
     )
     if args.dry_run:

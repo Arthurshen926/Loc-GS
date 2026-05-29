@@ -7,6 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from loc_gs.data.colmap_pose_repair import cambridge_pose_qnorm_issue_map
 from loc_gs.stdloc_native.commands import (
     CAMBRIDGE_SCENES,
     CommandJob,
@@ -82,6 +83,39 @@ def parse_map_name_overrides(values: list[str] | None) -> dict[str, str]:
             raise ValueError(f"map override must have non-empty scene names: {value}")
         overrides[scene] = map_scene
     return overrides
+
+
+def _scene_root(data_root: str | Path, scene: str) -> Path:
+    root = Path(data_root)
+    if (root / "dataset_train.txt").exists() or (root / "dataset_test.txt").exists():
+        return root
+    return root / scene
+
+
+def _check_scene_pose_qnorms(
+    *,
+    data_root: str | Path,
+    scene: str,
+    split: str,
+    allow_outliers: bool,
+) -> None:
+    scene_root = _scene_root(data_root, scene)
+    if not scene_root.exists():
+        return
+    issues = cambridge_pose_qnorm_issue_map(scene_root, split=split)
+    if not issues:
+        return
+    examples = ", ".join(
+        f"{name}: qnorm={issue.qnorm:.6f}" for name, issue in list(issues.items())[:5]
+    )
+    message = (
+        f"non-unit COLMAP quaternion(s) found in {scene_root} for split={split}: {examples}. "
+        "Use a qvec-normalized repaired scene root for paper-facing STDLoc jobs."
+    )
+    if allow_outliers:
+        print(f"[warning] {message}")
+        return
+    raise ValueError(message)
 
 
 def _launch_one_job(
@@ -181,6 +215,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--stream_cameras", action="store_true")
     parser.add_argument("--train_only_cameras", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument(
+        "--allow_pose_qnorm_outliers",
+        action="store_true",
+        help="Allow non-unit COLMAP camera quaternions. Diagnostic only; not paper-facing.",
+    )
     return parser
 
 
@@ -191,8 +230,20 @@ def main(args: argparse.Namespace | None = None) -> None:
     jobs: list[tuple[str, str, CommandJob]] = []
     for scene, gpu in assignments:
         if args.phase in {"train", "both"}:
+            _check_scene_pose_qnorms(
+                data_root=args.data_root,
+                scene=scene,
+                split="train",
+                allow_outliers=bool(args.allow_pose_qnorm_outliers),
+            )
             jobs.append(("train", scene, _make_train_job(args, scene, gpu)))
         if args.phase in {"eval", "both"}:
+            _check_scene_pose_qnorms(
+                data_root=args.data_root,
+                scene=scene,
+                split=args.eval_split,
+                allow_outliers=bool(args.allow_pose_qnorm_outliers),
+            )
             jobs.append(("eval", scene, _make_eval_job(args, scene, gpu)))
     if args.dry_run:
         for _phase, _scene, job in jobs:

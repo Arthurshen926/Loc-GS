@@ -78,6 +78,8 @@ def test_distill_dense_lsf_targets_suppresses_dense_worsened_gaussians(tmp_path)
     assert payload["metadata"]["feedback_bank_schema"] == "feedback_bank_v2"
     assert payload["metadata"]["usage_scope"] == "dense_residual_teacher_only"
     assert payload["metadata"]["sparse_selector_safe"] is False
+    assert payload["metadata"]["split_audit"]["audit_status"] == "passed"
+    assert payload["metadata"]["feedback_bank_audit_status"] == "passed"
 
 
 def test_distill_dense_lsf_cli_writes_targets_and_summary(tmp_path):
@@ -110,3 +112,4 @@ def test_distill_dense_lsf_cli_writes_targets_and_summary(tmp_path):
     assert summary["selected_count"] == 2
     assert summary["usage_scope"] == "dense_residual_teacher_only"
     assert summary["sparse_selector_safe"] is False
+    assert summary["feedback_bank_audit_status"] == "passed"

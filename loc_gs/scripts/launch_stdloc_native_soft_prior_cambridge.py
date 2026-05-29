@@ -6,6 +6,7 @@ from pathlib import Path
 
 from loc_gs.scripts.launch_stdloc_native_cambridge import (
     _launch_jobs,
+    _check_scene_pose_qnorms,
     assign_scene_gpus,
     parse_map_name_overrides,
     repo_root,
@@ -100,6 +101,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max_test_cameras", type=int, default=0)
     parser.add_argument("--test_stride", type=int, default=1)
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument(
+        "--allow_pose_qnorm_outliers",
+        action="store_true",
+        help="Allow non-unit COLMAP camera quaternions. Diagnostic only; not paper-facing.",
+    )
     return parser
 
 
@@ -111,6 +117,12 @@ def main(args: argparse.Namespace | None = None) -> None:
     output_map_root = Path(args.output_map_root)
     jobs: list[tuple[str, str, CommandJob]] = []
     for scene, gpu in assignments:
+        _check_scene_pose_qnorms(
+            data_root=args.data_root,
+            scene=scene,
+            split=args.eval_split,
+            allow_outliers=bool(args.allow_pose_qnorm_outliers),
+        )
         map_scene = overrides.get(scene, scene)
         output_map_scene = _soft_map_scene(scene, args.output_map_suffix)
         source_map = Path(args.source_map_root) / map_scene

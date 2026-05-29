@@ -3,9 +3,11 @@ from __future__ import annotations
 import bisect
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 import torch
+
+from loc_gs.stdloc_native.negative_support_memory import conflict_delta, normalize_negative_support_graph
 
 
 _METRIC_FIELDS = (
@@ -39,6 +41,9 @@ class CoverageTables:
     source_utility: dict[int, dict[str, float]]
     weights: dict[str, float]
     thresholds: dict[str, Any]
+
+
+CoverageSaturationMode = Literal["none", "native_percentile", "native_fraction"]
 
 
 def _long_vector(values: torch.Tensor | Any, *, name: str) -> torch.Tensor:
@@ -168,16 +173,108 @@ def _candidate_coverage_gain(
     add_id: int,
     coverage: Mapping[str, float],
     tables: CoverageTables,
+    *,
+    saturation_targets: Mapping[str, float] | None = None,
+    easy_query_gain_decay: float = 0.0,
+    tail_query_ids: set[str] | None = None,
+    tail_query_gain_boost: float = 1.0,
 ) -> tuple[float, dict[str, float]]:
     per_query: dict[str, float] = {}
     score = 0.0
     candidate_utility = tables.candidate_utility.get(int(add_id), {})
     for query_id in tables.hard_query_ids:
         utility = float(candidate_utility.get(query_id, 0.0))
-        per_query[query_id] = float(utility)
-        novelty = 1.0 / math.sqrt(1.0 + max(0.0, float(coverage.get(query_id, 0.0))))
-        score += float(utility) * novelty
+        effective = float(utility)
+        target = None if saturation_targets is None else saturation_targets.get(query_id)
+        if target is not None and utility > 0.0:
+            remaining = max(0.0, float(target) - max(0.0, float(coverage.get(query_id, 0.0))))
+            capped = min(float(utility), remaining)
+            excess = max(0.0, float(utility) - capped)
+            effective = capped + max(0.0, float(easy_query_gain_decay)) * excess
+        per_query[query_id] = float(effective)
+        if target is not None and target > 0.0:
+            deficit_ratio = max(0.0, float(target) - max(0.0, float(coverage.get(query_id, 0.0)))) / float(target)
+            novelty = 1.0 + deficit_ratio
+        else:
+            novelty = 1.0 / math.sqrt(1.0 + max(0.0, float(coverage.get(query_id, 0.0))))
+        if tail_query_ids is not None and query_id in tail_query_ids:
+            novelty *= 1.0 + max(0.0, float(tail_query_gain_boost))
+        score += float(effective) * novelty
     return float(score - _candidate_threshold_penalty(add_id, tables)), per_query
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    qf = min(1.0, max(0.0, float(q)))
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = qf * float(len(ordered) - 1)
+    lo = int(math.floor(position))
+    hi = int(math.ceil(position))
+    if lo == hi:
+        return float(ordered[lo])
+    weight = position - float(lo)
+    return float((1.0 - weight) * ordered[lo] + weight * ordered[hi])
+
+
+def _build_saturation_targets(
+    coverage: Mapping[str, float],
+    *,
+    mode: CoverageSaturationMode | str = "none",
+    percentile: float = 0.75,
+    fraction: float = 1.0,
+) -> tuple[dict[str, float] | None, dict[str, Any]]:
+    mode_text = str(mode or "none")
+    if mode_text == "none":
+        return None, {
+            "enabled": False,
+            "mode": "none",
+            "target_count": 0,
+            "saturated_query_count": 0,
+        }
+    if mode_text not in {"native_percentile", "native_fraction"}:
+        raise ValueError("coverage_saturation_mode must be one of: none, native_percentile, native_fraction")
+    if mode_text == "native_percentile":
+        target_value = _percentile(list(coverage.values()), float(percentile))
+        targets = {str(query_id): float(target_value) for query_id in coverage}
+    else:
+        frac = max(0.0, float(fraction))
+        targets = {str(query_id): max(0.0, float(value) * frac) for query_id, value in coverage.items()}
+    saturated_count = sum(1 for query_id, target in targets.items() if float(coverage.get(query_id, 0.0)) >= float(target))
+    finite_targets = list(targets.values())
+    return targets, {
+        "enabled": True,
+        "mode": mode_text,
+        "target_count": int(len(targets)),
+        "saturated_query_count": int(saturated_count),
+        "target_min": float(min(finite_targets)) if finite_targets else 0.0,
+        "target_median": _percentile(finite_targets, 0.5),
+        "target_max": float(max(finite_targets)) if finite_targets else 0.0,
+        "percentile": float(percentile),
+        "fraction": float(fraction),
+    }
+
+
+def _tail_query_ids(
+    coverage: Mapping[str, float],
+    targets: Mapping[str, float] | None,
+    *,
+    alpha: float,
+) -> set[str]:
+    alpha_f = max(0.0, min(1.0, float(alpha)))
+    if alpha_f <= 0.0:
+        return set()
+    ratios: list[tuple[float, str]] = []
+    for query_id, value in coverage.items():
+        target = None if targets is None else targets.get(query_id)
+        denom = float(target) if target is not None and float(target) > 0.0 else max(1.0, float(value))
+        ratios.append((float(value) / denom, str(query_id)))
+    if not ratios:
+        return set()
+    count = max(1, int(math.ceil(alpha_f * len(ratios))))
+    return {query_id for _, query_id in sorted(ratios)[:count]}
 
 
 def _drop_cost(
@@ -188,6 +285,9 @@ def _drop_cost(
     tables: CoverageTables,
     utility_t: torch.Tensor,
     min_query_coverage: float,
+    saturation_targets: Mapping[str, float] | None = None,
+    tail_query_ids: set[str] | None = None,
+    saturation_drop_protection_weight: float = 0.0,
 ) -> tuple[float, bool]:
     cost = float(utility_t[int(drop_id)].item())
     protected = False
@@ -205,6 +305,12 @@ def _drop_cost(
         if projected < float(min_query_coverage):
             protected = True
             cost += 10.0 * (float(min_query_coverage) - projected + drop_contrib)
+        if saturation_targets is not None and float(saturation_drop_protection_weight) > 0.0:
+            target = float(saturation_targets.get(query_id, 0.0))
+            if target > 0.0 and projected < target:
+                deficit_ratio = (target - projected) / target
+                tail_boost = 2.0 if tail_query_ids is not None and query_id in tail_query_ids else 1.0
+                cost += float(saturation_drop_protection_weight) * tail_boost * drop_contrib * deficit_ratio
     cost -= 0.001 * overlap_reward
     return float(cost), protected
 
@@ -285,6 +391,17 @@ def solver_coverage_local_edit(
     max_drop_scan: int = 1,
     min_coverage_gain: float = 0.0,
     min_query_coverage: float = 1.0,
+    coverage_saturation_mode: CoverageSaturationMode | str = "none",
+    coverage_saturation_percentile: float = 0.75,
+    coverage_saturation_fraction: float = 1.0,
+    easy_query_gain_decay: float = 0.0,
+    tail_cvar_alpha: float = 0.0,
+    tail_query_gain_boost: float = 1.0,
+    hard_query_min_gain: float = 0.0,
+    saturation_drop_protection_weight: float = 0.0,
+    negative_support_graph: Mapping[str, Any] | None = None,
+    negative_conflict_pair_weight: float = 0.0,
+    negative_conflict_unary_weight: float = 0.0,
 ) -> dict[str, Any]:
     """Same-budget local replacement with hard-query solver coverage scoring."""
 
@@ -308,6 +425,13 @@ def solver_coverage_local_edit(
         if int(item) not in safe
     )
     coverage = _initial_query_coverage(selected, coverage_tables)
+    saturation_targets, saturation_metadata = _build_saturation_targets(
+        coverage,
+        mode=coverage_saturation_mode,
+        percentile=float(coverage_saturation_percentile),
+        fraction=float(coverage_saturation_fraction),
+    )
+    tail_queries = _tail_query_ids(coverage, saturation_targets, alpha=float(tail_cvar_alpha))
     source_by_query = _source_contrib_by_query(coverage_tables)
     initial_coverage = dict(coverage)
     edits: list[dict[str, Any]] = []
@@ -318,14 +442,52 @@ def solver_coverage_local_edit(
     drop_cost_evaluations = 0
     drop_scan_limit = max(1, int(max_drop_scan))
     max_edits_i = max(0, int(max_edits))
+    negative_graph = normalize_negative_support_graph(negative_support_graph)
+    conflict_enabled = (
+        bool(negative_graph.get("edge_weights") or negative_graph.get("unary_risk"))
+        and (float(negative_conflict_pair_weight) > 0.0 or float(negative_conflict_unary_weight) > 0.0)
+    )
+    conflict_penalty_sum = 0.0
 
     while candidate_set and removable and len(edits) < max_edits_i:
         scored_candidates: list[tuple[float, float, int, dict[str, float]]] = []
         for add_id in candidate_set:
-            coverage_gain, per_query = _candidate_coverage_gain(add_id, coverage, coverage_tables)
+            coverage_gain, per_query = _candidate_coverage_gain(
+                add_id,
+                coverage,
+                coverage_tables,
+                saturation_targets=saturation_targets,
+                easy_query_gain_decay=float(easy_query_gain_decay),
+                tail_query_ids=tail_queries,
+                tail_query_gain_boost=float(tail_query_gain_boost),
+            )
             if coverage_gain < float(min_coverage_gain):
                 continue
-            total_score = float(coverage_gain) + float(utility_t[int(add_id)].item())
+            undercovered_gain = 0.0
+            if saturation_targets is not None:
+                for query_id, gain in per_query.items():
+                    if float(coverage.get(query_id, 0.0)) < float(saturation_targets.get(query_id, 0.0)):
+                        undercovered_gain += max(0.0, float(gain))
+            else:
+                undercovered_gain = sum(max(0.0, float(value)) for value in per_query.values())
+            if undercovered_gain < float(hard_query_min_gain):
+                continue
+            add_conflict = (
+                max(
+                    0.0,
+                    conflict_delta(
+                        add_id=int(add_id),
+                        drop_id=None,
+                        selected_ids=selected,
+                        graph=negative_graph,
+                        pair_weight=float(negative_conflict_pair_weight),
+                        unary_weight=float(negative_conflict_unary_weight),
+                    ),
+                )
+                if conflict_enabled
+                else 0.0
+            )
+            total_score = float(coverage_gain) + float(utility_t[int(add_id)].item()) - float(add_conflict)
             scored_candidates.append((-total_score, -coverage_gain, int(add_id), per_query))
         if not scored_candidates:
             rejected_low_gain += int(len(candidate_set))
@@ -348,6 +510,9 @@ def solver_coverage_local_edit(
                     tables=coverage_tables,
                     utility_t=utility_t,
                     min_query_coverage=float(min_query_coverage),
+                    saturation_targets=saturation_targets,
+                    tail_query_ids=tail_queries,
+                    saturation_drop_protection_weight=float(saturation_drop_protection_weight),
                 )
                 if protected:
                     protected_drop_count += 1
@@ -357,21 +522,44 @@ def solver_coverage_local_edit(
                 drop_scan_attempts += 1
                 coverage_gain = -float(neg_coverage_gain)
                 utility_gain = float(utility_t[int(add_id)].item()) - float(utility_t[int(drop_id)].item())
-                replacement_gain = float(coverage_gain) + float(utility_gain) - float(cost)
+                conflict_cost = (
+                    max(
+                        0.0,
+                        conflict_delta(
+                            add_id=int(add_id),
+                            drop_id=int(drop_id),
+                            selected_ids=selected,
+                            graph=negative_graph,
+                            pair_weight=float(negative_conflict_pair_weight),
+                            unary_weight=float(negative_conflict_unary_weight),
+                        ),
+                    )
+                    if conflict_enabled
+                    else 0.0
+                )
+                replacement_gain = float(coverage_gain) + float(utility_gain) - float(cost) - float(conflict_cost)
                 if replacement_gain <= 0.0:
                     rejected_low_gain += 1
                     continue
                 if is_admissible is not None and not bool(is_admissible(add_id, drop_id)):
                     rejected_by_admissibility += 1
                     continue
-                accepted = (int(add_id), int(drop_id), float(coverage_gain), float(replacement_gain), add_per_query)
+                accepted = (
+                    int(add_id),
+                    int(drop_id),
+                    float(coverage_gain),
+                    float(replacement_gain),
+                    add_per_query,
+                    float(conflict_cost),
+                )
                 break
             if accepted is not None:
                 break
             candidate_set.remove(int(add_id))
         if accepted is None:
             break
-        add_id, drop_id, coverage_gain, replacement_gain, _ = accepted
+        add_id, drop_id, coverage_gain, replacement_gain, _, conflict_cost = accepted
+        conflict_penalty_sum += float(conflict_cost)
         selected.remove(drop_id)
         selected.add(add_id)
         candidate_set.discard(add_id)
@@ -389,6 +577,7 @@ def solver_coverage_local_edit(
                 "coverage_gain": float(coverage_gain),
                 "replacement_gain": float(replacement_gain),
                 "utility_gain": float(utility_t[int(add_id)].item()) - float(utility_t[int(drop_id)].item()),
+                "negative_conflict_penalty": float(conflict_cost),
             }
         )
 
@@ -419,10 +608,25 @@ def solver_coverage_local_edit(
         "max_edits": int(max_edits_i),
         "min_coverage_gain": float(min_coverage_gain),
         "min_query_coverage": float(min_query_coverage),
+        "coverage_saturation": saturation_metadata,
+        "easy_query_gain_decay": float(easy_query_gain_decay),
+        "tail_cvar_alpha": float(tail_cvar_alpha),
+        "tail_query_gain_boost": float(tail_query_gain_boost),
+        "tail_query_count": int(len(tail_queries)),
+        "hard_query_min_gain": float(hard_query_min_gain),
         "hard_query_count": int(len(coverage_tables.hard_query_ids)),
+        "negative_support_graph": {
+            "enabled": bool(conflict_enabled),
+            "edge_count": int(negative_graph.get("edge_count", 0) or 0),
+            "unary_count": int(len(negative_graph.get("unary_risk", {}))),
+            "pair_weight": float(negative_conflict_pair_weight),
+            "unary_weight": float(negative_conflict_unary_weight),
+            "applied_penalty_sum": float(conflict_penalty_sum),
+        },
         "initial_query_coverage": initial_coverage,
         "final_query_coverage": {key: float(value) for key, value in coverage.items()},
     }
+    metadata["coverage_saturation"]["drop_protection_weight"] = float(saturation_drop_protection_weight)
     return {
         "sampled_idx": sampled,
         "edits": edits,

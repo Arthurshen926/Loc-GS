@@ -106,7 +106,9 @@ def _read_null_terminated_string(fid) -> str:
 
 
 def _qvec_to_rotmat(qvec: np.ndarray) -> np.ndarray:
-    w, x, y, z = qvec.astype(np.float64)
+    q = qvec.astype(np.float64)
+    q = q / max(float(np.linalg.norm(q)), 1e-12)
+    w, x, y, z = q
     return np.array(
         [
             [1.0 - 2.0 * y * y - 2.0 * z * z, 2.0 * x * y - 2.0 * w * z, 2.0 * x * z + 2.0 * w * y],

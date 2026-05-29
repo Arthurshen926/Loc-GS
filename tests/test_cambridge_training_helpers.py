@@ -5,10 +5,13 @@ from loc_gs.scripts.train_cambridge_hybrid import (
     build_argparser,
     camera_centers_from_w2c,
     descriptor_residual_alignment_loss,
+    descriptor_reconstruction_losses,
     extract_superpoint_teacher_batch,
+    filter_superpoint_query_mask_by_semantic_mask,
     interpolate_pose_batch,
     locability_prior_alignment_loss,
     make_feature_renderer_intrinsics,
+    masked_detector_kl_loss,
     normalize_position_map,
     pair_candidate_indices,
     pnp_feedback_detector_loss,
@@ -60,6 +63,48 @@ def test_resize_teacher_outputs_to_feature_grid_normalizes_descriptor():
     assert det_small.shape == (1, 65, 3, 4)
     norms = desc_small.norm(dim=1)
     assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+
+def test_descriptor_reconstruction_losses_ignore_invalid_semantic_pixels():
+    target = F.normalize(torch.ones(1, 4, 2, 2), p=2, dim=1)
+    pred = target.clone()
+    pred[:, :, 0, 1] = -target[:, :, 0, 1]
+    valid_mask = torch.tensor([[[[True, False], [True, True]]]])
+
+    losses = descriptor_reconstruction_losses(pred, target, valid_mask=valid_mask)
+
+    assert torch.allclose(losses["l2"], torch.tensor(0.0))
+    assert torch.allclose(losses["cos"], torch.tensor(0.0), atol=1e-6)
+
+
+def test_masked_detector_kl_loss_ignores_invalid_semantic_cells():
+    pred = torch.zeros(1, 3, 2, 2)
+    target = torch.zeros(1, 3, 2, 2)
+    pred[:, 0, 0, 1] = 20.0
+    target[:, 1, 0, 1] = 20.0
+    valid_mask = torch.tensor([[[[True, False], [True, True]]]])
+
+    masked = masked_detector_kl_loss(pred, target, valid_mask=valid_mask)
+    unmasked = masked_detector_kl_loss(pred, target, valid_mask=None)
+
+    assert masked < 1e-5
+    assert unmasked > 1.0
+
+
+def test_filter_superpoint_query_mask_by_semantic_mask_drops_invalid_keypoints():
+    keypoints = torch.tensor([[[0.0, 0.0], [0.0, 1.0], [1.0, 1.0]]])
+    query_mask = torch.tensor([[True, True, True]])
+    valid_mask = torch.ones(1, 1, 16, 16, dtype=torch.bool)
+    valid_mask[:, :, 0, 8] = False
+
+    filtered = filter_superpoint_query_mask_by_semantic_mask(
+        keypoints,
+        query_mask,
+        valid_mask,
+        stride=8,
+    )
+
+    assert filtered.tolist() == [[True, False, True]]
 
 
 def test_extract_superpoint_teacher_batch_recomputes_mixed_shape_cache_entries():
@@ -170,6 +215,9 @@ def test_training_parser_exposes_same_view_geometric_match_options():
             "3",
             "--teacher_feature_source",
             "original",
+            "--semantic_mask_mode",
+            "dynamic_sky",
+            "--require_semantic_masks",
         ]
     )
     assert args.same_view_match_weight == 2.0
@@ -192,6 +240,8 @@ def test_training_parser_exposes_same_view_geometric_match_options():
     assert args.locability_prior_target_start_epoch == 2
     assert args.locability_prior_target_warmup_epochs == 3
     assert args.teacher_feature_source == "original"
+    assert args.semantic_mask_mode == "dynamic_sky"
+    assert args.require_semantic_masks is True
 
 
 def test_training_parser_defaults_to_conservative_reliability_recipe():

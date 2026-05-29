@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 
+from loc_gs.data.cambridge_semantic_masks import CambridgeSemanticMaskStore, resize_semantic_mask
+
 
 @dataclass(frozen=True)
 class CambridgeCameraRecord:
@@ -73,6 +75,8 @@ class CambridgeHybridDataset(Dataset):
         cx: Optional[float] = None,
         cy: Optional[float] = None,
         max_frames: int = 0,
+        semantic_mask_mode: str = "none",
+        require_semantic_masks: bool = False,
     ) -> None:
         self.scene_root = Path(scene_root)
         self.split = split
@@ -83,6 +87,21 @@ class CambridgeHybridDataset(Dataset):
         self._fallback_fy = fy
         self._fallback_cx = cx
         self._fallback_cy = cy
+        if semantic_mask_mode not in {"none", "dynamic", "dynamic_sky"}:
+            raise ValueError(f"Unsupported semantic_mask_mode={semantic_mask_mode!r}")
+        self.semantic_mask_mode = semantic_mask_mode
+        self.semantic_masks = CambridgeSemanticMaskStore(
+            path=None,
+            masks={},
+            remove_sky=semantic_mask_mode == "dynamic_sky",
+        )
+        if semantic_mask_mode != "none":
+            self.semantic_masks = CambridgeSemanticMaskStore.from_scene(
+                self.scene_root,
+                image_subdir=self.image_subdir,
+                remove_sky=semantic_mask_mode == "dynamic_sky",
+                require=require_semantic_masks,
+            )
 
         if cameras_json is not None:
             self.records = self._load_camera_json(Path(cameras_json))
@@ -216,6 +235,20 @@ class CambridgeHybridDataset(Dataset):
             "cy": record.cy * sy,
         }
 
+    def semantic_mask_audit(self) -> dict[str, object]:
+        audit = self.semantic_masks.audit()
+        audit["mode"] = self.semantic_mask_mode
+        audit["image_subdir"] = self.image_subdir
+        return audit
+
+    def _semantic_valid_mask(self, image_name: str, height: int, width: int) -> tuple[torch.Tensor, bool]:
+        if self.semantic_mask_mode == "none":
+            return torch.ones(1, height, width, dtype=torch.bool), False
+        available = self.semantic_masks.loaded and image_name in self.semantic_masks.masks
+        mask = self.semantic_masks.valid_mask(image_name, fallback_hw=(height, width))
+        mask = resize_semantic_mask(mask, height=height, width=width)
+        return mask.unsqueeze(0), available
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         record = self.records[idx]
         rgb = self._load_rgb(self._image_path(record.image_name))
@@ -232,6 +265,11 @@ class CambridgeHybridDataset(Dataset):
         feature_K = K.clone()
         feature_K[0, :] /= 8.0
         feature_K[1, :] /= 8.0
+        semantic_valid_mask, semantic_mask_available = self._semantic_valid_mask(
+            record.image_name,
+            height,
+            width,
+        )
         return {
             "rgb": rgb,
             "pose_w2c": torch.from_numpy(record.pose_w2c.copy()),
@@ -239,4 +277,6 @@ class CambridgeHybridDataset(Dataset):
             "feature_K": feature_K,
             "image_name": record.image_name,
             "frame_idx": torch.tensor(idx, dtype=torch.long),
+            "semantic_valid_mask": semantic_valid_mask,
+            "semantic_mask_available": torch.tensor(semantic_mask_available, dtype=torch.bool),
         }

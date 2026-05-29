@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
+from loc_gs.data.colmap_pose_repair import cambridge_pose_qnorm_issue_map
 from loc_gs.export.manifest import audit_split_usage, write_export_eval_audit_bundle
 
 
@@ -488,6 +489,37 @@ def _native_train_eval_split_audit(
     return audit
 
 
+def _attach_pose_qnorm_audit(
+    audit: dict[str, Any],
+    *,
+    scene: str,
+    data_root: str,
+    eval_split: str,
+) -> dict[str, Any]:
+    scene_root = _resolve_scene_root(data_root, scene)
+    if scene_root is None or not scene_root.exists():
+        return audit
+    issues = cambridge_pose_qnorm_issue_map(scene_root, split=str(eval_split))
+    checks = audit.setdefault("checks", {})
+    checks["pose_qnorm"] = {
+        "status": "failed" if issues else "passed",
+        "source": "colmap_images_bin" if (scene_root / "sparse" / "0" / "images.bin").exists() else "cambridge_pose_split",
+        "scene_root": str(scene_root),
+        "split": str(eval_split),
+        "issue_count": int(len(issues)),
+        "issues_sample": [
+            {
+                "image_name": name,
+                "qnorm": round(float(issue.qnorm), 9),
+                "delta": round(float(issue.delta), 9),
+            }
+            for name, issue in list(issues.items())[:20]
+        ],
+    }
+    audit["audit_status"] = _audit_status_from_checks(checks)
+    return audit
+
+
 def _map_reporting_fields(map_path_text: str) -> dict[str, Any]:
     map_path = Path(map_path_text)
     fields: dict[str, Any] = {}
@@ -557,6 +589,12 @@ def write_native_eval_audit_bundle(
             feedback_bank_manifest={"split_name": feedback_split},
             quality_gate={"mode": quality_gate_mode, "per_query_branch_selection": False},
         )
+    split_audit = _attach_pose_qnorm_audit(
+        dict(split_audit),
+        scene=scene,
+        data_root=data_root,
+        eval_split=eval_split,
+    )
     cfg_hparams = _cfg_hyperparameters(_copied_cfg_path(root))
     evaluator_safety = _evaluator_safety(cfg_hparams)
     hyperparameters = {

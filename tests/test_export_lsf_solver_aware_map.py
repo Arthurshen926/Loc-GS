@@ -844,3 +844,202 @@ def test_export_lsf_solver_aware_map_uses_coverage_policy(tmp_path):
     assert 5 not in sampled
     assert manifest["selection_policy"] == "coverage"
     assert manifest["solver_aware"]["coverage_policy"] == "solver_coverage_coreset"
+
+
+def test_export_lsf_solver_aware_map_records_coverage_saturation_policy(tmp_path):
+    source = tmp_path / "source_map"
+    output = tmp_path / "output_map"
+    _dump_pickle(source / "detector" / "sampled_idx.pkl", torch.tensor([0, 1, 2], dtype=torch.long))
+    _dump_pickle(source / "detector" / "sampled_scores.pkl", torch.ones(3, dtype=torch.float32))
+    (source / "manifest.json").write_text("{}", encoding="utf-8")
+    selector_path = tmp_path / "selector.pt"
+    positive_path = tmp_path / "positive.pt"
+    candidate_pool_path = tmp_path / "candidate_pool.pt"
+    constraints_path = tmp_path / "solver_constraints.json"
+    torch.save(torch.tensor([0.0, 0.0, 0.1, 0.99, 0.5], dtype=torch.float32), selector_path)
+    torch.save(torch.ones(5, dtype=torch.float32), positive_path)
+    torch.save(torch.tensor([3, 4], dtype=torch.long), candidate_pool_path)
+    constraints_path.write_text(
+        json.dumps(
+            {
+                "hard_query_ids": ["easy", "hard"],
+                "candidate_gain": {
+                    "3": {"easy": {"support": 1000.0}},
+                    "4": {"hard": {"support": 2.0}},
+                },
+                "source_loss": {
+                    "0": {"easy": {"support": 100.0}},
+                    "1": {"hard": {"support": 1.0}},
+                    "2": {},
+                },
+                "thresholds": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loc_gs.scripts.export_lsf_solver_aware_map",
+            "--source_map",
+            str(source),
+            "--selector_path",
+            str(selector_path),
+            "--positive_support_path",
+            str(positive_path),
+            "--candidate_pool_path",
+            str(candidate_pool_path),
+            "--solver_admissibility_path",
+            str(constraints_path),
+            "--selection_policy",
+            "coverage",
+            "--coverage_saturation_mode",
+            "native_percentile",
+            "--coverage_saturation_percentile",
+            "0.5",
+            "--tail_cvar_alpha",
+            "0.5",
+            "--tail_query_gain_boost",
+            "1.0",
+            "--hard_query_min_gain",
+            "0.1",
+            "--saturation_drop_protection_weight",
+            "1.0",
+            "--output_map",
+            str(output),
+            "--max_edits",
+            "1",
+        ],
+        check=True,
+    )
+
+    sampled = set(torch.as_tensor(pickle.load((output / "detector" / "sampled_idx.pkl").open("rb"))).tolist())
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert 4 in sampled
+    assert 3 not in sampled
+    assert manifest["hyperparameters"]["coverage_saturation_mode"] == "native_percentile"
+    assert manifest["hyperparameters"]["coverage_saturation_percentile"] == 0.5
+    assert manifest["hyperparameters"]["tail_cvar_alpha"] == 0.5
+    assert manifest["hyperparameters"]["hard_query_min_gain"] == 0.1
+    assert manifest["hyperparameters"]["saturation_drop_protection_weight"] == 1.0
+    assert manifest["solver_aware"]["coverage_saturation"]["enabled"] is True
+    assert manifest["solver_aware"]["coverage_saturation"]["drop_protection_weight"] == 1.0
+
+
+def test_export_lsf_solver_aware_map_uses_failure_aware_policy(tmp_path):
+    source = tmp_path / "source_map"
+    output = tmp_path / "output_map"
+    _dump_pickle(source / "detector" / "sampled_idx.pkl", torch.tensor([0, 1, 2], dtype=torch.long))
+    _dump_pickle(source / "detector" / "sampled_scores.pkl", torch.ones(3, dtype=torch.float32))
+    (source / "manifest.json").write_text("{}", encoding="utf-8")
+    selector_path = tmp_path / "selector.pt"
+    positive_path = tmp_path / "positive.pt"
+    candidate_pool_path = tmp_path / "candidate_pool.pt"
+    failure_profile_path = tmp_path / "failure_profile.json"
+    torch.save(torch.ones(6, dtype=torch.float32), selector_path)
+    torch.save(torch.ones(6, dtype=torch.float32), positive_path)
+    torch.save(torch.tensor([3, 4, 5], dtype=torch.long), candidate_pool_path)
+    failure_profile_path.write_text(
+        json.dumps(
+            {
+                "split_name": "selfmap_train",
+                "query_baseline_dense_te_cm": {"easy": 8.0, "hard": 45.0, "dense_bad": 18.0},
+                "dense_worsened_query_ids": ["dense_bad"],
+                "candidate_query_gain": {
+                    "3": {"hard": 5.0},
+                    "4": {"hard": 8.0},
+                    "5": {"dense_bad": 4.0},
+                },
+                "candidate_regression_risk": {
+                    "4": {"easy": 0.5},
+                },
+                "dense_worsen_risk": {"5": 10.0},
+                "ambiguity_risk": {},
+                "source_loss": {"0": 3.0, "1": 1.0, "2": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loc_gs.scripts.export_lsf_solver_aware_map",
+            "--source_map",
+            str(source),
+            "--selector_path",
+            str(selector_path),
+            "--positive_support_path",
+            str(positive_path),
+            "--candidate_pool_path",
+            str(candidate_pool_path),
+            "--failure_profile_path",
+            str(failure_profile_path),
+            "--selection_policy",
+            "failure_aware",
+            "--output_map",
+            str(output),
+            "--max_edits",
+            "2",
+        ],
+        check=True,
+    )
+
+    sampled = set(torch.as_tensor(pickle.load((output / "detector" / "sampled_idx.pkl").open("rb"))).tolist())
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert 3 in sampled
+    assert 4 not in sampled
+    assert 5 not in sampled
+    assert 0 not in sampled
+    assert manifest["method"] == "loc_gs_lsf_failure_aware_coreset"
+    assert manifest["selection_policy"] == "failure_aware"
+    assert manifest["failure_profile"]["split_name"] == "selfmap_train"
+    assert manifest["solver_aware"]["selected_recipe"] == "lsf_v7_failure_aware"
+
+
+def test_export_lsf_solver_aware_map_rejects_test_failure_profile(tmp_path):
+    source = tmp_path / "source_map"
+    output = tmp_path / "output_map"
+    _dump_pickle(source / "detector" / "sampled_idx.pkl", torch.tensor([0, 1], dtype=torch.long))
+    _dump_pickle(source / "detector" / "sampled_scores.pkl", torch.ones(2, dtype=torch.float32))
+    selector_path = tmp_path / "selector.pt"
+    failure_profile_path = tmp_path / "failure_profile.json"
+    torch.save(torch.ones(3, dtype=torch.float32), selector_path)
+    failure_profile_path.write_text(
+        json.dumps(
+            {
+                "split_name": "test",
+                "query_baseline_dense_te_cm": {"q0": 100.0},
+                "candidate_query_gain": {"2": {"q0": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loc_gs.scripts.export_lsf_solver_aware_map",
+            "--source_map",
+            str(source),
+            "--selector_path",
+            str(selector_path),
+            "--failure_profile_path",
+            str(failure_profile_path),
+            "--selection_policy",
+            "failure_aware",
+            "--output_map",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "test split failure profiles are not allowed" in result.stderr
+    assert not output.exists()

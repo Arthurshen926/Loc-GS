@@ -114,6 +114,19 @@ def _resolve_cfg(path: str | Path) -> Path:
     raise FileNotFoundError(f"STDLoc cfg not found: {path}")
 
 
+def _validate_cfg_supported_by_feedback_exporter(path: str | Path) -> None:
+    cfg_path = _resolve_cfg(path)
+    payload = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid STDLoc cfg for feedback export: {cfg_path}")
+    dense_solver = str(payload.get("dense", {}).get("solver", "poselib"))
+    if dense_solver in _OPENCV_PROSAC_SOLVERS:
+        raise ValueError(
+            "feedback exporter dense solver must be supported by the vendored "
+            f"STDLoc dense path; got dense solver={dense_solver!r}"
+        )
+
+
 def _resolve_scene_images_for_export(scene_root: str | Path, preferred: str) -> str:
     root = Path(scene_root)
     if root.exists() and preferred and not (root / preferred).exists():
@@ -155,6 +168,117 @@ def _match_ranks(query_indices: list[int], scores: list[float]) -> list[int]:
         for rank, (index, _score) in enumerate(sorted(entries, key=lambda item: (-item[1], item[0])), start=1):
             ranks[index] = rank
     return ranks
+
+
+_OPENCV_PROSAC_SOLVERS = {"opencv_prosac", "opencv_prosac_magsac"}
+
+
+def _solve_opencv_prosac_pose(
+    p2d: np.ndarray,
+    p3d: np.ndarray,
+    K: np.ndarray,
+    solver: str,
+    reprojection_error: float,
+    confidence: float,
+    max_iterations: int,
+    min_iterations: int,
+    match_scores: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    import cv2
+
+    del min_iterations
+    image_points = np.asarray(p2d, dtype=np.float64).reshape(-1, 2)
+    object_points = np.asarray(p3d, dtype=np.float64).reshape(-1, 3)
+    camera_matrix = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    if image_points.shape[0] < 4 or object_points.shape[0] < 4:
+        return np.eye(4, dtype=np.float32), np.array([], dtype=np.int32)
+
+    order = np.arange(image_points.shape[0])
+    if match_scores is not None:
+        scores = np.asarray(match_scores, dtype=np.float64).reshape(-1)
+        if scores.shape[0] == image_points.shape[0]:
+            score_key = np.where(np.isfinite(scores), scores, -np.inf)
+            order = np.argsort(score_key)[::-1]
+            image_points = image_points[order]
+            object_points = object_points[order]
+
+    if hasattr(cv2, "UsacParams"):
+        params = cv2.UsacParams()
+        params.confidence = float(confidence)
+        params.maxIterations = int(max_iterations)
+        params.threshold = float(reprojection_error)
+        params.sampler = cv2.SAMPLING_PROSAC
+        if solver == "opencv_prosac_magsac" and hasattr(cv2, "SCORE_METHOD_MAGSAC"):
+            params.score = cv2.SCORE_METHOD_MAGSAC
+        elif hasattr(cv2, "SCORE_METHOD_MSAC"):
+            params.score = cv2.SCORE_METHOD_MSAC
+        ok, _camera_matrix, rvec, tvec, inliers = cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            camera_matrix,
+            None,
+            None,
+            None,
+            None,
+            params,
+        )
+    else:
+        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            camera_matrix,
+            distCoeffs=np.zeros((4, 1)),
+            reprojectionError=float(reprojection_error),
+            confidence=float(confidence),
+            iterationsCount=int(max_iterations),
+            flags=cv2.SOLVEPNP_EPNP,
+        )
+
+    if not ok:
+        return np.eye(4, dtype=np.float32), np.array([], dtype=np.int32)
+    pose = np.eye(4, dtype=np.float32)
+    cv2.Rodrigues(rvec, pose[:3, :3])
+    pose[:3, 3] = np.asarray(tvec).reshape(-1)[:3]
+    if inliers is None:
+        return pose, np.array([], dtype=np.int32)
+    sorted_inliers = np.asarray(inliers).reshape(-1).astype(np.int64)
+    return pose, order[sorted_inliers].astype(np.int32)
+
+
+def _solve_pose_for_feedback(
+    stdloc_module: Any,
+    p2d: np.ndarray,
+    p3d: np.ndarray,
+    K: np.ndarray,
+    solver: str,
+    reprojection_error: float,
+    confidence: float,
+    max_iterations: int,
+    min_iterations: int,
+    match_scores: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if solver in _OPENCV_PROSAC_SOLVERS:
+        return _solve_opencv_prosac_pose(
+            p2d,
+            p3d,
+            K,
+            solver,
+            reprojection_error,
+            confidence,
+            max_iterations,
+            min_iterations,
+            match_scores,
+        )
+    return stdloc_module.solve_pose(
+        p2d,
+        p3d,
+        K,
+        solver,
+        reprojection_error,
+        confidence,
+        max_iterations,
+        min_iterations,
+    )
 
 
 def _captured_sparse_localize(
@@ -216,7 +340,8 @@ def _captured_sparse_localize(
     matched_xy = all_xy[kp_mask.cpu()][im_idx.cpu()].numpy().astype(np.float64) + 0.5
     p3d = stdloc.landmarks.get_xyz[gs_ids].detach().cpu().numpy()
     intrinsic = stdloc_module.get_intrinsic(fovx, fovy, width, height)
-    pose_w2c, inliers = stdloc_module.solve_pose(
+    pose_w2c, inliers = _solve_pose_for_feedback(
+        stdloc_module,
         matched_xy,
         p3d,
         intrinsic,
@@ -225,7 +350,7 @@ def _captured_sparse_localize(
         stdloc.config["sparse"]["confidence"],
         stdloc.config["sparse"]["max_iterations"],
         stdloc.config["sparse"]["min_iterations"],
-        match_scores=match_scores.detach().cpu().numpy(),
+        match_scores.detach().cpu().numpy(),
     )
     inliers = np.asarray(inliers).reshape(-1).astype(np.int64)
     scores = [float(item) for item in match_scores.detach().cpu().reshape(-1).tolist()]
@@ -263,7 +388,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--map_root", required=True)
     parser.add_argument("--map_scene", default="")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--cfg", default="configs/stdloc_cambridge_opencv.yaml")
+    parser.add_argument("--cfg", default="third_party/stdloc/configs/stdloc_spgs_cambridge_dense1.yaml")
     parser.add_argument("--images", default="processed")
     parser.add_argument("--feature_type", default="sp")
     parser.add_argument("--gaussian_type", default="3dgs")
@@ -302,6 +427,7 @@ def export_feedback_bank(args: argparse.Namespace) -> dict[str, Any]:
     if split_audit.get("audit_status") != "passed":
         raise ValueError("split_audit_json must have audit_status=passed")
     cfg_path = _resolve_cfg(args.cfg)
+    _validate_cfg_supported_by_feedback_exporter(cfg_path)
     if args.dry_run:
         return {
             "dry_run": True,

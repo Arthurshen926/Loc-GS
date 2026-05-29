@@ -1,0 +1,39 @@
+{
+  "format": "loc_gs_masked_rebuild_launcher_v1",
+  "started_at_utc": "2026-05-27T05:57:49.997089+00:00",
+  "map_root": "/root/Loc-GS/output/stdloc/map_cambridge_spgs_semantic_mask_trainonly_20260527",
+  "log_dir": "/root/Loc-GS/logs/stdloc_native_semantic_mask_trainonly_20260527",
+  "launched": [
+    {
+      "gpu": "0",
+      "pid": 27006,
+      "scenes": [
+        "GreatCourt",
+        "StMarysChurch"
+      ],
+      "queue_log": "/root/Loc-GS/logs/stdloc_native_semantic_mask_trainonly_20260527/gpu0_queue.log"
+    },
+    {
+      "gpu": "1",
+      "pid": 27008,
+      "scenes": [
+        "OldHospital"
+      ],
+      "queue_log": "/root/Loc-GS/logs/stdloc_native_semantic_mask_trainonly_20260527/gpu1_queue.log"
+    },
+    {
+      "gpu": "2",
+      "pid": 27010,
+      "scenes": [
+        "ShopFacade"
+      ],
+      "queue_log": "/root/Loc-GS/logs/stdloc_native_semantic_mask_trainonly_20260527/gpu2_queue.log"
+    }
+  ],
+  "skipped": [
+    {
+      "scene": "KingsCollege",
+      "reason": "no processed/masks.pkl in local Cambridge_stdloc tree"
+    }
+  ]
+}

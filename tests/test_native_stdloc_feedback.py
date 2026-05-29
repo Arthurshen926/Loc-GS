@@ -1,6 +1,8 @@
 import pytest
 from pathlib import Path
 
+import numpy as np
+
 from loc_gs.feedback.audit import audit_feedback_bank_v2
 from loc_gs.feedback.io import save_feedback_bank
 from loc_gs.scripts import export_native_stdloc_feedback_bank
@@ -109,3 +111,75 @@ def test_native_feedback_resolves_missing_processed_images_to_scene_root(tmp_pat
     )
 
     assert images == "."
+
+
+def test_feedback_solve_pose_omits_scores_for_vendored_poselib_solver():
+    class VendoredModule:
+        @staticmethod
+        def solve_pose(*args, **kwargs):
+            assert "match_scores" not in kwargs
+            return np.eye(4, dtype=np.float32), np.array([0, 2], dtype=np.int32)
+
+    pose, inliers = export_native_stdloc_feedback_bank._solve_pose_for_feedback(
+        VendoredModule,
+        np.zeros((4, 2), dtype=np.float64),
+        np.zeros((4, 3), dtype=np.float64),
+        np.eye(3, dtype=np.float64),
+        "poselib",
+        12.0,
+        0.999,
+        100,
+        10,
+        match_scores=np.ones(4, dtype=np.float64),
+    )
+
+    assert pose.shape == (4, 4)
+    assert inliers.tolist() == [0, 2]
+
+
+def test_feedback_solve_pose_routes_opencv_prosac_to_local_solver(monkeypatch):
+    calls = []
+
+    class VendoredModule:
+        @staticmethod
+        def solve_pose(*args, **kwargs):
+            raise AssertionError("vendored solve_pose should not receive opencv_prosac_magsac")
+
+    def fake_opencv_solver(*args, **kwargs):
+        calls.append((args, kwargs))
+        return np.eye(4, dtype=np.float32), np.array([1, 3], dtype=np.int32)
+
+    monkeypatch.setattr(export_native_stdloc_feedback_bank, "_solve_opencv_prosac_pose", fake_opencv_solver)
+
+    pose, inliers = export_native_stdloc_feedback_bank._solve_pose_for_feedback(
+        VendoredModule,
+        np.zeros((4, 2), dtype=np.float64),
+        np.zeros((4, 3), dtype=np.float64),
+        np.eye(3, dtype=np.float64),
+        "opencv_prosac_magsac",
+        12.0,
+        0.999,
+        100,
+        10,
+        match_scores=np.ones(4, dtype=np.float64),
+    )
+
+    assert pose.shape == (4, 4)
+    assert inliers.tolist() == [1, 3]
+    assert calls
+
+
+def test_native_feedback_cfg_rejects_opencv_prosac_dense_solver(tmp_path):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        """
+sparse:
+  solver: opencv_prosac_magsac
+dense:
+  solver: opencv_prosac_magsac
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="dense solver"):
+        export_native_stdloc_feedback_bank._validate_cfg_supported_by_feedback_exporter(cfg)
