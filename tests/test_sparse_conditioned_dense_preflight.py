@@ -247,6 +247,60 @@ def test_sparse_ray_gaussian_gating_uses_footprint_and_opacity():
     assert result["protected_count"] == 1
 
 
+def test_sparse_ray_gaussian_gating_can_require_midrange_large_footprint_artifacts():
+    pose = np.eye(4, dtype=np.float32)
+    intrinsic = np.array(
+        [[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    sparse_points = np.array([[0.0, 0.0, 30.0]], dtype=np.float32)
+    sparse_query_xy = np.array([[50.0, 50.0]], dtype=np.float32)
+    gaussian_xyz = np.array(
+        [
+            [0.0, 0.0, 25.0],  # normal small foreground structure: keep
+            [0.0, 0.0, 15.0],  # medium-range large footprint artifact: mask
+            [0.0, 0.0, 2.0],   # near-camera blob should be handled by guided pose: keep
+            [0.0, 0.0, 70.0],  # far structure is behind sparse point: keep
+        ],
+        dtype=np.float32,
+    )
+    gaussian_scale_world = np.array(
+        [
+            [0.2, 0.2, 0.2],
+            [1.0, 1.0, 1.0],
+            [5.0, 5.0, 5.0],
+            [4.0, 4.0, 4.0],
+        ],
+        dtype=np.float32,
+    )
+    gaussian_opacity = np.array([0.9, 0.9, 0.9, 0.9], dtype=np.float32)
+
+    result = compute_sparse_ray_gaussian_gating_mask(
+        gaussian_xyz=gaussian_xyz,
+        gaussian_scale_world=gaussian_scale_world,
+        gaussian_opacity=gaussian_opacity,
+        sparse_query_xy=sparse_query_xy,
+        sparse_points_world=sparse_points,
+        sparse_pose_w2c=pose,
+        intrinsic=intrinsic,
+        sparse_inlier_indices=np.array([0]),
+        image_size=(100, 100),
+        radius_px=2.0,
+        depth_margin_m=2.0,
+        footprint_radius_scale=1.0,
+        min_conflict_footprint_radius_px=4.0,
+        min_conflict_depth_m=5.0,
+        max_conflict_depth_m=40.0,
+        min_opacity=0.01,
+    )
+
+    assert result["conflict_indices"].tolist() == [1]
+    assert result["keep_mask"].tolist() == [True, False, True, True]
+    assert result["min_conflict_footprint_radius_px"] == 4.0
+    assert result["min_conflict_depth_m"] == 5.0
+    assert result["max_conflict_depth_m"] == 40.0
+
+
 def test_sparse_ray_conflict_search_matches_bruteforce_with_variable_footprints():
     gaussian_xy = np.array(
         [
@@ -777,6 +831,45 @@ def test_select_repaired_pose_candidate_returns_base_when_gain_is_too_small():
 
     assert selected["decision"] == "accept_original_dense_pose"
     assert selected["selected_label"] == "base"
+
+
+def test_select_repaired_pose_candidate_accepts_valid_repair_when_base_preflight_fails():
+    evaluations = [
+        {
+            "label": "base",
+            "translation_cam_m": (0.0, 0.0, 0.0),
+            "preflight": {
+                "decision": "skip_dense_keep_sparse",
+                "visible_ratio": 0.0,
+                "visible_count": 0,
+                "coverage_grid_cells": 0,
+                "feature_cosine_median": 0.0,
+                "failed_checks": {"visibility": True, "feature_agreement": True},
+            },
+        },
+        {
+            "label": "gated_ray_up+5.000",
+            "translation_cam_m": (0.0, -5.0, 0.0),
+            "preflight": {
+                "decision": "accept_dense",
+                "visible_ratio": 0.55,
+                "visible_count": 67,
+                "coverage_grid_cells": 7,
+                "feature_cosine_median": 0.52,
+                "failed_checks": {},
+            },
+        },
+    ]
+
+    selected = select_repaired_pose_candidate(
+        evaluations,
+        require_accept=True,
+        min_score_gain=2.0,
+        translation_penalty_per_m=0.75,
+    )
+
+    assert selected["decision"] == "accept_repaired_dense_pose"
+    assert selected["selected_label"] == "gated_ray_up+5.000"
 
 
 def test_select_repaired_pose_candidate_allows_low_confidence_gated_base():

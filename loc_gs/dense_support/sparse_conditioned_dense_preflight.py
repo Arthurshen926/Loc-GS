@@ -345,6 +345,9 @@ def compute_sparse_ray_gaussian_gating_mask(
     depth_margin_m: float = 1.0,
     footprint_radius_scale: float = 0.0,
     max_footprint_radius_px: float = 64.0,
+    min_conflict_footprint_radius_px: float = 0.0,
+    min_conflict_depth_m: float = 0.0,
+    max_conflict_depth_m: float | None = None,
     min_opacity: float = 0.0,
     protected_gaussian_indices: Sequence[int] | np.ndarray | None = None,
     chunk_size: int = 65536,
@@ -400,6 +403,9 @@ def compute_sparse_ray_gaussian_gating_mask(
             "depth_margin_m": float(depth_margin_m),
             "footprint_radius_scale": float(footprint_radius_scale),
             "max_footprint_radius_px": float(max_footprint_radius_px),
+            "min_conflict_footprint_radius_px": float(min_conflict_footprint_radius_px),
+            "min_conflict_depth_m": float(min_conflict_depth_m),
+            "max_conflict_depth_m": None if max_conflict_depth_m is None else float(max_conflict_depth_m),
             "min_opacity": float(min_opacity),
             "diagnostic_only": True,
         }
@@ -428,6 +434,11 @@ def compute_sparse_ray_gaussian_gating_mask(
             max_radius_px=float(max_footprint_radius_px),
         )
         opacity_ok = np.ones_like(gaussian_valid, dtype=bool) if opacity_all is None else opacity_all[start:stop] >= float(min_opacity)
+        artifact_like = opacity_ok & (footprint_radius >= float(min_conflict_footprint_radius_px))
+        if float(min_conflict_depth_m) > 0.0:
+            artifact_like &= gaussian_depth >= float(min_conflict_depth_m)
+        if max_conflict_depth_m is not None and np.isfinite(float(max_conflict_depth_m)):
+            artifact_like &= gaussian_depth <= float(max_conflict_depth_m)
         chunk_conflict, _chunk_conflicted_rays = _find_sparse_ray_conflicts_projected(
             projected_xy=projected_xy,
             gaussian_depth=gaussian_depth,
@@ -437,7 +448,7 @@ def compute_sparse_ray_gaussian_gating_mask(
             radius_px=float(radius_px),
             footprint_radius=footprint_radius,
             depth_margin_m=float(depth_margin_m),
-            active_mask=opacity_ok,
+            active_mask=artifact_like,
         )
         conflict_mask[start:stop] = chunk_conflict
     conflict_mask &= ~protected_mask
@@ -456,6 +467,9 @@ def compute_sparse_ray_gaussian_gating_mask(
         "depth_margin_m": float(depth_margin_m),
         "footprint_radius_scale": float(footprint_radius_scale),
         "max_footprint_radius_px": float(max_footprint_radius_px),
+        "min_conflict_footprint_radius_px": float(min_conflict_footprint_radius_px),
+        "min_conflict_depth_m": float(min_conflict_depth_m),
+        "max_conflict_depth_m": None if max_conflict_depth_m is None else float(max_conflict_depth_m),
         "min_opacity": float(min_opacity),
         "diagnostic_only": True,
     }
@@ -1313,6 +1327,8 @@ def select_repaired_pose_candidate(
         )
     base_score = scored[0][0]
     base = scored[0][1]
+    base_preflight = dict(base.get("preflight", {}))
+    base_passes = base_preflight.get("decision") == "accept_dense"
     best_score, best = max(scored, key=lambda item: item[0])
     best_preflight = dict(best.get("preflight", {}))
     passes = best_preflight.get("decision") == "accept_dense"
@@ -1326,6 +1342,8 @@ def select_repaired_pose_candidate(
     if require_accept and not passes:
         decision = "skip_dense_keep_sparse"
     elif bool(allow_low_confidence_gated_base) and low_confidence_gated_base:
+        decision = "accept_repaired_dense_pose"
+    elif (not bool(base_passes)) and bool(passes) and str(best.get("label")) != "base" and score_gain > 0.0:
         decision = "accept_repaired_dense_pose"
     elif score_gain < float(min_score_gain):
         decision = "accept_original_dense_pose"

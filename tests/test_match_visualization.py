@@ -1,3 +1,5 @@
+import inspect
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -135,11 +137,23 @@ def test_sparse_conditioned_render_control_resolves_fixed_fusion_recipe():
     assert options["slcdp_transition_control"] is True
     assert options["slcdp_repair_min_score_gain"] == pytest.approx(2.0)
     assert options["slcdp_gating_radius_px"] == pytest.approx(6.0)
+    assert options["slcdp_gating_depth_margin_m"] == pytest.approx(1.0)
     assert options["slcdp_gating_footprint_radius_scale"] == pytest.approx(1.5)
+    assert options["slcdp_gating_min_footprint_radius_px"] == pytest.approx(12.0)
+    assert options["slcdp_gating_min_depth_m"] == pytest.approx(5.0)
+    assert options["slcdp_gating_max_depth_m"] == pytest.approx(60.0)
     assert options["slcdp_repair_translation_penalty_per_m"] == pytest.approx(0.75)
     assert options["slcdp_allow_low_confidence_gated_base"] is False
     assert options["slcdp_low_confidence_gated_base_min_score_gain"] == pytest.approx(0.25)
     assert options["slcdp_transition_min_retained_ratio"] == pytest.approx(0.875)
+
+
+def test_sparse_conditioned_effective_options_match_analyze_case_signature():
+    args = hard_match_viz.build_argparser().parse_args(["--slcdp_render_control", "sparse_conditioned"])
+    options = hard_match_viz._resolve_slcdp_effective_options(args)
+    signature = inspect.signature(hard_match_viz._analyze_case)
+
+    assert set(options).issubset(set(signature.parameters))
 
 
 def test_sparse_conditioned_base_candidate_does_not_apply_gating():
@@ -265,6 +279,102 @@ def test_sparse_conditioned_rejects_repair_when_it_degrades_dense_quality_tail()
     assert decision["reason"] == "repair_degrades_dense_quality_tail"
 
 
+def test_sparse_conditioned_rejects_repair_when_it_damages_coherent_dense_core():
+    base_quality = {
+        "match_count": 5320,
+        "solver_inlier_count": 3828,
+        "solver_inlier_ratio": 0.7195,
+        "median_reprojection_error_px": 0.90,
+        "p90_reprojection_error_px": 249.4,
+    }
+    repair_quality = {
+        "match_count": 5313,
+        "solver_inlier_count": 1865,
+        "solver_inlier_ratio": 0.3510,
+        "median_reprojection_error_px": 62.9,
+        "p90_reprojection_error_px": 313.4,
+    }
+
+    decision = hard_match_viz._should_reject_sparse_conditioned_repair_for_dense_quality_regression(
+        base_quality,
+        repair_quality,
+    )
+
+    assert decision["reject_repair"] is True
+    assert decision["reason"] == "repair_degrades_dense_quality_core"
+
+
+def test_sparse_conditioned_does_not_protect_bad_dense_core():
+    base_quality = {
+        "match_count": 3605,
+        "solver_inlier_count": 689,
+        "solver_inlier_ratio": 0.191,
+        "median_reprojection_error_px": 192.9,
+        "p90_reprojection_error_px": 435.3,
+    }
+    repair_quality = {
+        "match_count": 4378,
+        "solver_inlier_count": 706,
+        "solver_inlier_ratio": 0.161,
+        "median_reprojection_error_px": 172.1,
+        "p90_reprojection_error_px": 422.8,
+    }
+
+    decision = hard_match_viz._should_reject_sparse_conditioned_repair_for_dense_quality_regression(
+        base_quality,
+        repair_quality,
+    )
+
+    assert decision["reject_repair"] is False
+    assert decision["reason"] == "base_dense_quality_not_protective"
+
+
+def test_sparse_conditioned_rejects_gating_only_repair_with_weak_sparse_support():
+    sparse_capture = {
+        "inliers": np.arange(26, dtype=np.int64),
+        "p3d": np.zeros((30, 3), dtype=np.float32),
+    }
+
+    decision = hard_match_viz._should_reject_gating_only_repair_for_weak_sparse_support(
+        selected_label="gated_base",
+        sparse_capture=sparse_capture,
+    )
+
+    assert decision["reject_repair"] is True
+    assert decision["reason"] == "weak_sparse_support_gating_only"
+    assert decision["sparse_inlier_count"] == 26
+
+
+def test_sparse_conditioned_allows_gating_only_repair_with_strong_sparse_support():
+    sparse_capture = {
+        "inliers": np.arange(96, dtype=np.int64),
+        "p3d": np.zeros((96, 3), dtype=np.float32),
+    }
+
+    decision = hard_match_viz._should_reject_gating_only_repair_for_weak_sparse_support(
+        selected_label="gated_base",
+        sparse_capture=sparse_capture,
+    )
+
+    assert decision["reject_repair"] is False
+    assert decision["reason"] == "sparse_support_sufficient_for_gating_only"
+
+
+def test_sparse_conditioned_weak_sparse_guard_does_not_block_guided_pose():
+    sparse_capture = {
+        "inliers": np.arange(20, dtype=np.int64),
+        "p3d": np.zeros((20, 3), dtype=np.float32),
+    }
+
+    decision = hard_match_viz._should_reject_gating_only_repair_for_weak_sparse_support(
+        selected_label="gated_ray_centroid+5.000",
+        sparse_capture=sparse_capture,
+    )
+
+    assert decision["reject_repair"] is False
+    assert decision["reason"] == "not_gating_only"
+
+
 def test_sparse_conditioned_keeps_repair_when_base_dense_quality_is_already_bad():
     base_quality = {
         "match_count": 5000,
@@ -341,6 +451,31 @@ def test_transition_control_only_runs_for_non_base_repair_candidates():
         )
         is True
     )
+
+
+def test_sparse_conditioned_rejects_low_quality_dense_repair_when_sparse_is_strong():
+    sparse_capture = {
+        "query_xy": np.zeros((200, 2), dtype=np.float32),
+        "p3d": np.zeros((200, 3), dtype=np.float32),
+        "inliers": np.arange(127, dtype=np.int32),
+    }
+    dense_quality = {
+        "match_count": 5931,
+        "solver_inlier_count": 2806,
+        "solver_inlier_ratio": 0.473,
+        "median_reprojection_error_px": 24.0,
+        "p90_reprojection_error_px": 273.0,
+    }
+
+    decision = hard_match_viz._should_reject_sparse_conditioned_dense_for_low_quality(
+        selected_label="gated_ray_up+2.000",
+        repair_selection={"decision": "accept_repaired_dense_pose"},
+        sparse_capture=sparse_capture,
+        dense_quality=dense_quality,
+    )
+
+    assert decision["reject_dense"] is True
+    assert decision["reason"] == "strong_sparse_low_quality_dense_repair"
 
 
 def test_sparse_conditioned_reuses_base_dense_when_no_repair_is_accepted():

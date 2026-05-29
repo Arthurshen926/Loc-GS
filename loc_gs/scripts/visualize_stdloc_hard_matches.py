@@ -185,14 +185,15 @@ def _should_reject_sparse_conditioned_repair_for_dense_quality_regression(
     base_ratio = _quality_float(base_quality, "solver_inlier_ratio", 0.0)
     base_median = _quality_float(base_quality, "median_reprojection_error_px", float("inf"))
     base_p90 = _quality_float(base_quality, "p90_reprojection_error_px", float("inf"))
+    repair_match_count = int(_quality_float(repair_quality, "match_count", 0.0))
     repair_ratio = _quality_float(repair_quality, "solver_inlier_ratio", 0.0)
+    repair_median = _quality_float(repair_quality, "median_reprojection_error_px", float("inf"))
     repair_p90 = _quality_float(repair_quality, "p90_reprojection_error_px", float("inf"))
     protective_base = (
         base_match_count >= 1000
         and base_inlier_count >= 500
-        and base_ratio >= 0.75
+        and base_ratio >= 0.70
         and base_median <= 2.5
-        and base_p90 <= 150.0
     )
     if not protective_base:
         return {
@@ -203,14 +204,142 @@ def _should_reject_sparse_conditioned_repair_for_dense_quality_regression(
         }
     tail_degraded = repair_p90 >= base_p90 + 50.0
     consensus_degraded = repair_ratio <= base_ratio - 0.02
-    reject = bool(tail_degraded and consensus_degraded)
+    core_median_degraded = repair_median >= max(base_median + 5.0, base_median * 5.0)
+    core_consensus_collapsed = repair_ratio <= base_ratio - 0.15
+    match_support_collapsed = repair_match_count <= int(0.80 * max(base_match_count, 1))
+    core_degraded = bool(core_median_degraded or (core_consensus_collapsed and match_support_collapsed))
+    reject = bool((tail_degraded and consensus_degraded) or core_degraded)
+    if core_degraded:
+        reason = "repair_degrades_dense_quality_core"
+    elif tail_degraded and consensus_degraded:
+        reason = "repair_degrades_dense_quality_tail"
+    else:
+        reason = "repair_dense_quality_not_worse"
     return {
         "reject_repair": reject,
-        "reason": "repair_degrades_dense_quality_tail" if reject else "repair_dense_quality_not_worse",
+        "reason": reason,
         "tail_degraded": bool(tail_degraded),
         "consensus_degraded": bool(consensus_degraded),
+        "core_median_degraded": bool(core_median_degraded),
+        "core_consensus_collapsed": bool(core_consensus_collapsed),
+        "match_support_collapsed": bool(match_support_collapsed),
         "base_quality": dict(base_quality),
         "repair_quality": dict(repair_quality),
+    }
+
+
+def _should_reject_sparse_conditioned_dense_for_low_quality(
+    *,
+    selected_label: str,
+    repair_selection: Mapping[str, Any] | None,
+    sparse_capture: Mapping[str, Any] | None,
+    dense_quality: Mapping[str, Any] | None,
+    min_sparse_inliers: int = DenseTransitionPolicy.strong_sparse_inlier_count,
+) -> dict[str, Any]:
+    """Reject repaired dense updates with poor no-GT dense consensus.
+
+    Sparse-conditioned render control can make anchor visibility look much
+    better while dense matching still produces a noisy, weak-consensus PnP.
+    For strong sparse anchors, such a dense update is not allowed to become the
+    final pose unless the dense correspondence set is internally coherent.
+    """
+
+    if str(selected_label) == "base":
+        return {"reject_dense": False, "reason": "base_candidate", "diagnostic_only": True}
+    if not isinstance(repair_selection, Mapping) or str(repair_selection.get("decision", "")) != "accept_repaired_dense_pose":
+        return {"reject_dense": False, "reason": "no_accepted_repair", "diagnostic_only": True}
+    if not isinstance(sparse_capture, Mapping):
+        return {"reject_dense": False, "reason": "missing_sparse_capture", "diagnostic_only": True}
+    sparse_inliers = np.asarray(sparse_capture.get("inliers", np.empty(0)), dtype=np.int64).reshape(-1)
+    sparse_inlier_count = int(sparse_inliers.shape[0])
+    if sparse_inlier_count < int(min_sparse_inliers):
+        return {
+            "reject_dense": False,
+            "reason": "sparse_support_not_strong",
+            "sparse_inlier_count": sparse_inlier_count,
+            "min_sparse_inliers": int(min_sparse_inliers),
+            "diagnostic_only": True,
+        }
+    if not isinstance(dense_quality, Mapping):
+        return {"reject_dense": False, "reason": "missing_dense_quality", "diagnostic_only": True}
+
+    match_count = int(_quality_float(dense_quality, "match_count", 0.0))
+    inlier_count = int(_quality_float(dense_quality, "solver_inlier_count", 0.0))
+    inlier_ratio = _quality_float(dense_quality, "solver_inlier_ratio", 0.0)
+    median_error = _quality_float(dense_quality, "median_reprojection_error_px", float("inf"))
+    p90_error = _quality_float(dense_quality, "p90_reprojection_error_px", float("inf"))
+    weak_consensus = inlier_ratio < 0.60
+    poor_core = median_error > 12.0
+    poor_tail = p90_error > 80.0
+    low_support = match_count < 256 or inlier_count < int(min_sparse_inliers)
+    reject = bool(low_support or (weak_consensus and (poor_core or poor_tail)))
+    if low_support:
+        reason = "strong_sparse_low_dense_support"
+    elif reject:
+        reason = "strong_sparse_low_quality_dense_repair"
+    else:
+        reason = "dense_quality_acceptable"
+    return {
+        "schema": "loc_gs_slcdp_dense_quality_guard_v1",
+        "decision": "reject_dense_keep_sparse" if reject else "accept_dense_update",
+        "reject_dense": reject,
+        "reason": reason,
+        "selected_label": str(selected_label),
+        "sparse_inlier_count": sparse_inlier_count,
+        "min_sparse_inliers": int(min_sparse_inliers),
+        "dense_quality": dict(dense_quality),
+        "failed_checks": {
+            "low_support": bool(low_support),
+            "weak_consensus": bool(weak_consensus),
+            "poor_core": bool(poor_core),
+            "poor_tail": bool(poor_tail),
+        },
+        "diagnostic_only": True,
+    }
+
+
+def _should_reject_gating_only_repair_for_weak_sparse_support(
+    *,
+    selected_label: str,
+    sparse_capture: Mapping[str, Any] | None,
+    min_sparse_inliers: int = DenseTransitionPolicy.strong_sparse_inlier_count,
+) -> dict[str, Any]:
+    """Reject zero-motion ray gating when sparse support is too weak.
+
+    Ray-depth gating uses sparse inlier rays to decide which Gaussians are
+    artifacts. With too few inliers, that prior is not reliable enough to
+    override native dense. Guided-pose candidates are evaluated separately.
+    """
+
+    if str(selected_label) != "gated_base":
+        return {
+            "reject_repair": False,
+            "reason": "not_gating_only",
+            "selected_label": str(selected_label),
+        }
+    if not isinstance(sparse_capture, Mapping):
+        return {
+            "reject_repair": True,
+            "reason": "missing_sparse_capture_for_gating_only",
+            "selected_label": str(selected_label),
+            "sparse_inlier_count": 0,
+            "min_sparse_inliers": int(min_sparse_inliers),
+        }
+    inliers = np.asarray(sparse_capture.get("inliers", []), dtype=np.int64).reshape(-1)
+    points = sparse_capture.get("p3d")
+    if points is not None:
+        point_count = int(np.asarray(points).reshape(-1, 3).shape[0])
+        inliers = inliers[(inliers >= 0) & (inliers < point_count)]
+    else:
+        inliers = inliers[inliers >= 0]
+    inlier_count = int(inliers.size)
+    reject = inlier_count < int(min_sparse_inliers)
+    return {
+        "reject_repair": bool(reject),
+        "reason": "weak_sparse_support_gating_only" if reject else "sparse_support_sufficient_for_gating_only",
+        "selected_label": str(selected_label),
+        "sparse_inlier_count": inlier_count,
+        "min_sparse_inliers": int(min_sparse_inliers),
     }
 
 
@@ -480,6 +609,9 @@ def _resolve_slcdp_effective_options(args: argparse.Namespace) -> dict[str, Any]
         "slcdp_gating_depth_margin_m": float(args.slcdp_gating_depth_margin_m),
         "slcdp_gating_footprint_radius_scale": float(args.slcdp_gating_footprint_radius_scale),
         "slcdp_gating_max_footprint_radius_px": float(args.slcdp_gating_max_footprint_radius_px),
+        "slcdp_gating_min_footprint_radius_px": float(args.slcdp_gating_min_footprint_radius_px),
+        "slcdp_gating_min_depth_m": float(args.slcdp_gating_min_depth_m),
+        "slcdp_gating_max_depth_m": float(args.slcdp_gating_max_depth_m),
         "slcdp_gating_min_opacity": float(args.slcdp_gating_min_opacity),
         "slcdp_gating_chunk_size": int(args.slcdp_gating_chunk_size),
         "slcdp_fast_guided_max_render_candidates": int(args.slcdp_fast_guided_max_render_candidates),
@@ -507,9 +639,12 @@ def _resolve_slcdp_effective_options(args: argparse.Namespace) -> dict[str, Any]
                 "slcdp_low_confidence_gated_base_min_score_gain": 0.25,
                 "slcdp_guided_pose_steps_m": (0.5, 1.0, 2.0, 5.0),
                 "slcdp_gating_radius_px": 6.0,
-                "slcdp_gating_depth_margin_m": 0.0,
+                "slcdp_gating_depth_margin_m": 1.0,
                 "slcdp_gating_footprint_radius_scale": 1.5,
                 "slcdp_gating_max_footprint_radius_px": 96.0,
+                "slcdp_gating_min_footprint_radius_px": 12.0,
+                "slcdp_gating_min_depth_m": 5.0,
+                "slcdp_gating_max_depth_m": 60.0,
                 "slcdp_gating_min_opacity": 0.01,
                 "slcdp_fast_guided_max_render_candidates": 4,
                 "slcdp_fast_guided_conflict_radius_px": 8.0,
@@ -795,6 +930,9 @@ def _capture_dense(
     slcdp_gating_depth_margin_m: float = 1.0,
     slcdp_gating_footprint_radius_scale: float = 0.0,
     slcdp_gating_max_footprint_radius_px: float = 64.0,
+    slcdp_gating_min_footprint_radius_px: float = 0.0,
+    slcdp_gating_min_depth_m: float = 0.0,
+    slcdp_gating_max_depth_m: float = 0.0,
     slcdp_gating_min_opacity: float = 0.0,
     slcdp_gating_chunk_size: int = 65536,
     slcdp_fast_guided_max_render_candidates: int = 4,
@@ -885,6 +1023,13 @@ def _capture_dense(
                 depth_margin_m=float(slcdp_gating_depth_margin_m),
                 footprint_radius_scale=float(slcdp_gating_footprint_radius_scale),
                 max_footprint_radius_px=float(slcdp_gating_max_footprint_radius_px),
+                min_conflict_footprint_radius_px=float(slcdp_gating_min_footprint_radius_px),
+                min_conflict_depth_m=float(slcdp_gating_min_depth_m),
+                max_conflict_depth_m=(
+                    None
+                    if float(slcdp_gating_max_depth_m) <= 0.0
+                    else float(slcdp_gating_max_depth_m)
+                ),
                 min_opacity=float(slcdp_gating_min_opacity),
                 protected_gaussian_indices=protected,
                 chunk_size=int(slcdp_gating_chunk_size),
@@ -1081,6 +1226,27 @@ def _capture_dense(
     selected_label = str(repair_selection.get("selected_label", "base"))
     if repair_selection.get("decision") not in {"accept_repaired_dense_pose", "accept_original_dense_pose"}:
         selected_label = "base"
+    if (
+        render_control_mode == SPARSE_CONDITIONED_RENDER_CONTROL
+        and str(repair_selection.get("decision")) == "accept_repaired_dense_pose"
+    ):
+        weak_support_gating_guard = _should_reject_gating_only_repair_for_weak_sparse_support(
+            selected_label=selected_label,
+            sparse_capture=sparse_capture,
+        )
+        repair_selection = dict(repair_selection)
+        repair_selection["weak_support_gating_guard"] = weak_support_gating_guard
+        if bool(weak_support_gating_guard.get("reject_repair")):
+            repair_selection.update(
+                {
+                    "decision": "accept_original_dense_pose",
+                    "original_decision": "accept_repaired_dense_pose",
+                    "rejected_selected_label": selected_label,
+                    "selected_label": "base",
+                    "selected_score": float(repair_selection.get("base_score", repair_selection.get("selected_score", 0.0))),
+                }
+            )
+            selected_label = "base"
     if bool(repair_enabled) and repair_selection["decision"] == "skip_dense_keep_sparse" and bool(slcdp_repair_skip_if_no_accept):
         base = rendered_candidates[0]
         if render_control_mode == SPARSE_CONDITIONED_RENDER_CONTROL and slcdp_base_dense_capture is not None:
@@ -1288,6 +1454,45 @@ def _capture_dense(
     result["dense_pose_quality"] = _dense_pose_quality(result)
     if (
         render_control_mode == SPARSE_CONDITIONED_RENDER_CONTROL
+        and sparse_capture is not None
+        and str(selected.get("label", selected_label)) != "base"
+    ):
+        low_quality_guard = _should_reject_sparse_conditioned_dense_for_low_quality(
+            selected_label=str(selected.get("label", selected_label)),
+            repair_selection=repair_selection,
+            sparse_capture=sparse_capture,
+            dense_quality=result["dense_pose_quality"],
+        )
+        result["slcdp_dense_quality_guard"] = low_quality_guard
+        if bool(low_quality_guard.get("reject_dense")):
+            empty = np.empty((0, 2), dtype=np.float32)
+            result.update(
+                {
+                    "query_xy": empty,
+                    "rendered_xy": empty,
+                    "p3d": np.empty((0, 3), dtype=np.float32),
+                    "pose_w2c": np.asarray(sparse_pose, dtype=np.float32).reshape(4, 4),
+                    "inliers": np.empty(0, dtype=np.int32),
+                    "slcdp_transition_control": _compact_transition_result(
+                        {
+                            **low_quality_guard,
+                            "selected_fraction": 0.0,
+                            "sparse_support_strength": "strong",
+                            "selected_acceptance": {
+                                "decision": "reject_dense_keep_sparse",
+                                "reason": low_quality_guard.get("reason"),
+                            },
+                            "policy": {
+                                "source": "sparse_conditioned_dense_quality_guard",
+                            },
+                            "candidates": [],
+                        }
+                    ),
+                }
+            )
+            return result
+    if (
+        render_control_mode == SPARSE_CONDITIONED_RENDER_CONTROL
         and slcdp_base_dense_capture is not None
         and str(selected.get("label", selected_label)) != "base"
     ):
@@ -1476,6 +1681,9 @@ def _analyze_case(
     slcdp_gating_depth_margin_m: float,
     slcdp_gating_footprint_radius_scale: float,
     slcdp_gating_max_footprint_radius_px: float,
+    slcdp_gating_min_footprint_radius_px: float,
+    slcdp_gating_min_depth_m: float,
+    slcdp_gating_max_depth_m: float,
     slcdp_gating_min_opacity: float,
     slcdp_gating_chunk_size: int,
     slcdp_fast_guided_max_render_candidates: int,
@@ -1519,6 +1727,9 @@ def _analyze_case(
             slcdp_gating_depth_margin_m=slcdp_gating_depth_margin_m,
             slcdp_gating_footprint_radius_scale=slcdp_gating_footprint_radius_scale,
             slcdp_gating_max_footprint_radius_px=slcdp_gating_max_footprint_radius_px,
+            slcdp_gating_min_footprint_radius_px=slcdp_gating_min_footprint_radius_px,
+            slcdp_gating_min_depth_m=slcdp_gating_min_depth_m,
+            slcdp_gating_max_depth_m=slcdp_gating_max_depth_m,
             slcdp_gating_min_opacity=slcdp_gating_min_opacity,
             slcdp_gating_chunk_size=slcdp_gating_chunk_size,
             slcdp_fast_guided_max_render_candidates=slcdp_fast_guided_max_render_candidates,
@@ -1715,6 +1926,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--slcdp_gating_depth_margin_m", type=float, default=1.0)
     parser.add_argument("--slcdp_gating_footprint_radius_scale", type=float, default=0.0)
     parser.add_argument("--slcdp_gating_max_footprint_radius_px", type=float, default=64.0)
+    parser.add_argument("--slcdp_gating_min_footprint_radius_px", type=float, default=0.0)
+    parser.add_argument("--slcdp_gating_min_depth_m", type=float, default=0.0)
+    parser.add_argument("--slcdp_gating_max_depth_m", type=float, default=0.0)
     parser.add_argument("--slcdp_gating_min_opacity", type=float, default=0.0)
     parser.add_argument("--slcdp_gating_chunk_size", type=int, default=65536)
     parser.add_argument("--slcdp_fast_guided_max_render_candidates", type=int, default=4)
