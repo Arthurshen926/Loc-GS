@@ -13,7 +13,10 @@ from loc_gs.scripts.diagnose_patch_guided_sparse import (
 
 from loc_gs.stdloc_native.patch_guided_sparse import (
     PatchHypothesis,
+    PatchResidualWeightPolicy,
+    apply_patch_residual_group_weight,
     cluster_patch_hypotheses,
+    compute_patch_residual_group_weight,
     evaluate_pose_global_consistency,
     filter_matches_by_reference_reprojection,
     filter_matches_by_patch,
@@ -42,6 +45,21 @@ def test_dense_pgsh_is_explicit_and_can_disable_sparse_pgsh():
     assert default_args.pgsh_detector_score_weight == 0.0
     assert dense_args.dense_pgsh is True
     assert dense_args.disable_sparse_pgsh is True
+
+
+def test_patch_diagnostic_accepts_soft_slcdp_transition_option():
+    args = build_argparser().parse_args(["--slcdp_soft_transition_control"])
+    resolved = _resolve_diagnostic_slcdp_options(args)
+
+    assert resolved["slcdp_soft_transition_control"] is True
+    assert resolved["slcdp_transition_control"] is False
+
+
+def test_patch_diagnostic_accepts_patch_residual_weighting_option():
+    args = build_argparser().parse_args(["--dense_pgsh_patch_residual_weighting", "--dense_pgsh_patch_residual_min_group_patches", "3"])
+
+    assert args.dense_pgsh_patch_residual_weighting is True
+    assert args.dense_pgsh_patch_residual_min_group_patches == 3
 
 
 def test_legacy_sparse_conditioned_repair_selection_can_reproduce_basefirst_diagnostic():
@@ -291,6 +309,65 @@ def test_reference_prior_refinement_reduces_reprojection_error_from_nearby_pose(
     assert diagnostics["after_median_reprojection_error_px"] < diagnostics["before_median_reprojection_error_px"]
     assert abs(float(refined[0, 3])) < abs(float(reference[0, 3]))
     assert diagnostics["success"] is True
+
+
+def test_reference_prior_refinement_consumes_match_weights():
+    intrinsic = np.array([[80.0, 0.0, 40.0], [0.0, 80.0, 40.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    points = np.array(
+        [
+            [-1.0, -1.0, 8.0],
+            [1.0, -1.0, 8.0],
+            [-1.0, 1.0, 8.0],
+            [1.0, 1.0, 8.0],
+            [-0.5, -0.5, 10.0],
+            [0.5, -0.5, 10.0],
+            [-0.5, 0.5, 10.0],
+            [0.5, 0.5, 10.0],
+        ],
+        dtype=np.float32,
+    )
+    correct_xy = np.column_stack(
+        [
+            intrinsic[0, 0] * points[:, 0] / points[:, 2] + intrinsic[0, 2],
+            intrinsic[1, 1] * points[:, 1] / points[:, 2] + intrinsic[1, 2],
+        ]
+    ).astype(np.float32)
+    shifted_dense_xy = correct_xy + np.array([8.0, 0.0], dtype=np.float32)
+    match_xy = np.concatenate([shifted_dense_xy, correct_xy], axis=0)
+    match_xyz = np.concatenate([points, points], axis=0)
+    reference = np.eye(4, dtype=np.float32)
+
+    low_weight_pose, low_weight_diagnostics = refine_pose_with_reference_prior(
+        reference_pose_w2c=reference,
+        match_xy=match_xy,
+        points_world=match_xyz,
+        intrinsic=intrinsic,
+        image_size=(80, 80),
+        max_iterations=80,
+        reprojection_loss_scale_px=4.0,
+        translation_prior_weight=0.001,
+        rotation_prior_weight=0.001,
+        match_weights=np.ones((match_xy.shape[0],), dtype=np.float32),
+    )
+    high_anchor_weights = np.concatenate(
+        [np.ones((points.shape[0],), dtype=np.float32), np.full((points.shape[0],), 100.0, dtype=np.float32)],
+        axis=0,
+    )
+    high_weight_pose, high_weight_diagnostics = refine_pose_with_reference_prior(
+        reference_pose_w2c=reference,
+        match_xy=match_xy,
+        points_world=match_xyz,
+        intrinsic=intrinsic,
+        image_size=(80, 80),
+        max_iterations=80,
+        reprojection_loss_scale_px=4.0,
+        translation_prior_weight=0.001,
+        rotation_prior_weight=0.001,
+        match_weights=high_anchor_weights,
+    )
+
+    assert high_weight_diagnostics["weighted_match_count"] > low_weight_diagnostics["weighted_match_count"]
+    assert abs(float(high_weight_pose[0, 3])) < abs(float(low_weight_pose[0, 3]))
 
 
 def test_reference_prior_refinement_respects_translation_trust_region():
@@ -655,3 +732,63 @@ def test_patch_group_returns_empty_when_consensus_requirement_is_unmet():
 
     assert group.patch_ids == []
     assert group.match_indices.size == 0
+
+
+def test_patch_residual_group_weight_downweights_local_only_ambiguous_group():
+    weak_hypotheses = [
+        PatchHypothesis(
+            patch_id=0,
+            score=2.0,
+            inlier_count=30,
+            match_indices=np.array([0, 1]),
+            components={"ambiguity_risk": 0.9, "spatial_extent": 0.05, "depth_spread": 0.05, "logdet_proxy": 0.1},
+        )
+    ]
+    strong_hypotheses = [
+        PatchHypothesis(
+            patch_id=0,
+            score=1.0,
+            inlier_count=20,
+            match_indices=np.array([0, 1]),
+            components={"ambiguity_risk": 0.1, "spatial_extent": 0.5, "depth_spread": 0.6, "logdet_proxy": 0.5},
+        ),
+        PatchHypothesis(
+            patch_id=1,
+            score=0.9,
+            inlier_count=18,
+            match_indices=np.array([2, 3]),
+            components={"ambiguity_risk": 0.1, "spatial_extent": 0.4, "depth_spread": 0.5, "logdet_proxy": 0.5},
+        ),
+    ]
+    weak_group = select_pose_consistent_patch_group(weak_hypotheses, center_thresh=1.0, rotation_thresh_deg=5.0)
+    strong_group = select_pose_consistent_patch_group(strong_hypotheses, center_thresh=1.0, rotation_thresh_deg=5.0)
+
+    weak = compute_patch_residual_group_weight(
+        weak_group,
+        weak_hypotheses,
+        total_patch_count=4,
+        policy=PatchResidualWeightPolicy(min_group_patches=2),
+    )
+    strong = compute_patch_residual_group_weight(
+        strong_group,
+        strong_hypotheses,
+        total_patch_count=4,
+        policy=PatchResidualWeightPolicy(min_group_patches=2),
+    )
+
+    assert weak["patch_residual_weight"] < strong["patch_residual_weight"]
+    assert weak["components"]["pose_consensus"] < strong["components"]["pose_consensus"]
+    assert weak["components"]["ambiguity_safety"] < strong["components"]["ambiguity_safety"]
+
+
+def test_apply_patch_residual_group_weight_scales_dense_matches_not_sparse_anchors():
+    refinement = {
+        "xy": np.zeros((5, 2), dtype=np.float32),
+        "xyz": np.zeros((5, 3), dtype=np.float32),
+        "weights": np.ones((5,), dtype=np.float32),
+    }
+
+    weighted = apply_patch_residual_group_weight(refinement, patch_residual_weight=0.25, dense_match_count=3)
+
+    assert weighted["weights"].tolist() == [0.25, 0.25, 0.25, 1.0, 1.0]
+    assert weighted["patch_residual_weighting"]["dense_match_count"] == 3

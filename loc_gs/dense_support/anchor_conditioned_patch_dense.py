@@ -174,8 +174,10 @@ def assess_anchor_conditioned_update(
     if local_refine is None:
         return {
             "schema": "loc_gs_acpd_refinement_acceptance_v1",
-            "decision": "accept_anchor_conditioned_update",
-            "reason": "no_reference_refinement_diagnostics",
+            "decision": "unknown_noop_keep_reference",
+            "reason": "missing_reference_refinement_diagnostics",
+            "accept_update": False,
+            "failed_checks": {"missing_reference_refinement_diagnostics": True},
             "diagnostic_only": True,
         }
     local_refine = dict(local_refine)

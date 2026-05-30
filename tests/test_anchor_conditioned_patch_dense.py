@@ -98,6 +98,40 @@ def test_acpd_anchor_target_fraction_prevents_dense_match_dilution():
     assert refinement["weights"][-2:].tolist() == [12.5, 12.5]
 
 
+def test_acpd_anchor_projection_uses_width_height_image_size_order():
+    dense_merged = {
+        "xy": np.empty((0, 2), dtype=np.float32),
+        "xyz": np.empty((0, 3), dtype=np.float32),
+    }
+    sparse = {
+        "query_xy": np.array([[110.0, 70.0]], dtype=np.float32),
+        "p3d": np.array([[11.0, 7.0, 1.0]], dtype=np.float32),
+        "inliers": np.array([0], dtype=np.int32),
+    }
+    intrinsic = np.array([[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+    refinement = build_anchor_conditioned_refinement_matches(
+        dense_merged,
+        sparse,
+        reference_pose_w2c=np.eye(4, dtype=np.float32),
+        intrinsic=intrinsic,
+        image_size=(120, 80),
+        policy=AnchorConditionedPatchDensePolicy(anchor_weight=2.0, anchor_max_count=8, anchor_max_reprojection_px=1.0),
+    )
+
+    assert refinement["diagnostics"]["selected_anchor_count"] == 1
+    assert refinement["xy"].tolist() == [[110.0, 70.0]]
+    assert refinement["weights"].tolist() == [2.0]
+
+
+def test_acpd_refinement_acceptance_missing_diagnostics_is_unknown_noop():
+    decision = assess_anchor_conditioned_update(None)
+
+    assert decision["decision"] == "unknown_noop_keep_reference"
+    assert decision["accept_update"] is False
+    assert decision["failed_checks"]["missing_reference_refinement_diagnostics"] is True
+
+
 def test_acpd_refinement_acceptance_rejects_motion_with_tiny_objective_gain():
     decision = assess_anchor_conditioned_update(
         {

@@ -117,6 +117,15 @@ def test_hard_match_parser_accepts_slcdp_transition_control_options():
     assert args.slcdp_transition_line_search_fractions == "1.0,0.5,0.0"
 
 
+def test_hard_match_parser_accepts_soft_slcdp_transition_option():
+    args = hard_match_viz.build_argparser().parse_args(["--slcdp_soft_transition_control"])
+    options = hard_match_viz._resolve_slcdp_effective_options(args)
+
+    assert args.slcdp_soft_transition_control is True
+    assert options["slcdp_soft_transition_control"] is True
+    assert options["slcdp_transition_control"] is False
+
+
 def test_sparse_conditioned_render_control_resolves_fixed_fusion_recipe():
     args = hard_match_viz.build_argparser().parse_args(
         [

@@ -24,6 +24,7 @@ from loc_gs.diagnostics.match_visualization import (
 from loc_gs.dense_support.sparse_conditioned_dense_preflight import (
     DenseTransitionPolicy,
     select_sparse_conditioned_dense_transition,
+    select_soft_sparse_conditioned_dense_transition,
 )
 from loc_gs.dense_support.anchor_conditioned_patch_dense import (
     AnchorConditionedPatchDensePolicy,
@@ -44,11 +45,14 @@ from loc_gs.scripts.visualize_stdloc_hard_matches import (
 from loc_gs.stdloc_native.patch_guided_sparse import (
     Patch,
     PatchHypothesis,
+    PatchResidualWeightPolicy,
+    apply_patch_residual_group_weight,
     evaluate_pose_global_consistency,
     filter_matches_by_reference_reprojection,
     filter_matches_by_patch,
     generate_patch_grid,
     merge_group_matches,
+    compute_patch_residual_group_weight,
     refine_pose_with_reference_prior,
     score_patch_hypothesis,
     select_pose_consistent_patch_group,
@@ -1305,6 +1309,8 @@ def analyze_case(
     dense_pgsh_sparse_anchor_max_reprojection_px: float,
     dense_pgsh_sparse_anchor_target_weight_fraction: float,
     dense_pgsh_sparse_anchor_max_weight: float,
+    dense_pgsh_patch_residual_weighting: bool,
+    dense_pgsh_patch_residual_min_group_patches: int,
     dense_pgsh_min_refine_median_gain_px: float,
     dense_pgsh_min_refine_p90_gain_px: float,
     dense_pgsh_max_refine_translation_without_gain_m: float,
@@ -1634,6 +1640,7 @@ def analyze_case(
             dense_pgsh_inliers = np.empty((0,), dtype=np.int32)
             dense_pgsh_local_refine = None
             dense_pgsh_refinement_anchor = None
+            dense_pgsh_patch_residual_weighting_diag = None
             if int(np.asarray(dense_merged.get("xy", [])).shape[0]) >= 4:
                 if bool(dense_pgsh_reference_local_refine):
                     refinement_matches = _build_dense_pgsh_refinement_matches(
@@ -1649,6 +1656,21 @@ def analyze_case(
                         sparse_anchor_target_weight_fraction=float(dense_pgsh_sparse_anchor_target_weight_fraction),
                         sparse_anchor_max_weight=float(dense_pgsh_sparse_anchor_max_weight),
                     )
+                    if bool(dense_pgsh_patch_residual_weighting):
+                        dense_pgsh_patch_residual_weighting_diag = compute_patch_residual_group_weight(
+                            dense_group,
+                            dense_hypotheses,
+                            total_patch_count=len(patches),
+                            policy=PatchResidualWeightPolicy(
+                                min_group_patches=int(dense_pgsh_patch_residual_min_group_patches)
+                            ),
+                        )
+                        refinement_matches = apply_patch_residual_group_weight(
+                            refinement_matches,
+                            patch_residual_weight=float(dense_pgsh_patch_residual_weighting_diag["patch_residual_weight"]),
+                            dense_match_count=int(np.asarray(dense_merged.get("xy", [])).shape[0]),
+                        )
+                        dense_pgsh_patch_residual_weighting_diag["applied"] = refinement_matches.get("patch_residual_weighting")
                     dense_pgsh_refinement_anchor = refinement_matches["diagnostics"]
                     dense_pgsh_raw_pose, dense_pgsh_local_refine = refine_pose_with_reference_prior(
                         reference_pose_w2c=base_dense["pose_w2c"],
@@ -1705,27 +1727,45 @@ def analyze_case(
                 )
                 if str(dense_pgsh_acpd_acceptance.get("decision")) != "accept_anchor_conditioned_update":
                     dense_pgsh_decision = "fallback_base_dense_acpd_refinement_reject"
-            if dense_pgsh_decision == "use_dense_pgsh" and bool(dict(slcdp_options).get("slcdp_transition_control", False)):
-                dense_pgsh_transition = select_sparse_conditioned_dense_transition(
-                    sparse_query_xy=base_sparse["query_xy"],
-                    sparse_points_world=base_sparse["p3d"],
-                    sparse_pose_w2c=base_sparse["pose_w2c"],
-                    dense_pose_w2c=dense_pgsh_raw_pose,
-                    intrinsic=base_dense["K"],
-                    sparse_inlier_indices=base_sparse["inliers"],
-                    policy=DenseTransitionPolicy(
-                        max_reprojection_error_px=float(dict(slcdp_options).get("slcdp_transition_max_reprojection_error_px", 8.0)),
-                        min_retained_ratio=float(dict(slcdp_options).get("slcdp_transition_min_retained_ratio", 0.90)),
-                        max_translation_delta_m=float(dict(slcdp_options).get("slcdp_transition_max_translation_delta_m", 0.35)),
-                        max_rotation_delta_deg=float(dict(slcdp_options).get("slcdp_transition_max_rotation_delta_deg", 5.0)),
-                        line_search_fractions=tuple(float(v) for v in dict(slcdp_options).get("slcdp_transition_line_search_fractions", (1.0, 0.75, 0.5, 0.25, 0.0))),
-                    ),
-                    image_size=(int(base_sparse["width"]), int(base_sparse["height"])),
+            if dense_pgsh_decision == "use_dense_pgsh" and (
+                bool(dict(slcdp_options).get("slcdp_transition_control", False))
+                or bool(dict(slcdp_options).get("slcdp_soft_transition_control", False))
+            ):
+                dense_transition_policy = DenseTransitionPolicy(
+                    max_reprojection_error_px=float(dict(slcdp_options).get("slcdp_transition_max_reprojection_error_px", 8.0)),
+                    min_retained_ratio=float(dict(slcdp_options).get("slcdp_transition_min_retained_ratio", 0.90)),
+                    max_translation_delta_m=float(dict(slcdp_options).get("slcdp_transition_max_translation_delta_m", 0.35)),
+                    max_rotation_delta_deg=float(dict(slcdp_options).get("slcdp_transition_max_rotation_delta_deg", 5.0)),
+                    line_search_fractions=tuple(float(v) for v in dict(slcdp_options).get("slcdp_transition_line_search_fractions", (1.0, 0.75, 0.5, 0.25, 0.0))),
                 )
-                if str(dense_pgsh_transition.get("decision")) == "reject_dense_keep_sparse":
-                    dense_pgsh_decision = "fallback_base_dense_transition_reject"
-                else:
+                if bool(dict(slcdp_options).get("slcdp_soft_transition_control", False)):
+                    dense_pgsh_transition = select_soft_sparse_conditioned_dense_transition(
+                        sparse_query_xy=base_sparse["query_xy"],
+                        sparse_points_world=base_sparse["p3d"],
+                        sparse_pose_w2c=base_sparse["pose_w2c"],
+                        dense_pose_w2c=dense_pgsh_raw_pose,
+                        intrinsic=base_dense["K"],
+                        sparse_inlier_indices=base_sparse["inliers"],
+                        preflight=base_dense.get("slcdp_preflight"),
+                        policy=dense_transition_policy,
+                        image_size=(int(base_sparse["width"]), int(base_sparse["height"])),
+                    )
                     dense_pgsh_final_pose = np.asarray(dense_pgsh_transition["selected_pose_w2c"], dtype=np.float32).reshape(4, 4)
+                else:
+                    dense_pgsh_transition = select_sparse_conditioned_dense_transition(
+                        sparse_query_xy=base_sparse["query_xy"],
+                        sparse_points_world=base_sparse["p3d"],
+                        sparse_pose_w2c=base_sparse["pose_w2c"],
+                        dense_pose_w2c=dense_pgsh_raw_pose,
+                        intrinsic=base_dense["K"],
+                        sparse_inlier_indices=base_sparse["inliers"],
+                        policy=dense_transition_policy,
+                        image_size=(int(base_sparse["width"]), int(base_sparse["height"])),
+                    )
+                    if str(dense_pgsh_transition.get("decision")) == "reject_dense_keep_sparse":
+                        dense_pgsh_decision = "fallback_base_dense_transition_reject"
+                    else:
+                        dense_pgsh_final_pose = np.asarray(dense_pgsh_transition["selected_pose_w2c"], dtype=np.float32).reshape(4, 4)
 
             if dense_pgsh_decision == "use_dense_pgsh":
                 dense_pgsh_base_trust = _dense_pgsh_base_trust_acceptance(
@@ -1771,6 +1811,7 @@ def analyze_case(
                         "acpd_acceptance": dense_pgsh_acpd_acceptance,
                         "reference_local_refine": dense_pgsh_local_refine,
                         "refinement_sparse_anchor": dense_pgsh_refinement_anchor,
+                        "patch_residual_weighting": dense_pgsh_patch_residual_weighting_diag,
                         "anchor_conditioned_patch_dense": acpd_summary,
                     },
                 )
@@ -1795,6 +1836,7 @@ def analyze_case(
                     "acpd_acceptance": dense_pgsh_acpd_acceptance,
                     "reference_local_refine": dense_pgsh_local_refine,
                     "refinement_sparse_anchor": dense_pgsh_refinement_anchor,
+                    "patch_residual_weighting": dense_pgsh_patch_residual_weighting_diag,
                     "anchor_conditioned_patch_dense": acpd_summary,
                 }
 
@@ -1857,6 +1899,7 @@ def analyze_case(
                 "acpd_acceptance": dense_pgsh_acpd_acceptance,
                 "reference_local_refine": dense_pgsh_local_refine,
                 "refinement_sparse_anchor": dense_pgsh_refinement_anchor,
+                "patch_residual_weighting": dense_pgsh_patch_residual_weighting_diag,
                 "anchor_conditioned_patch_dense": acpd_summary,
                 "paths": {
                     "matches": str(dense_pgsh_path),
@@ -1955,6 +1998,8 @@ def analyze_case(
             "dense_pgsh_sparse_anchor_max_reprojection_px": float(dense_pgsh_sparse_anchor_max_reprojection_px),
             "dense_pgsh_sparse_anchor_target_weight_fraction": float(dense_pgsh_sparse_anchor_target_weight_fraction),
             "dense_pgsh_sparse_anchor_max_weight": float(dense_pgsh_sparse_anchor_max_weight),
+            "dense_pgsh_patch_residual_weighting": bool(dense_pgsh_patch_residual_weighting),
+            "dense_pgsh_patch_residual_min_group_patches": int(dense_pgsh_patch_residual_min_group_patches),
             "dense_pgsh_min_refine_median_gain_px": float(dense_pgsh_min_refine_median_gain_px),
             "dense_pgsh_min_refine_p90_gain_px": float(dense_pgsh_min_refine_p90_gain_px),
             "dense_pgsh_max_refine_translation_without_gain_m": float(dense_pgsh_max_refine_translation_without_gain_m),
@@ -2082,6 +2127,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dense_pgsh_sparse_anchor_max_reprojection_px", type=float, default=8.0)
     parser.add_argument("--dense_pgsh_sparse_anchor_target_weight_fraction", type=float, default=0.0)
     parser.add_argument("--dense_pgsh_sparse_anchor_max_weight", type=float, default=256.0)
+    parser.add_argument("--dense_pgsh_patch_residual_weighting", action="store_true")
+    parser.add_argument("--dense_pgsh_patch_residual_min_group_patches", type=int, default=2)
     parser.add_argument("--dense_pgsh_min_refine_median_gain_px", type=float, default=0.05)
     parser.add_argument("--dense_pgsh_min_refine_p90_gain_px", type=float, default=0.10)
     parser.add_argument("--dense_pgsh_max_refine_translation_without_gain_m", type=float, default=0.01)
@@ -2173,6 +2220,8 @@ def main(argv: list[str] | None = None) -> int:
         dense_pgsh_sparse_anchor_max_reprojection_px=float(args.dense_pgsh_sparse_anchor_max_reprojection_px),
         dense_pgsh_sparse_anchor_target_weight_fraction=float(args.dense_pgsh_sparse_anchor_target_weight_fraction),
         dense_pgsh_sparse_anchor_max_weight=float(args.dense_pgsh_sparse_anchor_max_weight),
+        dense_pgsh_patch_residual_weighting=bool(args.dense_pgsh_patch_residual_weighting),
+        dense_pgsh_patch_residual_min_group_patches=int(args.dense_pgsh_patch_residual_min_group_patches),
         dense_pgsh_min_refine_median_gain_px=float(args.dense_pgsh_min_refine_median_gain_px),
         dense_pgsh_min_refine_p90_gain_px=float(args.dense_pgsh_min_refine_p90_gain_px),
         dense_pgsh_max_refine_translation_without_gain_m=float(args.dense_pgsh_max_refine_translation_without_gain_m),

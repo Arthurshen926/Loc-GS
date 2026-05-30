@@ -12,6 +12,36 @@ except Exception:  # pragma: no cover - exercised only in stripped-down envs.
 
 
 @dataclass(frozen=True)
+class ImageGeometry:
+    """Explicit coordinate mapping between image and feature-map frames."""
+
+    width: int
+    height: int
+    feature_width: int
+    feature_height: int
+
+    def __post_init__(self) -> None:
+        if int(self.width) <= 0 or int(self.height) <= 0:
+            raise ValueError("ImageGeometry width and height must be positive")
+        if int(self.feature_width) <= 0 or int(self.feature_height) <= 0:
+            raise ValueError("ImageGeometry feature dimensions must be positive")
+
+    @property
+    def scale_x(self) -> float:
+        return float(self.feature_width) / float(self.width)
+
+    @property
+    def scale_y(self) -> float:
+        return float(self.feature_height) / float(self.height)
+
+    def full_to_feature_xy(self, xy: np.ndarray) -> np.ndarray:
+        coords = np.asarray(xy, dtype=np.float64).reshape(-1, 2).copy()
+        coords[:, 0] *= self.scale_x
+        coords[:, 1] *= self.scale_y
+        return coords
+
+
+@dataclass(frozen=True)
 class SLCDPThresholds:
     min_sparse_inliers: int = 40
     min_sparse_inlier_ratio: float = 0.0
@@ -56,6 +86,20 @@ def _as_array(value: Any, *, shape_tail: tuple[int, ...] | None = None, name: st
     if shape_tail is not None and array.shape[-len(shape_tail) :] != shape_tail:
         raise ValueError(f"{name} must have trailing shape {shape_tail}")
     return array
+
+
+def _coerce_image_geometry(value: ImageGeometry | Mapping[str, Any] | None) -> ImageGeometry | None:
+    if value is None:
+        return None
+    if isinstance(value, ImageGeometry):
+        return value
+    mapping = dict(value)
+    return ImageGeometry(
+        width=int(mapping["width"]),
+        height=int(mapping["height"]),
+        feature_width=int(mapping["feature_width"]),
+        feature_height=int(mapping["feature_height"]),
+    )
 
 
 def _select_indices(indices: Sequence[int] | np.ndarray | None, count: int) -> np.ndarray:
@@ -487,6 +531,7 @@ def sparse_landmark_conditioned_preflight(
     render_alpha: np.ndarray | None = None,
     sparse_inlier_indices: Sequence[int] | np.ndarray | None = None,
     sparse_scores: Sequence[float] | np.ndarray | None = None,
+    feature_geometry: ImageGeometry | Mapping[str, Any] | None = None,
     thresholds: SLCDPThresholds = SLCDPThresholds(),
 ) -> dict[str, Any]:
     """Check whether the dense render at the sparse pose explains sparse PnP inliers.
@@ -558,16 +603,24 @@ def sparse_landmark_conditioned_preflight(
     local_variance_median: float | None = None
     feature_ok = True
     variance_ok = True
+    geometry = _coerce_image_geometry(feature_geometry)
+    feature_coordinate_frame = "native_feature_coordinates"
     if query_features is not None and render_features is not None and selected.shape[0] > 0:
-        q_desc = _sample_hw_nearest(np.asarray(query_features, dtype=np.float64), query_xy)
-        r_desc = _sample_hw_nearest(np.asarray(render_features, dtype=np.float64), projected_xy)
+        query_feature_xy = query_xy
+        render_feature_xy = projected_xy
+        if geometry is not None:
+            query_feature_xy = geometry.full_to_feature_xy(query_xy)
+            render_feature_xy = geometry.full_to_feature_xy(projected_xy)
+            feature_coordinate_frame = "scaled_by_image_geometry"
+        q_desc = _sample_hw_nearest(np.asarray(query_features, dtype=np.float64), query_feature_xy)
+        r_desc = _sample_hw_nearest(np.asarray(render_features, dtype=np.float64), render_feature_xy)
         feature_cosines = _cosine_rows(q_desc, r_desc)
         finite_cos = feature_cosines[np.isfinite(feature_cosines)]
         feature_cosine_median = float(np.median(finite_cos)) if finite_cos.size else None
         feature_ok = feature_cosine_median is not None and feature_cosine_median >= float(thresholds.min_feature_cosine)
         local_variance = _local_feature_variance(
             np.asarray(render_features, dtype=np.float64),
-            projected_xy,
+            render_feature_xy,
             radius=int(thresholds.local_patch_radius),
         )
         finite_var = local_variance[np.isfinite(local_variance)]
@@ -633,6 +686,7 @@ def sparse_landmark_conditioned_preflight(
         "coverage_grid_cells": int(coverage_grid_cells),
         "depth_span_m": depth_span_m,
         "feature_cosine_median": feature_cosine_median,
+        "feature_coordinate_frame": feature_coordinate_frame,
         "local_feature_variance_median": local_variance_median,
         "failed_checks": failed_checks,
         "diagnostic_only": True,
@@ -860,6 +914,153 @@ def select_sparse_conditioned_dense_transition(
             "max_rotation_delta_deg": float(policy.max_rotation_delta_deg),
             "line_search_fractions": [float(value) for value in fractions],
             "strong_sparse_inlier_count": int(policy.strong_sparse_inlier_count),
+        },
+        "diagnostic_only": True,
+    }
+
+
+def _finite_float(value: Any, default: float | None = None) -> float | None:
+    if value is None:
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if np.isfinite(result) else default
+
+
+def _soft_ratio_score(value: Any, target: float) -> float | None:
+    observed = _finite_float(value, default=None)
+    if observed is None:
+        return None
+    if float(target) <= 1.0e-12:
+        return 1.0
+    return float(np.clip(float(observed) / float(target), 0.0, 1.0))
+
+
+def _soft_limit_score(value: Any, limit: float) -> float | None:
+    observed = _finite_float(value, default=None)
+    if observed is None:
+        return None
+    if float(limit) <= 1.0e-12:
+        return 1.0 if float(observed) <= 1.0e-12 else 0.0
+    return float(np.clip(float(limit) / max(float(observed), 1.0e-12), 0.0, 1.0))
+
+
+def _soft_min_score(values: Sequence[float | None]) -> float:
+    available = [float(value) for value in values if value is not None and np.isfinite(float(value))]
+    if not available:
+        return 1.0
+    return float(np.clip(min(available), 0.0, 1.0))
+
+
+def _soft_preflight_score(preflight: Mapping[str, Any], thresholds: SLCDPThresholds) -> float:
+    if not preflight:
+        return 1.0
+    decision = str(preflight.get("decision", "")).strip()
+    if decision in {"skip_dense_keep_sparse", "retry_sparse_or_patch_dense"}:
+        return 0.0
+    if decision and decision != "accept_dense":
+        return 0.0
+    return _soft_min_score(
+        [
+            _soft_ratio_score(preflight.get("visible_ratio"), float(thresholds.min_visibility_ratio)),
+            _soft_ratio_score(preflight.get("feature_cosine_median"), float(thresholds.min_feature_cosine)),
+            _soft_ratio_score(preflight.get("local_feature_variance_median"), float(thresholds.min_local_feature_variance)),
+            _soft_ratio_score(preflight.get("coverage_grid_cells"), float(thresholds.min_grid_cells)),
+            _soft_ratio_score(preflight.get("query_to_render_max_cosine_mean"), float(thresholds.min_query_to_render_max_cosine)),
+            _soft_ratio_score(preflight.get("coarse_mnn_count"), float(thresholds.min_coarse_mnn_count)),
+        ]
+    )
+
+
+def select_soft_sparse_conditioned_dense_transition(
+    *,
+    sparse_query_xy: np.ndarray,
+    sparse_points_world: np.ndarray,
+    sparse_pose_w2c: np.ndarray,
+    dense_pose_w2c: np.ndarray,
+    intrinsic: np.ndarray,
+    sparse_inlier_indices: Sequence[int] | np.ndarray | None = None,
+    preflight: Mapping[str, Any] | None = None,
+    policy: DenseTransitionPolicy = DenseTransitionPolicy(),
+    thresholds: SLCDPThresholds = SLCDPThresholds(),
+    image_size: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    """Select a continuous sparse-anchored dense update without GT signals.
+
+    This is diagnostic infrastructure for the Soft-SDCG direction. It converts
+    sparse-anchor retention, pose trust, and optional SLCDP preflight metrics
+    into a dense reliability alpha, then interpolates between sparse and dense
+    poses. It does not modify the vendored STDLoc evaluator.
+    """
+
+    selected_indices = _select_indices(sparse_inlier_indices, np.asarray(sparse_query_xy).reshape(-1, 2).shape[0])
+    strong_sparse = int(selected_indices.size) >= int(policy.strong_sparse_inlier_count)
+    min_retained_ratio = float(policy.min_retained_ratio if strong_sparse else policy.weak_min_retained_ratio)
+    max_translation_delta_m = float(
+        policy.max_translation_delta_m
+        if strong_sparse
+        else max(float(policy.max_translation_delta_m), float(policy.weak_max_translation_delta_m))
+    )
+    step_acceptance = evaluate_dense_step_acceptance(
+        sparse_query_xy=sparse_query_xy,
+        sparse_points_world=sparse_points_world,
+        sparse_pose_w2c=sparse_pose_w2c,
+        dense_pose_w2c=dense_pose_w2c,
+        intrinsic=intrinsic,
+        sparse_inlier_indices=sparse_inlier_indices,
+        max_reprojection_error_px=float(policy.max_reprojection_error_px),
+        min_retained_ratio=min_retained_ratio,
+        max_translation_delta_m=max_translation_delta_m,
+        max_rotation_delta_deg=float(policy.max_rotation_delta_deg),
+        image_size=image_size,
+    )
+    step_score = _soft_min_score(
+        [
+            _soft_ratio_score(step_acceptance.get("retained_sparse_inlier_ratio"), min_retained_ratio),
+            _soft_limit_score(step_acceptance.get("translation_delta_m"), max_translation_delta_m),
+            _soft_limit_score(step_acceptance.get("rotation_delta_deg"), float(policy.max_rotation_delta_deg)),
+        ]
+    )
+    preflight = dict(preflight or {})
+    preflight_score = _soft_preflight_score(preflight, thresholds)
+    alpha = float(np.clip(min(step_score, preflight_score), 0.0, 1.0))
+    selected_pose = interpolate_w2c_poses(sparse_pose_w2c, dense_pose_w2c, alpha)
+    if alpha <= 1.0e-9:
+        decision = "soft_keep_sparse"
+    elif alpha >= 1.0 - 1.0e-9:
+        decision = "soft_accept_dense"
+    else:
+        decision = "soft_sparse_anchored_dense_update"
+    return {
+        "schema": "loc_gs_soft_sdcg_transition_v1",
+        "decision": decision,
+        "selected_fraction": alpha,
+        "dense_reliability_alpha": alpha,
+        "sparse_support_strength": "strong" if strong_sparse else "weak",
+        "selected_pose_w2c": selected_pose,
+        "step_score": float(step_score),
+        "preflight_score": float(preflight_score),
+        "step_acceptance": step_acceptance,
+        "policy": {
+            "max_reprojection_error_px": float(policy.max_reprojection_error_px),
+            "min_retained_ratio": float(policy.min_retained_ratio),
+            "weak_min_retained_ratio": float(policy.weak_min_retained_ratio),
+            "effective_min_retained_ratio": float(min_retained_ratio),
+            "max_translation_delta_m": float(policy.max_translation_delta_m),
+            "weak_max_translation_delta_m": float(policy.weak_max_translation_delta_m),
+            "effective_max_translation_delta_m": float(max_translation_delta_m),
+            "max_rotation_delta_deg": float(policy.max_rotation_delta_deg),
+            "strong_sparse_inlier_count": int(policy.strong_sparse_inlier_count),
+        },
+        "thresholds": {
+            "min_visibility_ratio": float(thresholds.min_visibility_ratio),
+            "min_feature_cosine": float(thresholds.min_feature_cosine),
+            "min_local_feature_variance": float(thresholds.min_local_feature_variance),
+            "min_grid_cells": int(thresholds.min_grid_cells),
+            "min_query_to_render_max_cosine": float(thresholds.min_query_to_render_max_cosine),
+            "min_coarse_mnn_count": int(thresholds.min_coarse_mnn_count),
         },
         "diagnostic_only": True,
     }

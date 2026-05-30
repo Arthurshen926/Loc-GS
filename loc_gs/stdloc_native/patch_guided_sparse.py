@@ -62,6 +62,15 @@ class PoseCluster:
     match_indices: np.ndarray
 
 
+@dataclass(frozen=True)
+class PatchResidualWeightPolicy:
+    min_group_patches: int = 2
+    local_score_scale: float = 2.0
+    spatial_coverage_scale: float = 0.25
+    min_patch_residual_weight: float = 0.05
+    max_patch_residual_weight: float = 1.0
+
+
 def _axis_starts(length: int, patch: int, overlap: int) -> list[int]:
     if length <= 0 or patch <= 0:
         raise ValueError("image and patch dimensions must be positive")
@@ -672,3 +681,99 @@ def merge_group_matches(matches: Mapping[str, Any], group: PoseCluster, *, xy_ke
     merged["indices"] = indices
     merged["patch_ids"] = list(group.patch_ids)
     return merged
+
+
+def compute_patch_residual_group_weight(
+    group: PoseCluster,
+    hypotheses: Sequence[PatchHypothesis],
+    *,
+    total_patch_count: int | None = None,
+    policy: PatchResidualWeightPolicy = PatchResidualWeightPolicy(),
+) -> dict[str, Any]:
+    """Compute a diagnostic residual weight for a pose-consistent patch group.
+
+    Patch proposals are local and can be wrong in repeated structures. This
+    weight keeps them as residual evidence: multi-patch, low-ambiguity,
+    spatially covered groups get high weight; local-only ambiguous groups are
+    downweighted before anchor-conditioned local refinement.
+    """
+
+    hyp_by_index = [hypotheses[idx] for idx in group.hypothesis_indices if 0 <= int(idx) < len(hypotheses)]
+    if not hyp_by_index:
+        return {
+            "schema": "loc_gs_patch_residual_group_weight_v1",
+            "patch_residual_weight": 0.0,
+            "components": {
+                "local_quality": 0.0,
+                "pose_consensus": 0.0,
+                "spatial_coverage": 0.0,
+                "ambiguity_safety": 0.0,
+                "geometry_support": 0.0,
+            },
+            "diagnostic_only": True,
+        }
+    patch_count = int(len(set(int(hyp.patch_id) for hyp in hyp_by_index)))
+    local_quality = _robust_unit_interval(max(0.0, float(group.score)), float(policy.local_score_scale))
+    pose_consensus = float(np.clip(patch_count / max(1, int(policy.min_group_patches)), 0.0, 1.0))
+    if total_patch_count is not None and int(total_patch_count) > 0:
+        coverage_raw = patch_count / float(total_patch_count)
+    else:
+        coverage_raw = patch_count / max(1.0, float(policy.min_group_patches))
+    spatial_coverage = _robust_unit_interval(coverage_raw, float(policy.spatial_coverage_scale))
+    ambiguity_values = [float(hyp.components.get("ambiguity_risk", 0.5)) for hyp in hyp_by_index]
+    ambiguity_safety = float(np.clip(1.0 - float(np.mean(ambiguity_values)), 0.0, 1.0))
+    geometry_terms: list[float] = []
+    for hyp in hyp_by_index:
+        components = hyp.components
+        for key in ("spatial_extent", "depth_spread", "logdet_proxy"):
+            if key in components and np.isfinite(float(components[key])):
+                geometry_terms.append(float(np.clip(float(components[key]), 0.0, 1.0)))
+    geometry_support = float(np.mean(geometry_terms)) if geometry_terms else 0.5
+    raw = local_quality * pose_consensus * (0.5 + 0.5 * spatial_coverage) * ambiguity_safety * (0.5 + 0.5 * geometry_support)
+    weight = float(
+        np.clip(
+            raw,
+            float(policy.min_patch_residual_weight),
+            float(policy.max_patch_residual_weight),
+        )
+    )
+    return {
+        "schema": "loc_gs_patch_residual_group_weight_v1",
+        "patch_residual_weight": weight,
+        "components": {
+            "local_quality": float(local_quality),
+            "pose_consensus": float(pose_consensus),
+            "spatial_coverage": float(spatial_coverage),
+            "ambiguity_safety": float(ambiguity_safety),
+            "geometry_support": float(geometry_support),
+        },
+        "patch_count": patch_count,
+        "total_patch_count": None if total_patch_count is None else int(total_patch_count),
+        "diagnostic_only": True,
+    }
+
+
+def apply_patch_residual_group_weight(
+    refinement_matches: Mapping[str, Any],
+    *,
+    patch_residual_weight: float,
+    dense_match_count: int,
+) -> dict[str, Any]:
+    """Scale dense patch residual weights while leaving sparse anchors intact."""
+
+    result = {key: np.asarray(value).copy() if isinstance(value, np.ndarray) else value for key, value in refinement_matches.items()}
+    xy = np.asarray(result.get("xy", np.empty((0, 2))), dtype=np.float32).reshape(-1, 2)
+    weights = np.asarray(result.get("weights", np.ones((xy.shape[0],), dtype=np.float32)), dtype=np.float32).reshape(-1).copy()
+    dense_count = int(np.clip(int(dense_match_count), 0, weights.shape[0]))
+    weight = float(np.clip(float(patch_residual_weight), 0.0, 1.0))
+    if dense_count > 0:
+        weights[:dense_count] *= weight
+    result["weights"] = weights.astype(np.float32)
+    result["patch_residual_weighting"] = {
+        "schema": "loc_gs_patch_residual_weighting_applied_v1",
+        "patch_residual_weight": weight,
+        "dense_match_count": dense_count,
+        "sparse_anchor_count": int(max(0, weights.shape[0] - dense_count)),
+        "diagnostic_only": True,
+    }
+    return result

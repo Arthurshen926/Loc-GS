@@ -6,6 +6,7 @@ import numpy as np
 
 from loc_gs.dense_support.sparse_conditioned_dense_preflight import (
     DenseTransitionPolicy,
+    ImageGeometry,
     SLCDPThresholds,
     SLCDPRepairSearchConfig,
     apply_camera_frame_delta,
@@ -16,6 +17,7 @@ from loc_gs.dense_support.sparse_conditioned_dense_preflight import (
     generate_landmark_guided_pose_candidates,
     generate_pose_repair_candidates,
     select_sparse_conditioned_dense_transition,
+    select_soft_sparse_conditioned_dense_transition,
     score_slcdp_preflight_result,
     select_repaired_pose_candidate,
     compute_sparse_ray_depth_diagnostics,
@@ -95,6 +97,41 @@ def test_slcdp_skips_dense_when_sparse_is_strong_but_render_is_not_explanatory()
     assert result["visible_ratio"] == 0.0
     assert result["failed_checks"]["visibility"] is True
     assert result["failed_checks"]["feature_agreement"] is True
+
+
+def test_slcdp_feature_sampling_uses_explicit_image_geometry_scale():
+    pose = np.eye(4, dtype=np.float32)
+    intrinsic = np.array([[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    points = np.array([[0.8, 0.8, 1.0], [1.0, 0.8, 1.0], [0.8, 1.0, 1.0], [1.0, 1.0, 1.0]], dtype=np.float32)
+    query_xy = np.array([[8.0, 8.0], [10.0, 8.0], [8.0, 10.0], [10.0, 10.0]], dtype=np.float32)
+    render_depth = np.ones((20, 20), dtype=np.float32)
+    query_features = np.zeros((2, 10, 10), dtype=np.float32)
+    render_features = np.zeros((2, 10, 10), dtype=np.float32)
+    for x, y in [(4, 4), (5, 4), (4, 5), (5, 5)]:
+        query_features[:, y, x] = np.array([1.0, 0.0], dtype=np.float32)
+        render_features[:, y, x] = np.array([1.0, 0.0], dtype=np.float32)
+
+    result = sparse_landmark_conditioned_preflight(
+        sparse_query_xy=query_xy,
+        sparse_points_world=points,
+        sparse_pose_w2c=pose,
+        intrinsic=intrinsic,
+        render_depth=render_depth,
+        query_features=query_features,
+        render_features=render_features,
+        sparse_inlier_indices=np.arange(4),
+        feature_geometry=ImageGeometry(width=20, height=20, feature_width=10, feature_height=10),
+        thresholds=SLCDPThresholds(
+            min_sparse_inliers=4,
+            min_visible_landmarks=4,
+            min_grid_cells=1,
+            min_feature_cosine=0.90,
+        ),
+    )
+
+    assert result["decision"] == "accept_dense"
+    assert result["feature_coordinate_frame"] == "scaled_by_image_geometry"
+    assert result["feature_cosine_median"] > 0.999
 
 
 def test_sparse_ray_depth_diagnostics_classifies_near_far_and_missing_depth():
@@ -587,6 +624,103 @@ def test_dense_transition_allows_large_update_when_sparse_support_is_weak():
     assert decision["sparse_support_strength"] == "weak"
     assert decision["decision"] == "accept_dense_update"
     assert decision["selected_fraction"] == 1.0
+
+
+def test_soft_dense_transition_keeps_sparse_when_dense_breaks_anchors():
+    sparse_pose, intrinsic = _identity_camera()
+    dense_pose = sparse_pose.copy()
+    dense_pose[0, 3] = -5.0
+    points = np.array([[-0.2, -0.2, 2.0], [0.2, -0.2, 2.0], [-0.2, 0.2, 2.0], [0.2, 0.2, 2.0]], dtype=np.float32)
+    query_xy = np.array([[4.0, 4.0], [6.0, 4.0], [4.0, 6.0], [6.0, 6.0]], dtype=np.float32)
+
+    decision = select_soft_sparse_conditioned_dense_transition(
+        sparse_query_xy=query_xy,
+        sparse_points_world=points,
+        sparse_pose_w2c=sparse_pose,
+        dense_pose_w2c=dense_pose,
+        intrinsic=intrinsic,
+        sparse_inlier_indices=np.arange(points.shape[0]),
+        policy=DenseTransitionPolicy(max_reprojection_error_px=5.0, min_retained_ratio=0.75, max_translation_delta_m=0.5),
+        image_size=(10, 10),
+    )
+
+    assert decision["decision"] == "soft_keep_sparse"
+    assert decision["selected_fraction"] == 0.0
+    assert np.allclose(decision["selected_pose_w2c"], sparse_pose)
+
+
+def test_soft_dense_transition_keeps_sparse_when_preflight_failed():
+    sparse_pose, intrinsic = _identity_camera()
+    dense_pose = sparse_pose.copy()
+    dense_pose[0, 3] = -0.10
+    points = np.array([[-0.2, -0.2, 2.0], [0.2, -0.2, 2.0], [-0.2, 0.2, 2.0], [0.2, 0.2, 2.0]], dtype=np.float32)
+    query_xy = np.array([[4.0, 4.0], [6.0, 4.0], [4.0, 6.0], [6.0, 6.0]], dtype=np.float32)
+
+    decision = select_soft_sparse_conditioned_dense_transition(
+        sparse_query_xy=query_xy,
+        sparse_points_world=points,
+        sparse_pose_w2c=sparse_pose,
+        dense_pose_w2c=dense_pose,
+        intrinsic=intrinsic,
+        sparse_inlier_indices=np.arange(points.shape[0]),
+        preflight={"decision": "retry_sparse_or_patch_dense", "reason": "empty_render_feature"},
+        policy=DenseTransitionPolicy(max_reprojection_error_px=5.0, min_retained_ratio=0.75, max_translation_delta_m=0.5),
+        image_size=(10, 10),
+    )
+
+    assert decision["decision"] == "soft_keep_sparse"
+    assert decision["selected_fraction"] == 0.0
+    assert decision["preflight_score"] == 0.0
+
+
+def test_soft_dense_transition_accepts_reliable_dense_update():
+    sparse_pose, intrinsic = _identity_camera()
+    dense_pose = sparse_pose.copy()
+    dense_pose[0, 3] = -0.10
+    points = np.array([[-0.2, -0.2, 2.0], [0.2, -0.2, 2.0], [-0.2, 0.2, 2.0], [0.2, 0.2, 2.0]], dtype=np.float32)
+    query_xy = np.array([[4.0, 4.0], [6.0, 4.0], [4.0, 6.0], [6.0, 6.0]], dtype=np.float32)
+
+    decision = select_soft_sparse_conditioned_dense_transition(
+        sparse_query_xy=query_xy,
+        sparse_points_world=points,
+        sparse_pose_w2c=sparse_pose,
+        dense_pose_w2c=dense_pose,
+        intrinsic=intrinsic,
+        sparse_inlier_indices=np.arange(points.shape[0]),
+        preflight={"visible_ratio": 1.0, "feature_cosine_median": 1.0, "query_to_render_max_cosine_mean": 1.0, "coarse_mnn_count": 100},
+        policy=DenseTransitionPolicy(max_reprojection_error_px=5.0, min_retained_ratio=0.75, max_translation_delta_m=0.5),
+        image_size=(10, 10),
+    )
+
+    assert decision["decision"] == "soft_accept_dense"
+    assert decision["selected_fraction"] == 1.0
+    assert np.allclose(decision["selected_pose_w2c"], dense_pose)
+
+
+def test_soft_dense_transition_uses_continuous_reliability_fraction():
+    sparse_pose, intrinsic = _identity_camera()
+    dense_pose = sparse_pose.copy()
+    dense_pose[0, 3] = -0.40
+    points = np.array([[-0.2, -0.2, 2.0], [0.2, -0.2, 2.0], [-0.2, 0.2, 2.0], [0.2, 0.2, 2.0]], dtype=np.float32)
+    query_xy = np.array([[4.0, 4.0], [6.0, 4.0], [4.0, 6.0], [6.0, 6.0]], dtype=np.float32)
+
+    decision = select_soft_sparse_conditioned_dense_transition(
+        sparse_query_xy=query_xy,
+        sparse_points_world=points,
+        sparse_pose_w2c=sparse_pose,
+        dense_pose_w2c=dense_pose,
+        intrinsic=intrinsic,
+        sparse_inlier_indices=np.arange(points.shape[0]),
+        preflight={"visible_ratio": 1.0, "feature_cosine_median": 0.04, "query_to_render_max_cosine_mean": 1.0, "coarse_mnn_count": 100},
+        policy=DenseTransitionPolicy(max_reprojection_error_px=5.0, min_retained_ratio=0.75, max_translation_delta_m=0.5),
+        image_size=(10, 10),
+    )
+
+    assert decision["decision"] == "soft_sparse_anchored_dense_update"
+    assert 0.0 < decision["selected_fraction"] < 1.0
+    selected_pose = np.asarray(decision["selected_pose_w2c"], dtype=np.float64)
+    selected_center = -selected_pose[:3, :3].T @ selected_pose[:3, 3]
+    assert np.isclose(selected_center[0], 0.20, atol=1.0e-6)
 
 
 def test_summary_preflight_flags_kings239_like_sparse_good_dense_bad_case():

@@ -34,6 +34,7 @@ from loc_gs.dense_support.sparse_conditioned_dense_preflight import (
     generate_landmark_guided_pose_candidates,
     generate_pose_repair_candidates,
     select_sparse_conditioned_dense_transition,
+    select_soft_sparse_conditioned_dense_transition,
     select_repaired_pose_candidate,
     sparse_landmark_conditioned_preflight,
 )
@@ -618,6 +619,7 @@ def _resolve_slcdp_effective_options(args: argparse.Namespace) -> dict[str, Any]
         "slcdp_fast_guided_conflict_radius_px": float(args.slcdp_fast_guided_conflict_radius_px),
         "slcdp_fast_guided_depth_margin_m": float(args.slcdp_fast_guided_depth_margin_m),
         "slcdp_transition_control": bool(args.slcdp_transition_control),
+        "slcdp_soft_transition_control": bool(args.slcdp_soft_transition_control),
         "slcdp_transition_max_reprojection_error_px": float(args.slcdp_transition_max_reprojection_error_px),
         "slcdp_transition_min_retained_ratio": float(args.slcdp_transition_min_retained_ratio),
         "slcdp_transition_max_translation_delta_m": float(args.slcdp_transition_max_translation_delta_m),
@@ -939,6 +941,7 @@ def _capture_dense(
     slcdp_fast_guided_conflict_radius_px: float = 8.0,
     slcdp_fast_guided_depth_margin_m: float = 1.0,
     slcdp_transition_control: bool = False,
+    slcdp_soft_transition_control: bool = False,
     slcdp_transition_max_reprojection_error_px: float = 8.0,
     slcdp_transition_min_retained_ratio: float = 0.90,
     slcdp_transition_max_translation_delta_m: float = 0.35,
@@ -1405,23 +1408,37 @@ def _capture_dense(
             selected_label=str(selected.get("label", selected_label)),
             repair_selection=repair_selection,
         )
-    if bool(slcdp_transition_control) and bool(apply_transition_control) and sparse_capture is not None:
-        transition_control = select_sparse_conditioned_dense_transition(
-            sparse_query_xy=sparse_capture["query_xy"],
-            sparse_points_world=sparse_capture["p3d"],
-            sparse_pose_w2c=sparse_pose,
-            dense_pose_w2c=pose,
-            intrinsic=K,
-            sparse_inlier_indices=sparse_capture["inliers"],
-            policy=DenseTransitionPolicy(
-                max_reprojection_error_px=float(slcdp_transition_max_reprojection_error_px),
-                min_retained_ratio=float(slcdp_transition_min_retained_ratio),
-                max_translation_delta_m=float(slcdp_transition_max_translation_delta_m),
-                max_rotation_delta_deg=float(slcdp_transition_max_rotation_delta_deg),
-                line_search_fractions=tuple(float(v) for v in slcdp_transition_line_search_fractions),
-            ),
-            image_size=(int(Wf), int(Hf)),
+    if (bool(slcdp_transition_control) or bool(slcdp_soft_transition_control)) and bool(apply_transition_control) and sparse_capture is not None:
+        transition_policy = DenseTransitionPolicy(
+            max_reprojection_error_px=float(slcdp_transition_max_reprojection_error_px),
+            min_retained_ratio=float(slcdp_transition_min_retained_ratio),
+            max_translation_delta_m=float(slcdp_transition_max_translation_delta_m),
+            max_rotation_delta_deg=float(slcdp_transition_max_rotation_delta_deg),
+            line_search_fractions=tuple(float(v) for v in slcdp_transition_line_search_fractions),
         )
+        if bool(slcdp_soft_transition_control):
+            transition_control = select_soft_sparse_conditioned_dense_transition(
+                sparse_query_xy=sparse_capture["query_xy"],
+                sparse_points_world=sparse_capture["p3d"],
+                sparse_pose_w2c=sparse_pose,
+                dense_pose_w2c=pose,
+                intrinsic=K,
+                sparse_inlier_indices=sparse_capture["inliers"],
+                preflight=slcdp_preflight,
+                policy=transition_policy,
+                image_size=(int(Wf), int(Hf)),
+            )
+        else:
+            transition_control = select_sparse_conditioned_dense_transition(
+                sparse_query_xy=sparse_capture["query_xy"],
+                sparse_points_world=sparse_capture["p3d"],
+                sparse_pose_w2c=sparse_pose,
+                dense_pose_w2c=pose,
+                intrinsic=K,
+                sparse_inlier_indices=sparse_capture["inliers"],
+                policy=transition_policy,
+                image_size=(int(Wf), int(Hf)),
+            )
         if (
             render_control_mode == SPARSE_CONDITIONED_RENDER_CONTROL
             and slcdp_base_dense_capture is not None
@@ -1690,6 +1707,7 @@ def _analyze_case(
     slcdp_fast_guided_conflict_radius_px: float,
     slcdp_fast_guided_depth_margin_m: float,
     slcdp_transition_control: bool,
+    slcdp_soft_transition_control: bool,
     slcdp_transition_max_reprojection_error_px: float,
     slcdp_transition_min_retained_ratio: float,
     slcdp_transition_max_translation_delta_m: float,
@@ -1736,6 +1754,7 @@ def _analyze_case(
             slcdp_fast_guided_conflict_radius_px=slcdp_fast_guided_conflict_radius_px,
             slcdp_fast_guided_depth_margin_m=slcdp_fast_guided_depth_margin_m,
             slcdp_transition_control=slcdp_transition_control,
+            slcdp_soft_transition_control=slcdp_soft_transition_control,
             slcdp_transition_max_reprojection_error_px=slcdp_transition_max_reprojection_error_px,
             slcdp_transition_min_retained_ratio=slcdp_transition_min_retained_ratio,
             slcdp_transition_max_translation_delta_m=slcdp_transition_max_translation_delta_m,
@@ -1935,6 +1954,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--slcdp_fast_guided_conflict_radius_px", type=float, default=8.0)
     parser.add_argument("--slcdp_fast_guided_depth_margin_m", type=float, default=1.0)
     parser.add_argument("--slcdp_transition_control", action="store_true")
+    parser.add_argument("--slcdp_soft_transition_control", action="store_true")
     parser.add_argument("--slcdp_transition_max_reprojection_error_px", type=float, default=8.0)
     parser.add_argument("--slcdp_transition_min_retained_ratio", type=float, default=0.90)
     parser.add_argument("--slcdp_transition_max_translation_delta_m", type=float, default=0.35)

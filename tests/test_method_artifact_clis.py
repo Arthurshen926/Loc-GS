@@ -110,6 +110,79 @@ def test_build_dense_transition_audit_cli_rejects_test_split_without_override(tm
     assert "test split dense transition audits are not allowed" in result.stderr
 
 
+def test_build_sparse_dense_transition_autopsy_cli_writes_variant_report(tmp_path):
+    native = tmp_path / "native"
+    soft = tmp_path / "soft"
+    output = tmp_path / "autopsy"
+    native.mkdir()
+    soft.mkdir()
+    (native / "pgsh_summary.json").write_text(
+        json.dumps(
+                {
+                    "scene": "ToyScene",
+                    "image_name": "q1.png",
+                    "captured_sparse_te_cm": 8.0,
+                    "dense": {
+                        "base_dense_te_cm": 30.0,
+                        "dense_pgsh_effective_te_cm": 30.0,
+                    },
+                    "dense_pgsh": {"decision": "native_dense"},
+                }
+        ),
+        encoding="utf-8",
+    )
+    (soft / "pgsh_summary.json").write_text(
+        json.dumps(
+                {
+                    "scene": "ToyScene",
+                    "image_name": "q1.png",
+                    "captured_sparse_te_cm": 8.0,
+                    "dense": {
+                        "base_dense_te_cm": 30.0,
+                        "dense_pgsh_effective_te_cm": 14.0,
+                        "dense_pgsh": {
+                            "decision": "use_dense_pgsh",
+                            "transition_control": {"decision": "soft_sparse_anchored_dense_update"},
+                        },
+                    },
+                }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loc_gs.scripts.build_sparse_dense_transition_autopsy",
+            "--variant",
+            f"native={native}",
+            "--variant",
+            f"soft={soft}",
+            "--split_name",
+            "selfmap_train",
+            "--output_dir",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((output / "autopsy_summary.json").read_text(encoding="utf-8"))
+    metrics = json.loads((output / "metrics_summary.json").read_text(encoding="utf-8"))
+    report = (output / "report.md").read_text(encoding="utf-8")
+    cases = (output / "variant_cases.csv").read_text(encoding="utf-8")
+    assert summary["variants"]["native"]["dense_worsened_count"] == 1
+    assert summary["variants"]["soft"]["median_effective_te_cm"] == 14.0
+    assert metrics["variant_count"] == 2
+    assert "| native | 1 |" in report
+    assert "soft_sparse_anchored_dense_update" in cases
+    assert "use_dense_pgsh" not in [line for line in cases.splitlines() if line.startswith("soft,")][0]
+    assert (output / "manifest.json").exists()
+
+
 def test_build_failure_profile_from_solver_constraints_cli_writes_train_only_profile(tmp_path):
     baseline = tmp_path / "baseline_results.json"
     candidate = tmp_path / "candidate_results.json"
