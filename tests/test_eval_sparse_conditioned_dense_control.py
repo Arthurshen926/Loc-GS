@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from loc_gs.scripts.eval_sparse_conditioned_dense_control import (
+    _fixed_options,
     _resume_rows,
     _resume_partial_rows,
     _selected_camera_count,
@@ -67,6 +68,23 @@ def test_summarize_comparison_counts_regressions_and_render_labels():
 
 def test_preload_render_backend_reports_boolean_status():
     assert isinstance(_preload_render_backend(), bool)
+
+
+def test_fixed_options_can_enable_apd_dense_without_legacy_transition():
+    options = _fixed_options(
+        "none",
+        apd_dense=True,
+        apd_include_patch_candidates=True,
+        apd_dense_group_weight=0.75,
+        apd_anchor_group_weight=1.25,
+    )
+
+    assert options["apd_dense"] is True
+    assert options["apd_include_patch_candidates"] is True
+    assert options["apd_dense_group_weight"] == 0.75
+    assert options["apd_anchor_group_weight"] == 1.25
+    assert options["slcdp_transition_control"] is False
+    assert options["slcdp_soft_transition_control"] is False
 
 
 def test_resume_rows_accepts_matching_partial_prefix(tmp_path):

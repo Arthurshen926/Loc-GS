@@ -38,6 +38,9 @@ from loc_gs.dense_support.sparse_conditioned_dense_preflight import (
     select_repaired_pose_candidate,
     sparse_landmark_conditioned_preflight,
 )
+from loc_gs.dense_support.clean_render_generator import select_clean_render_candidate
+from loc_gs.dense_support.apd_dense import APDDensePolicy, run_anchor_patch_dense_refinement
+from loc_gs.dense_support.patch_dense_candidates import PatchDenseCandidatePolicy, generate_patch_dense_candidates
 from loc_gs.reporting.artifact_audit import write_artifact_audit_bundle
 
 
@@ -625,6 +628,12 @@ def _resolve_slcdp_effective_options(args: argparse.Namespace) -> dict[str, Any]
         "slcdp_transition_max_translation_delta_m": float(args.slcdp_transition_max_translation_delta_m),
         "slcdp_transition_max_rotation_delta_deg": float(args.slcdp_transition_max_rotation_delta_deg),
         "slcdp_transition_line_search_fractions": transition_fractions,
+        "apd_dense": bool(getattr(args, "apd_dense", False)),
+        "apd_include_patch_candidates": bool(getattr(args, "apd_include_patch_candidates", False)),
+        "apd_dense_group_weight": float(getattr(args, "apd_dense_group_weight", 1.0)),
+        "apd_anchor_group_weight": float(getattr(args, "apd_anchor_group_weight", 1.0)),
+        "apd_max_translation_delta_m": float(getattr(args, "apd_max_translation_delta_m", 0.0)),
+        "apd_max_rotation_delta_deg": float(getattr(args, "apd_max_rotation_delta_deg", 0.0)),
     }
     if str(args.slcdp_render_control) == SPARSE_CONDITIONED_RENDER_CONTROL:
         options.update(
@@ -659,6 +668,9 @@ def _resolve_slcdp_effective_options(args: argparse.Namespace) -> dict[str, Any]
                 "slcdp_transition_line_search_fractions": (1.0, 0.75, 0.5, 0.25, 0.0),
             }
         )
+    if bool(getattr(args, "apd_dense", False)):
+        options["slcdp_transition_control"] = False
+        options["slcdp_soft_transition_control"] = False
     return options
 
 
@@ -843,6 +855,112 @@ def _compact_transition_result(result: dict[str, Any] | None) -> dict[str, Any] 
     }
 
 
+def _compact_apd_result(result: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(result, Mapping):
+        return None
+    diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), Mapping) else {}
+    pool = diagnostics.get("candidate_pool") if isinstance(diagnostics.get("candidate_pool"), Mapping) else {}
+    refine = diagnostics.get("refinement") if isinstance(diagnostics.get("refinement"), Mapping) else {}
+    score_rows = []
+    for row in pool.get("score_summaries", []) or []:
+        if not isinstance(row, Mapping):
+            continue
+        score_rows.append(
+            {
+                "candidate_count": row.get("candidate_count"),
+                "weight_mean": row.get("weight_mean"),
+                "anchor_consistency_median": row.get("anchor_consistency_median"),
+                "geometry_score": row.get("geometry_score"),
+                "match_quality_median": row.get("match_quality_median"),
+            }
+        )
+    return {
+        "schema": result.get("schema"),
+        "uses_gt": bool(result.get("uses_gt", False)),
+        "dense_refine_success": bool(result.get("dense_refine_success", False)),
+        "num_global_candidates": result.get("num_global_candidates"),
+        "num_clean_render_candidates": result.get("num_clean_render_candidates"),
+        "num_patch_candidates": result.get("num_patch_candidates"),
+        "num_anchor_residuals": result.get("num_anchor_residuals"),
+        "candidate_pool": {
+            "candidate_count": pool.get("candidate_count"),
+            "source_counts": pool.get("source_counts"),
+            "score_summaries": score_rows,
+        },
+        "refinement": {
+            "success": refine.get("success"),
+            "dense_candidate_count": refine.get("dense_candidate_count"),
+            "anchor_residual_count": refine.get("anchor_residual_count"),
+            "weighted_correspondence_count": refine.get("weighted_correspondence_count"),
+            "dense_weight_sum": refine.get("dense_weight_sum"),
+            "anchor_weight_sum": refine.get("anchor_weight_sum"),
+            "group_normalized": refine.get("group_normalized"),
+            "local_refinement": {
+                "success": (refine.get("refinement") or {}).get("success") if isinstance(refine.get("refinement"), Mapping) else None,
+                "delta_translation_norm_m": (refine.get("refinement") or {}).get("delta_translation_norm_m")
+                if isinstance(refine.get("refinement"), Mapping)
+                else None,
+                "delta_rotation_norm_deg": (refine.get("refinement") or {}).get("delta_rotation_norm_deg")
+                if isinstance(refine.get("refinement"), Mapping)
+                else None,
+                "before_median_reprojection_error_px": (refine.get("refinement") or {}).get("before_median_reprojection_error_px")
+                if isinstance(refine.get("refinement"), Mapping)
+                else None,
+                "after_median_reprojection_error_px": (refine.get("refinement") or {}).get("after_median_reprojection_error_px")
+                if isinstance(refine.get("refinement"), Mapping)
+                else None,
+            },
+        },
+    }
+
+
+def _select_render_label_for_dense(
+    *,
+    clean_render_selection: Mapping[str, Any],
+    repair_selection: Mapping[str, Any],
+    apd_dense: bool,
+) -> str:
+    if bool(apd_dense):
+        return str(clean_render_selection.get("selected_label", "base") or "base")
+    selected_label = str(repair_selection.get("selected_label", "base") or "base")
+    if repair_selection.get("decision") not in {"accept_repaired_dense_pose", "accept_original_dense_pose"}:
+        return "base"
+    return selected_label
+
+
+def _clean_render_visual_payload(
+    *,
+    selection: Mapping[str, Any],
+    rendered_candidates: Sequence[Mapping[str, Any]],
+    ray_depth_rows_fn: Any,
+) -> dict[str, Any]:
+    """Keep non-serializable clean-render images for diagnostic visualization."""
+
+    if not rendered_candidates:
+        return {"selection": dict(selection), "base": None, "selected": None}
+    base_idx = int(selection.get("base_index", 0) or 0)
+    selected_idx = int(selection.get("selected_index", base_idx) or base_idx)
+    base_idx = max(0, min(base_idx, len(rendered_candidates) - 1))
+    selected_idx = max(0, min(selected_idx, len(rendered_candidates) - 1))
+
+    def _pack(item: Mapping[str, Any]) -> dict[str, Any]:
+        depth = item.get("depth")
+        pose = np.asarray(item.get("pose_w2c"), dtype=np.float32).reshape(4, 4)
+        return {
+            "label": str(item.get("label", "candidate")),
+            "render": item.get("render_pkg", {}).get("render") if isinstance(item.get("render_pkg"), Mapping) else None,
+            "preflight": item.get("preflight"),
+            "render_control": item.get("render_control"),
+            "ray_depth_diagnostics": ray_depth_rows_fn(depth, pose) if depth is not None else [],
+        }
+
+    return {
+        "selection": dict(selection),
+        "base": _pack(rendered_candidates[base_idx]),
+        "selected": _pack(rendered_candidates[selected_idx]),
+    }
+
+
 def _capture_sparse(ctx: dict[str, Any], query_image: torch.Tensor, fovx: float, fovy: float) -> dict[str, Any]:
     stdloc = ctx["stdloc"]
     loc = ctx["localizer"]
@@ -948,6 +1066,12 @@ def _capture_dense(
     slcdp_transition_max_rotation_delta_deg: float = 5.0,
     slcdp_transition_line_search_fractions: tuple[float, ...] = (1.0, 0.75, 0.5, 0.25, 0.0),
     slcdp_base_dense_capture: Mapping[str, Any] | None = None,
+    apd_dense: bool = False,
+    apd_include_patch_candidates: bool = False,
+    apd_dense_group_weight: float = 1.0,
+    apd_anchor_group_weight: float = 1.0,
+    apd_max_translation_delta_m: float = 0.0,
+    apd_max_rotation_delta_deg: float = 0.0,
 ) -> dict[str, Any]:
     stdloc = ctx["stdloc"]
     loc = ctx["localizer"]
@@ -1218,6 +1342,12 @@ def _capture_dense(
     if "rendered_candidates" not in locals() or rendered_candidates is None:
         rendered_candidates = []
     rendered_candidates.extend(_render_and_preflight(candidate) for candidate in candidates)
+    clean_render_selection = select_clean_render_candidate(rendered_candidates)
+    clean_render_visualization = _clean_render_visual_payload(
+        selection=clean_render_selection,
+        rendered_candidates=rendered_candidates,
+        ray_depth_rows_fn=_ray_depth_rows,
+    )
     repair_selection = select_repaired_pose_candidate(
         rendered_candidates,
         require_accept=bool(slcdp_repair_require_accept),
@@ -1226,10 +1356,14 @@ def _capture_dense(
         allow_low_confidence_gated_base=bool(slcdp_allow_low_confidence_gated_base),
         low_confidence_gated_base_min_score_gain=float(slcdp_low_confidence_gated_base_min_score_gain),
     )
-    selected_label = str(repair_selection.get("selected_label", "base"))
-    if repair_selection.get("decision") not in {"accept_repaired_dense_pose", "accept_original_dense_pose"}:
-        selected_label = "base"
+    selected_label = _select_render_label_for_dense(
+        clean_render_selection=clean_render_selection,
+        repair_selection=repair_selection,
+        apd_dense=bool(apd_dense),
+    )
     if (
+        not bool(apd_dense)
+        and
         render_control_mode == SPARSE_CONDITIONED_RENDER_CONTROL
         and str(repair_selection.get("decision")) == "accept_repaired_dense_pose"
     ):
@@ -1250,7 +1384,12 @@ def _capture_dense(
                 }
             )
             selected_label = "base"
-    if bool(repair_enabled) and repair_selection["decision"] == "skip_dense_keep_sparse" and bool(slcdp_repair_skip_if_no_accept):
+    if (
+        not bool(apd_dense)
+        and bool(repair_enabled)
+        and repair_selection["decision"] == "skip_dense_keep_sparse"
+        and bool(slcdp_repair_skip_if_no_accept)
+    ):
         base = rendered_candidates[0]
         if render_control_mode == SPARSE_CONDITIONED_RENDER_CONTROL and slcdp_base_dense_capture is not None:
             return _reuse_base_dense_after_rejected_sparse_conditioned_repair(
@@ -1273,11 +1412,13 @@ def _capture_dense(
             "slcdp_preflight": base.get("preflight"),
             "slcdp_repair_search": {
                 "enabled": bool(repair_enabled),
+                "clean_render_generation": clean_render_selection,
                 "selection": repair_selection,
                 "candidates": _slcdp_candidate_audit_rows(rendered_candidates),
                 "render_candidate_count": int(len(rendered_candidates)),
                 "dense_skipped": True,
             },
+            "_clean_render_visualization": clean_render_visualization,
         }
     selected = next((item for item in rendered_candidates if item["label"] == selected_label), rendered_candidates[0])
     render_pose = np.asarray(selected["pose_w2c"], dtype=np.float32).reshape(4, 4)
@@ -1287,6 +1428,7 @@ def _capture_dense(
     slcdp_preflight = selected.get("preflight")
     slcdp_repair_metadata = {
         "enabled": bool(repair_enabled),
+        "clean_render_generation": clean_render_selection,
         "selection": repair_selection,
         "candidates": [
             {
@@ -1319,6 +1461,7 @@ def _capture_dense(
             "slcdp_render_control": selected.get("render_control"),
             "slcdp_preflight": {"decision": "retry_sparse_or_patch_dense", "reason": "empty_render_feature"},
             "slcdp_repair_search": slcdp_repair_metadata,
+            "_clean_render_visualization": clean_render_visualization,
         }
     coarse_render = F.interpolate(fine_render[None], size=(Hc, Wc), mode="bilinear", align_corners=False)[0]
     coarse_render = F.normalize(coarse_render, dim=0)
@@ -1345,6 +1488,7 @@ def _capture_dense(
             "slcdp_render_control": selected.get("render_control"),
             "slcdp_preflight": slcdp_preflight,
             "slcdp_repair_search": slcdp_repair_metadata,
+            "_clean_render_visualization": clean_render_visualization,
         }
 
     query_windows = F.unfold(query_fine, (W, W), stride=W).reshape(1, C, W * W, -1)[c_b, :, :, c_i].permute(0, 2, 1)
@@ -1369,6 +1513,7 @@ def _capture_dense(
             "slcdp_render_control": selected.get("render_control"),
             "slcdp_preflight": slcdp_preflight,
             "slcdp_repair_search": slcdp_repair_metadata,
+            "_clean_render_visualization": clean_render_visualization,
         }
     if loc.config["dense"].get("subpixel_refine", False):
         temp = loc.config["dense"].get("subpixel_temperature", 0.1)
@@ -1390,6 +1535,7 @@ def _capture_dense(
     )
     p2d_np = query_xy.detach().cpu().numpy().astype(np.float32)
     p3d_np = p3d.detach().cpu().numpy().astype(np.float32)
+    fine_scores_np = fine_corr[f_b, f_i, f_j].detach().cpu().numpy().astype(np.float32) if f_i.numel() else np.empty((0,), dtype=np.float32)
     pose, inliers = stdloc.solve_pose(
         p2d_np + 0.5,
         p3d_np,
@@ -1402,6 +1548,56 @@ def _capture_dense(
     )
     transition_control = None
     final_pose = pose
+    apd_result = None
+    if bool(apd_dense) and sparse_capture is not None:
+        apd_policy = APDDensePolicy(
+            dense_group_weight=float(apd_dense_group_weight),
+            anchor_group_weight=float(apd_anchor_group_weight),
+            max_translation_delta_m=None if float(apd_max_translation_delta_m) <= 0.0 else float(apd_max_translation_delta_m),
+            max_rotation_delta_deg=None if float(apd_max_rotation_delta_deg) <= 0.0 else float(apd_max_rotation_delta_deg),
+        )
+        sparse_ref_xy, _sparse_ref_valid = project_points(
+            sparse_capture["p3d"],
+            render_pose,
+            K,
+            width=int(Wf),
+            height=int(Hf),
+        )
+        apd_anchors = {
+            "query_xy": sparse_capture["query_xy"],
+            "render_xy": sparse_ref_xy,
+            "p3d": sparse_capture["p3d"],
+            "inliers": sparse_capture["inliers"],
+        }
+        current_dense_candidates = {
+            "query_xy": p2d_np + 0.5,
+            "p3d": p3d_np,
+            "match_scores": fine_scores_np,
+        }
+        selected_is_clean = render_control_mode != "none" and str(selected.get("label", selected_label)) != "base"
+        patch_candidates = None
+        if bool(apd_include_patch_candidates):
+            patch_candidates = generate_patch_dense_candidates(
+                query_fine.detach().cpu().numpy(),
+                fine_render.detach().cpu().numpy(),
+                depth.detach().cpu().numpy(),
+                apd_anchors,
+                policy=PatchDenseCandidatePolicy(),
+                render_pose_w2c=render_pose,
+                intrinsic=K,
+            )
+        apd_result = run_anchor_patch_dense_refinement(
+            sparse_pose=sparse_pose,
+            dense_reference_pose=pose,
+            sparse_anchors=apd_anchors,
+            intrinsic=K,
+            image_size=(int(Wf), int(Hf)),
+            global_dense_candidates=None if selected_is_clean else current_dense_candidates,
+            clean_render_dense_candidates=current_dense_candidates if selected_is_clean else None,
+            patch_dense_candidates=patch_candidates,
+            policy=apd_policy,
+        )
+        final_pose = np.asarray(apd_result["final_pose"], dtype=np.float32).reshape(4, 4)
     apply_transition_control = True
     if render_control_mode == SPARSE_CONDITIONED_RENDER_CONTROL:
         apply_transition_control = _should_apply_sparse_conditioned_transition_control(
@@ -1467,6 +1663,8 @@ def _capture_dense(
         "slcdp_preflight": slcdp_preflight,
         "slcdp_repair_search": slcdp_repair_metadata,
         "slcdp_transition_control": _compact_transition_result(transition_control),
+        "_clean_render_visualization": clean_render_visualization,
+        "apd_dense": _compact_apd_result(apd_result),
     }
     result["dense_pose_quality"] = _dense_pose_quality(result)
     if (
@@ -1655,6 +1853,121 @@ def _draw_ray_depth_canvas(
         draw.rectangle((x0, y, x0 + 10, y + 10), fill=(*color, 220))
         draw.text((x0 + 14, y - 2), label, fill=(255, 255, 255, 230))
     canvas.save(output_path)
+
+
+def _preflight_short(preflight: Mapping[str, Any] | None) -> str:
+    if not isinstance(preflight, Mapping):
+        return "preflight: n/a"
+    return (
+        "vis={vis:.3f} near={near:.3f} feat={feat:.3f} cov={cov} {decision}"
+    ).format(
+        vis=float(preflight.get("visible_ratio", 0.0) or 0.0),
+        near=float(preflight.get("near_occluder_ratio", 0.0) or 0.0),
+        feat=float(preflight.get("feature_cosine_median", 0.0) or 0.0),
+        cov=int(preflight.get("coverage_grid_cells", 0) or 0),
+        decision=str(preflight.get("decision", "unknown")),
+    )
+
+
+def _add_header(image: Image.Image, lines: Sequence[str]) -> Image.Image:
+    header_h = 16 + 14 * max(1, len(lines))
+    panel = Image.new("RGB", (image.width, image.height + header_h), (20, 20, 20))
+    panel.paste(image, (0, header_h))
+    draw = ImageDraw.Draw(panel)
+    for idx, line in enumerate(lines):
+        draw.text((6, 5 + idx * 14), str(line), fill=(245, 245, 245))
+    return panel
+
+
+def _write_clean_render_visualization(
+    case_dir: Path,
+    *,
+    query_image: Image.Image,
+    dense_render: Image.Image,
+    clean_visualization: Mapping[str, Any] | None,
+    max_draw: int,
+) -> dict[str, Any] | None:
+    if not isinstance(clean_visualization, Mapping):
+        return None
+    selection = clean_visualization.get("selection")
+    base = clean_visualization.get("base")
+    selected = clean_visualization.get("selected")
+    if not isinstance(selection, Mapping) or not isinstance(base, Mapping) or not isinstance(selected, Mapping):
+        return None
+    base_render_raw = base.get("render")
+    selected_render_raw = selected.get("render")
+    if base_render_raw is None or selected_render_raw is None:
+        return None
+    base_render = _tensor_to_image(base_render_raw, size=query_image.size)
+    selected_render = _tensor_to_image(selected_render_raw, size=query_image.size)
+
+    base_path = case_dir / "clean_render_base.jpg"
+    selected_path = case_dir / "clean_render_selected.jpg"
+    final_path = case_dir / "clean_render_actual_dense.jpg"
+    contact_path = case_dir / "clean_render_generator.jpg"
+    base_ray_path = case_dir / "clean_render_base_ray_depth.jpg"
+    selected_ray_path = case_dir / "clean_render_selected_ray_depth.jpg"
+    base_render.save(base_path, quality=92)
+    selected_render.save(selected_path, quality=92)
+    dense_render.save(final_path, quality=92)
+    _draw_ray_depth_canvas(
+        query_image,
+        base_render,
+        list(base.get("ray_depth_diagnostics") or []),
+        base_ray_path,
+        max_draw=max_draw,
+    )
+    _draw_ray_depth_canvas(
+        query_image,
+        selected_render,
+        list(selected.get("ray_depth_diagnostics") or []),
+        selected_ray_path,
+        max_draw=max_draw,
+    )
+
+    decision = str(selection.get("decision", "unknown"))
+    selected_label = str(selection.get("selected_label", "unknown"))
+    score_gain = float(selection.get("score_gain", 0.0) or 0.0)
+    base_panel = _add_header(
+        base_render,
+        [
+            f"base render | score={float(selection.get('base_score', 0.0) or 0.0):.3f}",
+            _preflight_short(base.get("preflight")),
+        ],
+    )
+    selected_panel = _add_header(
+        selected_render,
+        [
+            f"CleanRender selected: {selected_label} | gain={score_gain:.3f}",
+            _preflight_short(selected.get("preflight")),
+        ],
+    )
+    final_panel = _add_header(
+        dense_render,
+        [
+            "actual dense render used by current path",
+            "may differ if legacy repair selector chose another candidate",
+        ],
+    )
+    query_panel = _add_header(query_image, [f"query | CleanRender decision={decision}", "diagnostic only"])
+    panels = [query_panel, base_panel, selected_panel, final_panel]
+    width = sum(panel.width for panel in panels)
+    height = max(panel.height for panel in panels)
+    canvas = Image.new("RGB", (width, height), (255, 255, 255))
+    x = 0
+    for panel in panels:
+        canvas.paste(panel, (x, 0))
+        x += panel.width
+    contact_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(contact_path, quality=92)
+    return {
+        "clean_render_generator": str(contact_path),
+        "clean_render_base": str(base_path),
+        "clean_render_selected": str(selected_path),
+        "clean_render_actual_dense": str(final_path),
+        "clean_render_base_ray_depth": str(base_ray_path),
+        "clean_render_selected_ray_depth": str(selected_ray_path),
+    }
 
 
 def _summarize_ray_depth(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1861,6 +2174,38 @@ def _analyze_case(
     ray_depth_rows = list(dense.get("ray_depth_diagnostics") or [])
     _write_ray_depth_csv(ray_depth_csv, ray_depth_rows)
     _draw_ray_depth_canvas(query_pil, dense_render, ray_depth_rows, ray_depth_path, max_draw=max_draw)
+    clean_render_paths = _write_clean_render_visualization(
+        case_dir,
+        query_image=query_pil,
+        dense_render=dense_render,
+        clean_visualization=dense.get("_clean_render_visualization"),
+        max_draw=max_draw,
+    )
+    clean_render_visualization = dense.get("_clean_render_visualization")
+    clean_render_summary = None
+    if isinstance(clean_render_visualization, Mapping):
+        base_clean = clean_render_visualization.get("base")
+        selected_clean = clean_render_visualization.get("selected")
+        clean_render_summary = {
+            "selection": clean_render_visualization.get("selection"),
+            "base": {
+                "label": base_clean.get("label"),
+                "preflight": base_clean.get("preflight"),
+                "render_control": base_clean.get("render_control"),
+                "sparse_ray_depth": _summarize_ray_depth(list(base_clean.get("ray_depth_diagnostics") or [])),
+            }
+            if isinstance(base_clean, Mapping)
+            else None,
+            "selected": {
+                "label": selected_clean.get("label"),
+                "preflight": selected_clean.get("preflight"),
+                "render_control": selected_clean.get("render_control"),
+                "sparse_ray_depth": _summarize_ray_depth(list(selected_clean.get("ray_depth_diagnostics") or [])),
+            }
+            if isinstance(selected_clean, Mapping)
+            else None,
+            "paths": clean_render_paths,
+        }
     summary = {
         "scene": ctx["scene"],
         "run_label": run_label,
@@ -1889,9 +2234,11 @@ def _analyze_case(
         "slcdp_render_control": dense.get("slcdp_render_control"),
         "slcdp_repair_search": dense.get("slcdp_repair_search"),
         "slcdp_transition_control": dense.get("slcdp_transition_control"),
+        "apd_dense": dense.get("apd_dense"),
         "slcdp_raw_step_acceptance": slcdp_raw_step_acceptance,
         "slcdp_step_acceptance": slcdp_step_acceptance,
         "sparse_ray_depth": _summarize_ray_depth(ray_depth_rows),
+        "clean_render_visualization": clean_render_summary,
         "paths": {
             "sparse_matches": str(sparse_path),
             "dense_matches": str(dense_path),
@@ -1899,6 +2246,7 @@ def _analyze_case(
             "dense_csv": str(case_dir / "dense_matches.csv"),
             "sparse_ray_depth": str(ray_depth_path),
             "sparse_ray_depth_csv": str(ray_depth_csv),
+            **(clean_render_paths or {}),
         },
     }
     write_json(case_dir / "match_summary.json", summary)
@@ -1912,6 +2260,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline_root", default="")
     parser.add_argument("--output_dir", default="output/diagnostics/stdloc_match_visualizations/cambridge_test_v6_guarded512_20260526")
     parser.add_argument("--category", default="hard_failure")
+    parser.add_argument("--eval_split", choices=["train", "test"], default="test")
     parser.add_argument("--max_cases", type=int, default=8)
     parser.add_argument("--good_px", type=float, default=5.0)
     parser.add_argument("--max_draw", type=int, default=350)
@@ -1960,6 +2309,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--slcdp_transition_max_translation_delta_m", type=float, default=0.35)
     parser.add_argument("--slcdp_transition_max_rotation_delta_deg", type=float, default=5.0)
     parser.add_argument("--slcdp_transition_line_search_fractions", default="1.0,0.75,0.5,0.25,0.0")
+    parser.add_argument("--apd_dense", action="store_true", help="Diagnostic APD-Dense refinement inside dense stage.")
+    parser.add_argument("--apd_include_patch_candidates", action="store_true")
+    parser.add_argument("--apd_dense_group_weight", type=float, default=1.0)
+    parser.add_argument("--apd_anchor_group_weight", type=float, default=1.0)
+    parser.add_argument("--apd_max_translation_delta_m", type=float, default=0.0)
+    parser.add_argument("--apd_max_rotation_delta_deg", type=float, default=0.0)
     return parser
 
 
@@ -1983,7 +2338,7 @@ def main(argv: list[str] | None = None) -> int:
         for run_label, root in run_roots:
             key = (run_label, scene)
             if key not in contexts:
-                contexts[key] = _build_context(root / scene)
+                contexts[key] = _build_context(root / scene, split_override=str(args.eval_split))
             summaries.append(
                 _analyze_case(
                     contexts[key],
@@ -2010,7 +2365,8 @@ def main(argv: list[str] | None = None) -> int:
         "method": "loc_gs_stdloc_match_visualization",
         "diagnostic_only": True,
         "paper_safe_for_tuning": False,
-        "split_name": "test",
+        "split_name": str(args.eval_split),
+        "eval_split": str(args.eval_split),
         "report_dir": str(report_dir),
         "candidate_root": str(args.candidate_root),
         "baseline_root": str(args.baseline_root),
@@ -2023,8 +2379,14 @@ def main(argv: list[str] | None = None) -> int:
         },
     }
     split_audit = {
-        "audit_status": "failed",
-        "reason": "official test cases are visualized for diagnosis only; not valid for tuning or model selection",
+        "audit_status": "passed" if str(args.eval_split) == "train" else "failed",
+        "reason": (
+            "train/self-map diagnostic visualization"
+            if str(args.eval_split) == "train"
+            else "official test cases are visualized for diagnosis only; not valid for tuning or model selection"
+        ),
+        "split": str(args.eval_split),
+        "diagnostic_only": True,
     }
     write_artifact_audit_bundle(
         output_dir,

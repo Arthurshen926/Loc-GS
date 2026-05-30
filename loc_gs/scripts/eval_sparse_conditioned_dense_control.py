@@ -153,12 +153,38 @@ def summarize_comparison(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _fixed_options(render_control: str) -> dict[str, Any]:
+def _fixed_options(
+    render_control: str,
+    *,
+    apd_dense: bool = False,
+    apd_include_patch_candidates: bool = False,
+    apd_dense_group_weight: float = 1.0,
+    apd_anchor_group_weight: float = 1.0,
+    apd_max_translation_delta_m: float = 0.0,
+    apd_max_rotation_delta_deg: float = 0.0,
+) -> dict[str, Any]:
     parser = argparse.ArgumentParser(add_help=False)
     from loc_gs.scripts.visualize_stdloc_hard_matches import build_argparser as build_visualizer_argparser
 
     parser = build_visualizer_argparser()
-    args = parser.parse_args(["--slcdp_render_control", render_control])
+    argv = ["--slcdp_render_control", render_control]
+    if bool(apd_dense):
+        argv.append("--apd_dense")
+    if bool(apd_include_patch_candidates):
+        argv.append("--apd_include_patch_candidates")
+    argv.extend(
+        [
+            "--apd_dense_group_weight",
+            str(float(apd_dense_group_weight)),
+            "--apd_anchor_group_weight",
+            str(float(apd_anchor_group_weight)),
+            "--apd_max_translation_delta_m",
+            str(float(apd_max_translation_delta_m)),
+            "--apd_max_rotation_delta_deg",
+            str(float(apd_max_rotation_delta_deg)),
+        ]
+    )
+    args = parser.parse_args(argv)
     return _resolve_slcdp_effective_options(args)
 
 
@@ -221,12 +247,27 @@ def evaluate_scene(
     query_stride: int,
     progress_interval: int,
     resume_partial: bool = False,
+    candidate_render_control: str = "sparse_conditioned",
+    apd_dense: bool = False,
+    apd_include_patch_candidates: bool = False,
+    apd_dense_group_weight: float = 1.0,
+    apd_anchor_group_weight: float = 1.0,
+    apd_max_translation_delta_m: float = 0.0,
+    apd_max_rotation_delta_deg: float = 0.0,
 ) -> dict[str, Any]:
     _preload_render_backend()
     run_dir = candidate_root / scene
     ctx = _build_context(run_dir, split_override=eval_split)
     base_options = _fixed_options("none")
-    candidate_options = _fixed_options("sparse_conditioned")
+    candidate_options = _fixed_options(
+        candidate_render_control,
+        apd_dense=bool(apd_dense),
+        apd_include_patch_candidates=bool(apd_include_patch_candidates),
+        apd_dense_group_weight=float(apd_dense_group_weight),
+        apd_anchor_group_weight=float(apd_anchor_group_weight),
+        apd_max_translation_delta_m=float(apd_max_translation_delta_m),
+        apd_max_rotation_delta_deg=float(apd_max_rotation_delta_deg),
+    )
     cameras = ctx["cameras"]
     total_selected = _selected_camera_count(
         cameras,
@@ -283,12 +324,18 @@ def evaluate_scene(
         base_te, base_re = pose_error_cm_deg(base_dense["pose_w2c"], gt_w2c)
         controlled_te, controlled_re = pose_error_cm_deg(controlled_dense["pose_w2c"], gt_w2c)
         selection = (controlled_dense.get("slcdp_repair_search") or {}).get("selection") or {}
+        clean_render_selection = (controlled_dense.get("slcdp_repair_search") or {}).get("clean_render_generation") or {}
         render_control = controlled_dense.get("slcdp_render_control") or {}
         dense_quality = controlled_dense.get("dense_pose_quality") or {}
+        apd_info = controlled_dense.get("apd_dense") or {}
+        selected_label = render_control.get("candidate_label")
+        if selected_label is None:
+            selected_label = clean_render_selection.get("selected_label", "base")
         rows.append(
             {
                 "scene": scene,
                 "split": eval_split,
+                "candidate_method": "apd_dense" if bool(apd_dense) else str(candidate_render_control),
                 "query_index": int(index),
                 "image_name": str(camera.image_name),
                 "sparse_te_cm": sparse_te,
@@ -300,14 +347,22 @@ def evaluate_scene(
                 "sparse_conditioned_dense_te_cm": controlled_te,
                 "sparse_conditioned_dense_re_deg": controlled_re,
                 "sparse_conditioned_dense_inlier_count": int(np.asarray(controlled_dense.get("inliers", [])).reshape(-1).shape[0]),
-                "sparse_conditioned_label": render_control.get("candidate_label"),
+                "sparse_conditioned_label": selected_label,
                 "sparse_conditioned_decision": selection.get("decision"),
                 "sparse_conditioned_best_label": selection.get("best_label"),
                 "sparse_conditioned_score_gain": selection.get("score_gain"),
+                "clean_render_decision": clean_render_selection.get("decision"),
+                "clean_render_selected_label": clean_render_selection.get("selected_label"),
+                "clean_render_score_gain": clean_render_selection.get("score_gain"),
                 "low_confidence_gated_base": bool(selection.get("low_confidence_gated_base", False)),
                 "transition_decision": (controlled_dense.get("slcdp_transition_control") or {}).get("decision"),
                 "base_dense_reused": bool(render_control.get("base_dense_reused", False)),
                 "base_reuse_reason": render_control.get("base_reuse_reason"),
+                "apd_dense_refine_success": apd_info.get("dense_refine_success"),
+                "apd_num_global_candidates": apd_info.get("num_global_candidates"),
+                "apd_num_clean_render_candidates": apd_info.get("num_clean_render_candidates"),
+                "apd_num_patch_candidates": apd_info.get("num_patch_candidates"),
+                "apd_num_anchor_residuals": apd_info.get("num_anchor_residuals"),
                 "dense_pose_match_count": dense_quality.get("match_count"),
                 "dense_pose_solver_inlier_count": dense_quality.get("solver_inlier_count"),
                 "dense_pose_solver_inlier_ratio": dense_quality.get("solver_inlier_ratio"),
@@ -357,8 +412,10 @@ def evaluate_scene(
             "run_dir": str(run_dir),
             "map_path": ctx.get("map_path"),
             "data_root": ctx.get("scene_root"),
-            "render_control": "sparse_conditioned",
+            "render_control": str(candidate_render_control),
             "base_render_control": "none",
+            "apd_dense": bool(apd_dense),
+            "apd_include_patch_candidates": bool(apd_include_patch_candidates),
             "selection_policy": candidate_options,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "resume_partial": bool(resume_partial),
@@ -412,6 +469,25 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--query_stride", type=int, default=1)
     parser.add_argument("--progress_interval", type=int, default=10)
     parser.add_argument("--resume_partial", action="store_true")
+    parser.add_argument(
+        "--candidate_render_control",
+        choices=[
+            "none",
+            "gaussian_gating",
+            "guided_pose",
+            "gating_guided_pose",
+            "fast_guided_pose",
+            "fast_gating_guided_pose",
+            "sparse_conditioned",
+        ],
+        default="sparse_conditioned",
+    )
+    parser.add_argument("--apd_dense", action="store_true")
+    parser.add_argument("--apd_include_patch_candidates", action="store_true")
+    parser.add_argument("--apd_dense_group_weight", type=float, default=1.0)
+    parser.add_argument("--apd_anchor_group_weight", type=float, default=1.0)
+    parser.add_argument("--apd_max_translation_delta_m", type=float, default=0.0)
+    parser.add_argument("--apd_max_rotation_delta_deg", type=float, default=0.0)
     return parser
 
 
@@ -430,6 +506,13 @@ def main(args: argparse.Namespace | None = None) -> int:
             query_stride=int(ns.query_stride),
             progress_interval=int(ns.progress_interval),
             resume_partial=bool(ns.resume_partial),
+            candidate_render_control=str(ns.candidate_render_control),
+            apd_dense=bool(ns.apd_dense),
+            apd_include_patch_candidates=bool(ns.apd_include_patch_candidates),
+            apd_dense_group_weight=float(ns.apd_dense_group_weight),
+            apd_anchor_group_weight=float(ns.apd_anchor_group_weight),
+            apd_max_translation_delta_m=float(ns.apd_max_translation_delta_m),
+            apd_max_rotation_delta_deg=float(ns.apd_max_rotation_delta_deg),
         )
         for scene in scenes
     ]
