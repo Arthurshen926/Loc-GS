@@ -5,6 +5,8 @@ import argparse
 import json
 import math
 import pickle
+import shlex
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -74,6 +76,7 @@ from loc_gs.losses.localization_loss import (
     unproject_dense_depth_to_world,
 )
 from loc_gs.models.hybrid_gaussian import HybridFeatureGaussian, SuperPointOutputHead
+from loc_gs.reporting.artifact_audit import write_artifact_audit_bundle
 from loc_gs.scripts.extract_superpoint_features import SuperPointNet
 from loc_gs.scripts.train_cambridge_hybrid import (
     decode_gaussian_center_descriptors,
@@ -1309,6 +1312,67 @@ def _coverage_aware_topk(
     return torch.as_tensor(selected[:keep], dtype=torch.long, device=score.device)
 
 
+def patch_consensus_scores(
+    query_yx: torch.Tensor,
+    points3d: torch.Tensor,
+    scores: torch.Tensor | None = None,
+    *,
+    image_grid_size: int = 4,
+    min_patch_matches: int = 3,
+) -> torch.Tensor:
+    """Score correspondences by local patch support before a single PnP call.
+
+    This is a sparse-stage alternative to patch-level branch selection. It uses
+    only query-observable correspondence statistics: local match count, score
+    quality, image spread, 3D spread, and depth spread inside each query-grid
+    cell. The resulting score can reorder or prefilter matches for one fixed
+    RANSAC/PnP path.
+    """
+
+    count = min(int(query_yx.shape[0]), int(points3d.shape[0]))
+    device = query_yx.device
+    if count <= 0:
+        return torch.empty(0, dtype=torch.float32, device=device)
+    query = query_yx[:count].to(device=device, dtype=torch.float32)
+    xyz = points3d[:count].to(device=device, dtype=torch.float32)
+    if scores is None:
+        base_score = torch.ones(count, dtype=torch.float32, device=device)
+    else:
+        base_score = scores[:count].to(device=device, dtype=torch.float32).reshape(-1)
+        if base_score.numel() != count:
+            base_score = torch.ones(count, dtype=torch.float32, device=device)
+    valid = torch.isfinite(query).all(dim=-1) & torch.isfinite(xyz).all(dim=-1) & torch.isfinite(base_score)
+    out = torch.zeros(count, dtype=torch.float32, device=device)
+    if int(valid.sum()) == 0:
+        return out
+
+    cells = _grid_cell_ids(query, image_grid_size, valid)
+    min_count = max(1, int(min_patch_matches))
+    for cell in torch.unique(cells[valid]):
+        idx = torch.where(valid & (cells == cell))[0]
+        if idx.numel() == 0:
+            continue
+        local_query = query[idx]
+        local_xyz = xyz[idx, :3]
+        local_score = normalize_score01(base_score[idx])
+        match_support = float(idx.numel()) / float(idx.numel() + min_count)
+        if idx.numel() >= 2:
+            query_span = torch.linalg.norm(local_query.amax(dim=0) - local_query.amin(dim=0))
+            xyz_span = torch.linalg.norm(local_xyz.amax(dim=0) - local_xyz.amin(dim=0))
+            depth_span = local_xyz[:, 2].amax() - local_xyz[:, 2].amin()
+            query_spread = query_span / (query_span + 8.0)
+            xyz_spread = xyz_span / (xyz_span + 1.0)
+            depth_spread = depth_span / (depth_span + 1.0)
+        else:
+            query_spread = local_query.new_tensor(0.0)
+            xyz_spread = local_query.new_tensor(0.0)
+            depth_spread = local_query.new_tensor(0.0)
+        geometry = (0.35 * query_spread + 0.40 * xyz_spread + 0.25 * depth_spread).clamp(0.0, 1.0)
+        patch_quality = (0.45 * float(local_score.mean().item()) + 0.30 * match_support + 0.25 * float(geometry.item()))
+        out[idx] = float(patch_quality)
+    return normalize_score01(out, valid=valid)
+
+
 def local_geometric_consistency_scores(
     query_yx: torch.Tensor,
     points3d: torch.Tensor,
@@ -1454,6 +1518,27 @@ def select_pnp_match_indices(
     if mode == "calibrated_coverage":
         return _coverage_aware_topk(
             score,
+            query,
+            xyz,
+            keep,
+            valid,
+            image_grid_size=image_grid_size,
+            xyz_grid_size=xyz_grid_size,
+            max_per_image_cell=max_per_image_cell,
+            max_per_xyz_cell=max_per_xyz_cell,
+            min_matches=min_matches,
+        )
+    if mode == "patch_consensus_coverage":
+        consensus = patch_consensus_scores(
+            query,
+            xyz,
+            scores=score,
+            image_grid_size=image_grid_size,
+            min_patch_matches=max(3, int(min_matches)),
+        )
+        combined = score + consensus
+        return _coverage_aware_topk(
+            combined,
             query,
             xyz,
             keep,
@@ -1762,6 +1847,32 @@ def _stage_match_filter_max_matches(args: argparse.Namespace, stage: str, fallba
     return _match_filter_max_matches(args, fallback)
 
 
+def build_match_filter_stats(
+    *,
+    before_count: int,
+    after_count: int,
+    mode: str,
+    max_matches: int,
+) -> dict[str, float | int | str | bool]:
+    """Compact audit record for whether a PnP match filter actually changed input."""
+
+    before = max(0, int(before_count))
+    after = max(0, min(int(after_count), before))
+    removed = before - after
+    kept_fraction = 1.0 if before == 0 else float(after) / float(before)
+    mode_str = str(mode or "none")
+    max_m = int(max_matches)
+    return {
+        "mode": mode_str,
+        "max_matches": max_m,
+        "before_count": before,
+        "after_count": after,
+        "removed": removed,
+        "kept_fraction": kept_fraction,
+        "active": bool(removed > 0 and mode_str not in {"", "none"} and max_m > 0),
+    }
+
+
 def _match_filter_image_grid_size(args: argparse.Namespace) -> int:
     return int(getattr(args, "match_filter_image_grid_size", getattr(args, "pnp_prefilter_image_grid_size", 8)))
 
@@ -1967,6 +2078,31 @@ def _mean_metric_dict(rows: list[dict[str, float]]) -> dict[str, float]:
     return out
 
 
+def select_stdloc_candidate_ids_without_weights(
+    *,
+    ids_all: torch.Tensor,
+    sampled_ids: torch.Tensor,
+    detector_prior_all: torch.Tensor,
+    candidate_source: str,
+    keep: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select STDLoc landmark ids for the no-rescoring path.
+
+    `candidate_source=all_gaussians` must expose the full Gaussian id domain.
+    Falling back to sampled_ids here silently disables availability audits.
+    """
+
+    keep_count = max(0, min(int(keep), int(ids_all.numel())))
+    if str(candidate_source) == "all_gaussians":
+        ids = ids_all[:keep_count]
+        prior = detector_prior_all[:keep_count].float()
+    else:
+        sampled_keep = max(0, min(int(keep), int(sampled_ids.numel())))
+        ids = sampled_ids[:sampled_keep]
+        prior = detector_prior_all[:sampled_keep].float()
+    return ids, prior
+
+
 @torch.no_grad()
 def build_stdloc_detector_landmark_bank(
     model: HybridFeatureGaussian,
@@ -2164,12 +2300,13 @@ def build_stdloc_detector_landmark_bank(
         stats["candidate_source_all_gaussians"] = float(candidate_source == "all_gaussians")
         prior = prior_all[order].float()
     else:
-        if candidate_source == "all_gaussians":
-            ids = sampled_ids[:keep]
-            prior = detector_prior_all[ids].float()
-        else:
-            ids = ids_all[:keep]
-            prior = detector_prior_all[:keep].float()
+        ids, prior = select_stdloc_candidate_ids_without_weights(
+            ids_all=ids_all,
+            sampled_ids=sampled_ids,
+            detector_prior_all=detector_prior_all,
+            candidate_source=candidate_source,
+            keep=keep,
+        )
 
     calib_weight = min(max(float(calibrated_matchability_weight), 0.0), 1.0)
     selected_calibrated_prior = None
@@ -2870,12 +3007,19 @@ def localize_one(
             sparse_query_scores = sparse_query_scores.reshape(-1)
             sparse_query_scores = sparse_query_scores - sparse_query_scores.mean()
             sparse_filter_scores = sparse_filter_scores + query_score_weight * sparse_query_scores
+    sparse_filter_before_count = int(q_ids.numel())
+    sparse_filter_mode = _stage_match_filter_mode(args, "sparse")
+    sparse_filter_max_matches = _stage_match_filter_max_matches(
+        args,
+        "sparse",
+        getattr(args, "sparse_pnp_max_matches", 0),
+    )
     sparse_keep = select_pnp_match_indices(
         keypoints[q_ids] + sparse_query_offset,
         landmark_xyz[lm_ids],
         scores=sparse_filter_scores,
-        max_matches=_stage_match_filter_max_matches(args, "sparse", getattr(args, "sparse_pnp_max_matches", 0)),
-        mode=_stage_match_filter_mode(args, "sparse"),
+        max_matches=sparse_filter_max_matches,
+        mode=sparse_filter_mode,
         image_grid_size=_match_filter_image_grid_size(args),
         xyz_grid_size=_match_filter_xyz_grid_size(args),
         max_per_image_cell=getattr(args, "match_filter_max_per_image_cell", 8),
@@ -3469,6 +3613,12 @@ def localize_one(
         "dense_inliers": dense_inliers,
         "dense_rejections": dense_rejections,
         "dense_rejection_stats": dense_rejection_stats,
+        "sparse_filter_stats": build_match_filter_stats(
+            before_count=sparse_filter_before_count,
+            after_count=int(q_ids.numel()),
+            mode=sparse_filter_mode,
+            max_matches=sparse_filter_max_matches,
+        ),
     }
     if oracle_match_stats is not None:
         out["oracle_match_stats"] = oracle_match_stats
@@ -3650,7 +3800,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dense_pnp_min_iterations", type=int, default=None)
     parser.add_argument(
         "--pnp_prefilter",
-        choices=["none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry"],
+        choices=["none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "patch_consensus_coverage"],
         default="none",
     )
     parser.add_argument("--sparse_pnp_max_matches", type=int, default=0)
@@ -3659,7 +3809,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--pnp_prefilter_xyz_grid_size", type=int, default=4)
     parser.add_argument(
         "--match_filter_mode",
-        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage"],
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage", "patch_consensus_coverage"],
         default="",
     )
     parser.add_argument("--match_filter_calibrated_score_weight", type=float, default=0.0)
@@ -3670,12 +3820,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--match_filter_xyz_grid_size", type=int, default=8)
     parser.add_argument(
         "--sparse_match_filter_mode",
-        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage"],
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage", "patch_consensus_coverage"],
         default="",
     )
     parser.add_argument(
         "--dense_match_filter_mode",
-        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage"],
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage", "patch_consensus_coverage"],
         default="",
     )
     parser.add_argument("--sparse_match_filter_top_m", type=int, default=0)
@@ -3705,6 +3855,25 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def _summary(errors_te: list[float], errors_ae: list[float], inliers: list[int]) -> dict[str, float]:
     return pose_error_summary(errors_te, errors_ae, inliers)
+
+
+def _command() -> str:
+    return " ".join(shlex.quote(part) for part in sys.argv)
+
+
+def build_eval_split_audit(eval_split: str) -> dict[str, object]:
+    split = str(eval_split)
+    if split == "test":
+        return {
+            "audit_status": "unknown",
+            "split_name": split,
+            "reason": "Evaluation uses the test split; paper-facing use still requires upstream train/test disjoint audit.",
+        }
+    return {
+        "audit_status": "passed",
+        "split_name": split,
+        "reason": "This evaluation run does not mine feedback or tune from official test queries.",
+    }
 
 
 def main(args: Optional[argparse.Namespace] = None) -> None:
@@ -4043,6 +4212,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     dense_inliers: list[int] = []
     matchability_rows: list[dict[str, float]] = []
     oracle_match_rows: list[dict[str, float]] = []
+    sparse_filter_rows: list[dict[str, float]] = []
     details = []
 
     for item in tqdm(dataset, desc="Evaluating Cambridge hybrid", dynamic_ncols=True):
@@ -4081,6 +4251,15 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         matchability_i = None
         sparse_diag = result.pop("sparse_match_diagnostics", None)
         oracle_match_i = result.pop("oracle_match_stats", None)
+        sparse_filter_i = result.get("sparse_filter_stats", {})
+        if sparse_filter_i:
+            sparse_filter_rows.append(
+                {
+                    key: float(value)
+                    for key, value in sparse_filter_i.items()
+                    if isinstance(value, (int, float, bool)) and np.isfinite(float(value))
+                }
+            )
         if oracle_match_i is not None:
             oracle_match_rows.append(oracle_match_i)
         if sparse_diag is not None:
@@ -4123,6 +4302,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "dense_inliers": int(result["dense_inliers"]),
                 "dense_rejections": int(result.get("dense_rejections", 0)),
                 "dense_rejection_stats": result.get("dense_rejection_stats", {}),
+                "sparse_filter_stats": sparse_filter_i,
                 "localized": result["pose_w2c"] is not None,
                 "matchability": matchability_i,
                 "oracle_match": oracle_match_i,
@@ -4182,11 +4362,27 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         "dense": _summary(dense_te, dense_ae, dense_inliers),
         "matchability": _mean_metric_dict(matchability_rows),
         "oracle_match": _mean_metric_dict(oracle_match_rows),
+        "sparse_filter": _mean_metric_dict(sparse_filter_rows),
         "localized": len(dense_te),
         "queries": len(dataset),
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (output_dir / "results.json").write_text(json.dumps(details, indent=2), encoding="utf-8")
+    write_artifact_audit_bundle(
+        output_dir,
+        manifest={
+            "method": "eval_cambridge_hybrid",
+            "scene": scene,
+            "split_name": eval_split,
+            "checkpoint": str(args.checkpoint),
+            "output_dir": str(output_dir),
+            "data_root": str(args.data_root),
+            "hyperparameters": eval_config,
+        },
+        command=_command(),
+        metrics_summary=summary,
+        split_audit=build_eval_split_audit(eval_split),
+    )
     print(json.dumps(summary, indent=2))
 
 

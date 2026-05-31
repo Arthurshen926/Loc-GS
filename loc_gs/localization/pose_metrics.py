@@ -43,6 +43,13 @@ def pose_error_summary(
     out = {
         "median_te": float(np.median(te)) if valid else float("inf"),
         "median_ae": float(np.median(ae)) if valid else float("inf"),
+        "p90_te_cm": float(np.percentile(te, 90)) if valid else float("inf"),
+        "p95_te_cm": float(np.percentile(te, 95)) if valid else float("inf"),
+        "cvar10_te_cm": float(np.mean(np.sort(te)[-max(1, int(np.ceil(0.10 * len(te)))):]))
+        if valid
+        else float("inf"),
+        "severe_rate_1m": float((te > 100.0).mean()) if valid else 0.0,
+        "catastrophic_rate_5m": float((te > 500.0).mean()) if valid else 0.0,
     }
     out.update(pose_recall_metrics(te_values if valid else [], ae_values if valid else []))
     out["avg_inliers"] = float(inl.mean()) if len(inl) else 0.0

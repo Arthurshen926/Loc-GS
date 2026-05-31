@@ -320,6 +320,7 @@ def filter_matches_by_reference_reprojection(
     for key, value in matches.items():
         array = np.asarray(value)
         filtered[key] = array[indices] if array.shape[:1] == (n_matches,) else value
+    filtered["reference_reprojection_error_px"] = errors[indices].astype(np.float32)
     filtered["indices"] = indices
     finite_errors = errors[np.isfinite(errors)]
     diagnostics = {
@@ -333,6 +334,94 @@ def filter_matches_by_reference_reprojection(
         "p90_reprojection_error_px": float(np.percentile(finite_errors, 90.0)) if finite_errors.size else None,
     }
     return filtered, diagnostics
+
+
+def _subset_match_mapping(matches: Mapping[str, Any], indices: np.ndarray, *, n_matches: int) -> dict[str, Any]:
+    filtered: dict[str, Any] = {}
+    for key, value in matches.items():
+        array = np.asarray(value)
+        filtered[key] = array[indices] if array.shape[:1] == (n_matches,) else value
+    filtered["indices"] = indices.astype(np.int64)
+    return filtered
+
+
+def filter_matches_by_quality(
+    matches: Mapping[str, Any],
+    *,
+    min_margin: float = 0.0,
+    best_per_landmark: bool = False,
+    max_matches: int = 0,
+    min_matches: int = 0,
+    score_key: str = "score",
+    margin_key: str = "margin",
+    landmark_key: str = "gs_ids",
+    xy_key: str = "xy",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Filter ambiguous sparse matches before patch-level PnP.
+
+    The filter is conservative by default: if the requested filters would leave
+    fewer than ``min_matches`` correspondences, it returns the original matches
+    and records a fallback diagnostic.
+    """
+
+    xy = np.asarray(matches[xy_key])
+    n_matches = int(xy.shape[0])
+    keep = np.ones((n_matches,), dtype=bool)
+    diagnostics: dict[str, Any] = {
+        "schema": "loc_gs_sparse_match_quality_filter_v1",
+        "enabled": bool(float(min_margin) > 0.0 or best_per_landmark or int(max_matches) > 0),
+        "decision": "not_filtered",
+        "input_count": n_matches,
+        "min_margin": float(min_margin),
+        "best_per_landmark": bool(best_per_landmark),
+        "max_matches": int(max_matches),
+        "min_matches": int(min_matches),
+        "margin_available": bool(margin_key in matches),
+        "margin_kept_count": n_matches,
+        "unique_landmark_kept_count": n_matches,
+        "top_score_kept_count": n_matches,
+    }
+    if n_matches == 0 or not diagnostics["enabled"]:
+        return _subset_match_mapping(matches, np.arange(n_matches, dtype=np.int64), n_matches=n_matches), diagnostics
+
+    if float(min_margin) > 0.0 and margin_key in matches:
+        margin = np.asarray(matches[margin_key], dtype=np.float64).reshape(-1)
+        if margin.shape[0] == n_matches:
+            keep &= np.isfinite(margin) & (margin >= float(min_margin))
+            diagnostics["margin_kept_count"] = int(np.count_nonzero(keep))
+
+    if bool(best_per_landmark) and landmark_key in matches:
+        ids = np.asarray(matches[landmark_key]).reshape(-1)
+        scores = np.asarray(matches.get(score_key, np.ones((n_matches,), dtype=np.float32)), dtype=np.float64).reshape(-1)
+        if ids.shape[0] == n_matches and scores.shape[0] == n_matches:
+            selected = np.zeros((n_matches,), dtype=bool)
+            for landmark_id in np.unique(ids[keep]):
+                candidates = np.flatnonzero(keep & (ids == landmark_id))
+                if candidates.size == 0:
+                    continue
+                best = candidates[np.lexsort((candidates, -scores[candidates]))[0]]
+                selected[best] = True
+            keep &= selected
+            diagnostics["unique_landmark_kept_count"] = int(np.count_nonzero(keep))
+
+    indices = np.flatnonzero(keep).astype(np.int64)
+    if int(max_matches) > 0 and indices.shape[0] > int(max_matches):
+        scores = np.asarray(matches.get(score_key, np.ones((n_matches,), dtype=np.float32)), dtype=np.float64).reshape(-1)
+        if scores.shape[0] == n_matches:
+            order = np.lexsort((indices, -scores[indices]))
+            indices = indices[order[: int(max_matches)]]
+            indices = np.sort(indices).astype(np.int64)
+            diagnostics["top_score_kept_count"] = int(indices.shape[0])
+
+    if int(min_matches) > 0 and indices.shape[0] < int(min_matches):
+        diagnostics["decision"] = "fallback_original_too_few_matches"
+        diagnostics["output_count"] = n_matches
+        original = np.arange(n_matches, dtype=np.int64)
+        return _subset_match_mapping(matches, original, n_matches=n_matches), diagnostics
+
+    diagnostics["decision"] = "filtered" if indices.shape[0] != n_matches else "not_filtered"
+    diagnostics["output_count"] = int(indices.shape[0])
+    return _subset_match_mapping(matches, indices, n_matches=n_matches), diagnostics
 
 
 def _pose_reprojection_errors(
@@ -522,6 +611,7 @@ def score_patch_hypothesis(
     match_indices: Any | None = None,
     detector_scores: Any | None = None,
     detector_score_weight: float = 0.0,
+    score_profile: str = "balanced",
 ) -> PatchHypothesis:
     """Score a sparse pose hypothesis for one patch without GT or external solvers."""
 
@@ -568,16 +658,31 @@ def score_patch_hypothesis(
         if active_detector.size:
             detector_support = float(np.clip(np.median(active_detector), 0.0, 1.0))
     ambiguity_risk = float(np.clip(1.0 - 0.45 * spatial_extent - 0.35 * depth_spread - 0.20 * logdet, 0.0, 1.0))
-    score = (
-        0.25 * inlier_ratio
-        + 0.20 * inlier_count_score
-        + 0.15 * logdet
-        + 0.15 * reproj_score
-        + 0.15 * spatial_extent
-        + 0.15 * depth_spread
-        + float(detector_score_weight) * (detector_support - 0.5)
-        - 0.20 * ambiguity_risk
-    )
+    profile = str(score_profile or "balanced")
+    if profile == "precision":
+        score = (
+            0.45 * inlier_ratio
+            + 0.05 * inlier_count_score
+            + 0.15 * logdet
+            + 0.25 * reproj_score
+            + 0.05 * spatial_extent
+            + 0.10 * depth_spread
+            + float(detector_score_weight) * (detector_support - 0.5)
+            - 0.10 * ambiguity_risk
+        )
+    elif profile == "balanced":
+        score = (
+            0.25 * inlier_ratio
+            + 0.20 * inlier_count_score
+            + 0.15 * logdet
+            + 0.15 * reproj_score
+            + 0.15 * spatial_extent
+            + 0.15 * depth_spread
+            + float(detector_score_weight) * (detector_support - 0.5)
+            - 0.20 * ambiguity_risk
+        )
+    else:
+        raise ValueError("score_profile must be 'balanced' or 'precision'")
     components = {
         "inlier_ratio": inlier_ratio,
         "inlier_count": float(inlier_count),
@@ -602,11 +707,22 @@ def score_patch_hypothesis(
     )
 
 
+def _rank_hypothesis_indices(indices: Sequence[int], hypotheses: Sequence[PatchHypothesis], *, rank_by: str) -> list[int]:
+    rank = str(rank_by or "inlier_count")
+    if rank == "inlier_count":
+        return sorted(indices, key=lambda idx: (-hypotheses[idx].inlier_count, -hypotheses[idx].score, hypotheses[idx].patch_id))
+    if rank == "score":
+        return sorted(indices, key=lambda idx: (-hypotheses[idx].score, -hypotheses[idx].inlier_count, hypotheses[idx].patch_id))
+    raise ValueError("rank_by must be 'inlier_count' or 'score'")
+
+
 def cluster_patch_hypotheses(
     hypotheses: Sequence[PatchHypothesis],
     *,
     center_thresh: float,
     rotation_thresh_deg: float,
+    rank_by: str = "inlier_count",
+    max_patch_count: int = 0,
 ) -> list[PoseCluster]:
     """Cluster patch hypotheses by camera-center distance and rotation delta."""
 
@@ -624,8 +740,20 @@ def cluster_patch_hypotheses(
                 break
         if not placed:
             clusters.append([hyp_idx])
-    pose_clusters = [_build_pose_cluster(cluster, hypotheses) for cluster in clusters]
-    pose_clusters.sort(key=lambda item: (-item.inlier_count, -item.score, item.patch_ids))
+    capped_clusters: list[list[int]] = []
+    for cluster in clusters:
+        ranked = _rank_hypothesis_indices(cluster, hypotheses, rank_by=rank_by)
+        if int(max_patch_count) > 0:
+            ranked = ranked[: int(max_patch_count)]
+        capped_clusters.append(ranked)
+    pose_clusters = [_build_pose_cluster(cluster, hypotheses) for cluster in capped_clusters]
+    rank = str(rank_by or "inlier_count")
+    if rank == "inlier_count":
+        pose_clusters.sort(key=lambda item: (-item.inlier_count, -item.score, item.patch_ids))
+    elif rank == "score":
+        pose_clusters.sort(key=lambda item: (-item.score, -item.inlier_count, item.patch_ids))
+    else:
+        raise ValueError("rank_by must be 'inlier_count' or 'score'")
     return pose_clusters
 
 
@@ -653,11 +781,15 @@ def select_pose_consistent_patch_group(
     center_thresh: float,
     rotation_thresh_deg: float,
     min_patch_count: int = 1,
+    rank_by: str = "inlier_count",
+    max_patch_count: int = 0,
 ) -> PoseCluster:
     clusters = cluster_patch_hypotheses(
         hypotheses,
         center_thresh=center_thresh,
         rotation_thresh_deg=rotation_thresh_deg,
+        rank_by=rank_by,
+        max_patch_count=int(max_patch_count),
     )
     min_count = max(1, int(min_patch_count))
     clusters = [cluster for cluster in clusters if len(cluster.patch_ids) >= min_count]

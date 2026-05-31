@@ -2,6 +2,7 @@ import numpy as np
 
 from loc_gs.dense_support.apd_dense import (
     APDDensePolicy,
+    apply_sparse_anchor_monotonic_update,
     refine_pose_with_sparse_anchors_and_dense_candidates,
     run_anchor_patch_dense_refinement,
     score_dense_candidates,
@@ -173,6 +174,47 @@ def test_anchor_verified_refinement_can_use_dense_reference_pose_instead_of_spar
     assert sparse_ref_diag["reference_pose_source"] == "sparse_pose"
     assert dense_ref_diag["reference_pose_source"] == "dense_reference_pose"
     assert np.linalg.norm(dense_refined[:3, 3] - pose[:3, 3]) < np.linalg.norm(sparse_refined[:3, 3] - pose[:3, 3])
+
+
+def test_sparse_anchor_monotonic_update_shrinks_candidate_that_worsens_anchors():
+    pose, intrinsic, image_size = _camera()
+    anchors = _anchors(pose, intrinsic, image_size)
+    candidate = pose.copy()
+    candidate[0, 3] = 0.50
+
+    selected, diag = apply_sparse_anchor_monotonic_update(
+        sparse_pose=pose,
+        candidate_pose=candidate,
+        sparse_anchors=anchors,
+        intrinsic=intrinsic,
+        image_size=image_size,
+        policy=APDDensePolicy(anchor_monotonic_epsilon_px=0.1),
+    )
+
+    assert diag["schema"] == "loc_gs_apd_anchor_monotonic_v1"
+    assert diag["uses_gt"] is False
+    assert diag["selected_alpha"] < 1.0
+    assert diag["selected_anchor_median_px"] <= diag["sparse_anchor_median_px"] + 0.1
+    assert np.linalg.norm(selected[:3, 3] - pose[:3, 3]) < np.linalg.norm(candidate[:3, 3] - pose[:3, 3])
+
+
+def test_sparse_anchor_monotonic_update_accepts_candidate_that_preserves_anchors():
+    pose, intrinsic, image_size = _camera()
+    anchors = _anchors(pose, intrinsic, image_size)
+    candidate = pose.copy()
+    candidate[0, 3] = 0.001
+
+    selected, diag = apply_sparse_anchor_monotonic_update(
+        sparse_pose=pose,
+        candidate_pose=candidate,
+        sparse_anchors=anchors,
+        intrinsic=intrinsic,
+        image_size=image_size,
+        policy=APDDensePolicy(anchor_monotonic_epsilon_px=1.0),
+    )
+
+    assert diag["selected_alpha"] == 1.0
+    assert np.allclose(selected, candidate)
 
 
 def test_run_anchor_patch_dense_refinement_combines_global_clean_and_patch_sources():

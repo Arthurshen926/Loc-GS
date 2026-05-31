@@ -10,12 +10,16 @@ from loc_gs.localization.stdloc_parity import DenseMatchResult
 from loc_gs.scripts import eval_cambridge_hybrid
 from loc_gs.scripts.eval_cambridge_hybrid import (
     build_argparser,
+    build_eval_split_audit,
+    build_match_filter_stats,
+    select_stdloc_candidate_ids_without_weights,
     effective_eval_config,
     fuse_projected_teacher_descriptors,
     gated_residual_descriptor_blend,
     generate_pnp_hypotheses,
     local_geometric_consistency_scores,
     local_image_pair_geometry_scores,
+    patch_consensus_scores,
     prepare_query_teacher_maps,
     select_pnp_match_indices,
     select_view_landmark_indices,
@@ -850,6 +854,45 @@ def test_select_pnp_match_indices_can_keep_spatially_diverse_high_scores():
     assert balanced.tolist() == [0, 2]
 
 
+def test_build_match_filter_stats_reports_noop_and_active_filtering():
+    noop = build_match_filter_stats(before_count=512, after_count=512, mode="patch_consensus_coverage", max_matches=512)
+    active = build_match_filter_stats(before_count=512, after_count=128, mode="patch_consensus_coverage", max_matches=128)
+
+    assert noop["active"] is False
+    assert noop["removed"] == 0
+    assert noop["kept_fraction"] == 1.0
+    assert active["active"] is True
+    assert active["removed"] == 384
+    assert active["kept_fraction"] == 0.25
+
+
+def test_build_eval_split_audit_marks_test_as_unknown():
+    train = build_eval_split_audit("train")
+    test = build_eval_split_audit("test")
+
+    assert train["audit_status"] == "passed"
+    assert train["split_name"] == "train"
+    assert test["audit_status"] == "unknown"
+    assert test["split_name"] == "test"
+
+
+def test_all_gaussians_candidate_source_does_not_fall_back_to_sampled_without_weights():
+    ids_all = torch.arange(10, dtype=torch.long)
+    sampled_ids = torch.tensor([7, 3, 1], dtype=torch.long)
+    detector_prior_all = torch.linspace(0.0, 1.0, steps=10)
+
+    ids, prior = select_stdloc_candidate_ids_without_weights(
+        ids_all=ids_all,
+        sampled_ids=sampled_ids,
+        detector_prior_all=detector_prior_all,
+        candidate_source="all_gaussians",
+        keep=5,
+    )
+
+    assert ids.tolist() == [0, 1, 2, 3, 4]
+    assert torch.equal(prior, detector_prior_all[:5])
+
+
 def test_local_geometric_consistency_prefers_neighborhood_preserving_matches():
     query_yx = torch.tensor(
         [
@@ -1075,6 +1118,77 @@ def test_calibrated_coverage_filter_preserves_image_and_xyz_spread():
     assert keep.numel() == 4
     assert 0 in keep.tolist()
     assert any(idx in keep.tolist() for idx in (3, 4, 5))
+
+
+def test_patch_consensus_scores_prefer_locally_supported_patches():
+    query_yx = torch.tensor(
+        [
+            [0.1, 0.1],
+            [0.2, 0.2],
+            [0.3, 0.3],
+            [9.1, 9.1],
+            [9.2, 9.2],
+        ],
+        dtype=torch.float32,
+    )
+    points3d = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.2, 0.1, 2.0],
+            [0.4, 0.3, 4.0],
+            [5.0, 5.0, 1.0],
+            [5.1, 5.0, 1.1],
+        ],
+        dtype=torch.float32,
+    )
+    scores = torch.tensor([0.8, 0.7, 0.6, 0.95, 0.94], dtype=torch.float32)
+
+    consensus = patch_consensus_scores(
+        query_yx,
+        points3d,
+        scores=scores,
+        image_grid_size=2,
+        min_patch_matches=3,
+    )
+
+    assert consensus[:3].min() > consensus[3:].max()
+    assert torch.all((consensus >= 0.0) & (consensus <= 1.0))
+
+
+def test_select_pnp_match_indices_can_use_patch_consensus_coverage():
+    query_yx = torch.tensor(
+        [
+            [0.1, 0.1],
+            [0.2, 0.2],
+            [0.3, 0.3],
+            [9.1, 9.1],
+            [9.2, 9.2],
+        ],
+        dtype=torch.float32,
+    )
+    points3d = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.2, 0.1, 2.0],
+            [0.4, 0.3, 4.0],
+            [5.0, 5.0, 1.0],
+            [5.1, 5.0, 1.1],
+        ],
+        dtype=torch.float32,
+    )
+    scores = torch.tensor([0.8, 0.7, 0.6, 0.99, 0.98], dtype=torch.float32)
+
+    keep = select_pnp_match_indices(
+        query_yx,
+        points3d,
+        scores=scores,
+        max_matches=3,
+        mode="patch_consensus_coverage",
+        image_grid_size=2,
+        min_matches=3,
+    )
+
+    assert keep.tolist() == [0, 1, 2]
 
 
 def test_gated_residual_descriptor_blend_preserves_ply_at_zero_alpha():

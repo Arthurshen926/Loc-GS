@@ -4,6 +4,7 @@ import pytest
 
 from loc_gs.scripts.eval_sparse_conditioned_dense_control import (
     _fixed_options,
+    _read_case_rows,
     _resume_rows,
     _resume_partial_rows,
     _selected_camera_count,
@@ -77,14 +78,51 @@ def test_fixed_options_can_enable_apd_dense_without_legacy_transition():
         apd_include_patch_candidates=True,
         apd_dense_group_weight=0.75,
         apd_anchor_group_weight=1.25,
+        apd_anchor_monotonic=True,
+        apd_anchor_monotonic_epsilon_px=0.5,
+        apd_risk_weighted=True,
+        apd_risk_max_beta=0.8,
     )
 
     assert options["apd_dense"] is True
     assert options["apd_include_patch_candidates"] is True
     assert options["apd_dense_group_weight"] == 0.75
     assert options["apd_anchor_group_weight"] == 1.25
+    assert options["apd_anchor_monotonic"] is True
+    assert options["apd_anchor_monotonic_epsilon_px"] == 0.5
+    assert options["apd_risk_weighted"] is True
+    assert options["apd_risk_max_beta"] == 0.8
     assert options["slcdp_transition_control"] is False
     assert options["slcdp_soft_transition_control"] is False
+
+
+def test_read_case_rows_filters_phase0_hard_cases_and_rejects_test(tmp_path):
+    case_csv = tmp_path / "cases.csv"
+    case_csv.write_text(
+        "scene,image_name,case_type,phase0_split,source_split\n"
+        "GreatCourt,a.png,A_sparse_good_dense_bad,train,train\n"
+        "GreatCourt,b.png,D_normal_dense_good,train,train\n"
+        "ShopFacade,c.png,A_sparse_good_dense_bad,val,train\n",
+        encoding="utf-8",
+    )
+
+    rows = _read_case_rows(
+        [str(case_csv)],
+        case_types=["A_sparse_good_dense_bad"],
+        phase0_split="train",
+    )
+
+    assert sorted(rows) == ["GreatCourt"]
+    assert sorted(rows["GreatCourt"]) == ["a.png"]
+
+    test_csv = tmp_path / "test_cases.csv"
+    test_csv.write_text(
+        "scene,image_name,case_type,phase0_split,source_split\n"
+        "GreatCourt,a.png,A_sparse_good_dense_bad,train,test\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="official test"):
+        _read_case_rows([str(test_csv)], case_types=["A_sparse_good_dense_bad"], phase0_split="train")
 
 
 def test_resume_rows_accepts_matching_partial_prefix(tmp_path):

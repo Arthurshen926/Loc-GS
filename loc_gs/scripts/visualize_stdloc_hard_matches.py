@@ -27,6 +27,8 @@ from loc_gs.dense_support.sparse_conditioned_dense_preflight import (
     DenseTransitionPolicy,
     SLCDPRepairSearchConfig,
     SLCDPThresholds,
+    _camera_center as _slcdp_camera_center,
+    _rotation_delta_deg as _slcdp_rotation_delta_deg,
     compute_sparse_ray_gaussian_gating_mask,
     compute_sparse_ray_depth_diagnostics,
     evaluate_dense_step_acceptance,
@@ -37,10 +39,13 @@ from loc_gs.dense_support.sparse_conditioned_dense_preflight import (
     select_soft_sparse_conditioned_dense_transition,
     select_repaired_pose_candidate,
     sparse_landmark_conditioned_preflight,
+    interpolate_w2c_poses,
 )
 from loc_gs.dense_support.clean_render_generator import select_clean_render_candidate
 from loc_gs.dense_support.apd_dense import APDDensePolicy, run_anchor_patch_dense_refinement
 from loc_gs.dense_support.patch_dense_candidates import PatchDenseCandidatePolicy, generate_patch_dense_candidates
+from loc_gs.dense_support.sparse_anchor_residual import SparseAnchorResidualPolicy, compute_sparse_anchor_residual_group
+from loc_gs.diagnostics.apd_dense_damage_risk import compute_dense_damage_risk
 from loc_gs.reporting.artifact_audit import write_artifact_audit_bundle
 
 
@@ -57,6 +62,27 @@ def _command() -> str:
 def _repo_path(path: str | Path) -> Path:
     raw = Path(path).expanduser()
     return raw if raw.is_absolute() else REPO_ROOT / raw
+
+
+def _camera_collection_get(cameras: Any, index: int) -> Any:
+    if hasattr(cameras, "dataset"):
+        return cameras.dataset[int(index)]
+    return cameras[int(index)]
+
+
+class _LazyCameraByName:
+    def __init__(self, cameras: Any, camera_infos: Sequence[Any]):
+        self._cameras = cameras
+        self._name_to_index = {str(info.image_name): int(index) for index, info in enumerate(camera_infos)}
+        self._cache: dict[int, Any] = {}
+
+    def get(self, image_name: str, default: Any = None) -> Any:
+        index = self._name_to_index.get(str(image_name))
+        if index is None:
+            return default
+        if index not in self._cache:
+            self._cache[index] = _camera_collection_get(self._cameras, index)
+        return self._cache[index]
 
 
 def _parse_float_steps(value: str, *, default: tuple[float, ...]) -> tuple[float, ...]:
@@ -169,6 +195,146 @@ def _quality_float(quality: Mapping[str, Any], key: str, default: float) -> floa
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _anchor_residual_for_pose(
+    *,
+    sparse_capture: Mapping[str, Any],
+    pose_w2c: np.ndarray,
+    intrinsic: np.ndarray,
+    image_size: tuple[int, int],
+) -> dict[str, Any]:
+    try:
+        return compute_sparse_anchor_residual_group(
+            sparse_query_xy=sparse_capture["query_xy"],
+            sparse_points_world=sparse_capture["p3d"],
+            pose_w2c=np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4),
+            intrinsic=np.asarray(intrinsic, dtype=np.float64).reshape(3, 3),
+            sparse_inlier_indices=sparse_capture["inliers"],
+            image_size=image_size,
+            policy=SparseAnchorResidualPolicy(max_anchor_count=256),
+        )
+    except (KeyError, TypeError, ValueError):
+        return {
+            "valid_anchor_count": 0,
+            "median_error_px": None,
+            "p90_error_px": None,
+            "group_loss": None,
+        }
+
+
+def _dense_damage_risk_observation(
+    *,
+    sparse_capture: Mapping[str, Any],
+    dense_capture: Mapping[str, Any],
+    intrinsic: np.ndarray,
+    image_size: tuple[int, int],
+) -> dict[str, Any]:
+    sparse_pose = np.asarray(sparse_capture["pose_w2c"], dtype=np.float64).reshape(4, 4)
+    dense_pose = np.asarray(dense_capture["pose_w2c"], dtype=np.float64).reshape(4, 4)
+    dense_quality = dense_capture.get("dense_pose_quality")
+    if not isinstance(dense_quality, Mapping):
+        dense_quality = _dense_pose_quality(dense_capture)
+    sparse_anchor = _anchor_residual_for_pose(
+        sparse_capture=sparse_capture,
+        pose_w2c=sparse_pose,
+        intrinsic=intrinsic,
+        image_size=image_size,
+    )
+    dense_anchor = _anchor_residual_for_pose(
+        sparse_capture=sparse_capture,
+        pose_w2c=dense_pose,
+        intrinsic=intrinsic,
+        image_size=image_size,
+    )
+    translation_delta = float(np.linalg.norm(_slcdp_camera_center(dense_pose) - _slcdp_camera_center(sparse_pose)))
+    rotation_delta = float(_slcdp_rotation_delta_deg(sparse_pose, dense_pose))
+    return {
+        "sparse_inlier_count": int(np.asarray(sparse_capture.get("inliers", [])).reshape(-1).shape[0]),
+        "sparse_pose_anchor_median_px": sparse_anchor.get("median_error_px"),
+        "sparse_pose_anchor_p90_px": sparse_anchor.get("p90_error_px"),
+        "sparse_pose_anchor_valid_count": sparse_anchor.get("valid_anchor_count"),
+        "base_dense_pose_anchor_median_px": dense_anchor.get("median_error_px"),
+        "base_dense_pose_anchor_p90_px": dense_anchor.get("p90_error_px"),
+        "base_dense_pose_anchor_valid_count": dense_anchor.get("valid_anchor_count"),
+        "base_dense_vs_sparse_translation_delta_m": translation_delta,
+        "base_dense_vs_sparse_rotation_delta_deg": rotation_delta,
+        "base_dense_pose_p90_reprojection_error_px": dense_quality.get("p90_reprojection_error_px"),
+        "base_dense_pose_median_reprojection_error_px": dense_quality.get("median_reprojection_error_px"),
+        "base_dense_pose_solver_inlier_ratio": dense_quality.get("solver_inlier_ratio"),
+        "base_dense_pose_solver_inlier_count": dense_quality.get("solver_inlier_count"),
+    }
+
+
+def _evaluate_apd_no_regression_switch(
+    *,
+    native_capture: Mapping[str, Any],
+    apd_pose_w2c: np.ndarray,
+    apd_refine_success: bool,
+    min_inlier_ratio_delta: float,
+    max_median_reproj_increase_px: float,
+    max_p90_reproj_increase_px: float,
+    min_inlier_count_ratio: float,
+) -> dict[str, Any]:
+    """Decide whether APD refined pose can replace native dense pose.
+
+    This gate is no-GT and protects normal cases by requiring APD pose quality
+    to stay close to native dense quality on the same correspondence set.
+    """
+
+    native_quality = dict(
+        native_capture.get("dense_pose_quality") or _dense_pose_quality(native_capture)
+    )
+    apd_capture = dict(native_capture)
+    apd_capture["pose_w2c"] = np.asarray(apd_pose_w2c, dtype=np.float32).reshape(4, 4)
+    apd_quality = _dense_pose_quality(apd_capture)
+
+    native_inlier_ratio = _quality_float(native_quality, "solver_inlier_ratio", 0.0)
+    apd_inlier_ratio = _quality_float(apd_quality, "solver_inlier_ratio", 0.0)
+    native_inlier_count = int(_quality_float(native_quality, "solver_inlier_count", 0.0))
+    apd_inlier_count = int(_quality_float(apd_quality, "solver_inlier_count", 0.0))
+    native_median = _quality_float(native_quality, "median_reprojection_error_px", float("inf"))
+    apd_median = _quality_float(apd_quality, "median_reprojection_error_px", float("inf"))
+    native_p90 = _quality_float(native_quality, "p90_reprojection_error_px", float("inf"))
+    apd_p90 = _quality_float(apd_quality, "p90_reprojection_error_px", float("inf"))
+    native_high_confidence = _is_high_confidence_dense_quality(native_quality)
+
+    checks = {
+        "refinement_success": bool(apd_refine_success),
+        "inlier_ratio_not_worse": bool(apd_inlier_ratio >= native_inlier_ratio - float(min_inlier_ratio_delta)),
+        "inlier_count_not_worse": bool(apd_inlier_count >= int(np.floor(native_inlier_count * float(min_inlier_count_ratio)))),
+        "median_reprojection_not_worse": bool(apd_median <= native_median + float(max_median_reproj_increase_px)),
+        "p90_reprojection_not_worse": bool(apd_p90 <= native_p90 + float(max_p90_reproj_increase_px)),
+    }
+    if native_high_confidence:
+        checks.update(
+            {
+                "high_confidence_native_protection": bool(
+                    apd_inlier_ratio >= native_inlier_ratio
+                    and apd_inlier_count >= native_inlier_count
+                    and apd_median <= native_median
+                    and apd_p90 <= native_p90
+                ),
+            }
+        )
+    accept = bool(all(checks.values()))
+    reason = "accept_apd_pose" if accept else "reject_apd_pose_no_regression_gate"
+    return {
+        "schema": "loc_gs_apd_no_regression_gate_v1",
+        "decision": reason,
+        "accept_apd_pose": bool(accept),
+        "checks": checks,
+        "native_dense_quality": native_quality,
+        "apd_dense_quality": apd_quality,
+        "native_high_confidence": bool(native_high_confidence),
+        "thresholds": {
+            "min_inlier_ratio_delta": float(min_inlier_ratio_delta),
+            "max_median_reproj_increase_px": float(max_median_reproj_increase_px),
+            "max_p90_reproj_increase_px": float(max_p90_reproj_increase_px),
+            "min_inlier_count_ratio": float(min_inlier_count_ratio),
+        },
+        "diagnostic_only": True,
+    }
 
 
 def _should_reject_sparse_conditioned_repair_for_dense_quality_regression(
@@ -634,6 +800,16 @@ def _resolve_slcdp_effective_options(args: argparse.Namespace) -> dict[str, Any]
         "apd_anchor_group_weight": float(getattr(args, "apd_anchor_group_weight", 1.0)),
         "apd_max_translation_delta_m": float(getattr(args, "apd_max_translation_delta_m", 0.0)),
         "apd_max_rotation_delta_deg": float(getattr(args, "apd_max_rotation_delta_deg", 0.0)),
+        "apd_anchor_monotonic": bool(getattr(args, "apd_anchor_monotonic", False)),
+        "apd_anchor_monotonic_epsilon_px": float(getattr(args, "apd_anchor_monotonic_epsilon_px", 1.0)),
+        "apd_use_refined_pose": bool(getattr(args, "apd_use_refined_pose", False)),
+        "apd_risk_weighted": bool(getattr(args, "apd_risk_weighted", False)),
+        "apd_risk_max_beta": float(getattr(args, "apd_risk_max_beta", 1.0)),
+        "apd_no_regression_gate": bool(getattr(args, "apd_no_regression_gate", True)),
+        "apd_gate_min_inlier_ratio_delta": float(getattr(args, "apd_gate_min_inlier_ratio_delta", 0.02)),
+        "apd_gate_max_median_reproj_increase_px": float(getattr(args, "apd_gate_max_median_reproj_increase_px", 1.0)),
+        "apd_gate_max_p90_reproj_increase_px": float(getattr(args, "apd_gate_max_p90_reproj_increase_px", 3.0)),
+        "apd_gate_min_inlier_count_ratio": float(getattr(args, "apd_gate_min_inlier_count_ratio", 0.90)),
     }
     if str(args.slcdp_render_control) == SPARSE_CONDITIONED_RENDER_CONTROL:
         options.update(
@@ -757,7 +933,8 @@ def _build_context(run_dir: Path, *, split_override: str | None = None) -> dict[
     localizer = stdloc.STDLoc(gaussians, config)
     split_name = str(split_override or manifest.get("split") or "test")
     cameras = scene_obj.getTrainCameras() if split_name == "train" else scene_obj.getTestCameras()
-    camera_by_name = {str(camera.image_name): camera for camera in cameras}
+    camera_infos = scene_obj.scene_info.train_cameras if split_name == "train" else scene_obj.scene_info.test_cameras
+    camera_by_name = _LazyCameraByName(cameras, camera_infos)
     return {
         "stdloc": stdloc,
         "manifest": manifest,
@@ -861,6 +1038,7 @@ def _compact_apd_result(result: Mapping[str, Any] | None) -> dict[str, Any] | No
     diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), Mapping) else {}
     pool = diagnostics.get("candidate_pool") if isinstance(diagnostics.get("candidate_pool"), Mapping) else {}
     refine = diagnostics.get("refinement") if isinstance(diagnostics.get("refinement"), Mapping) else {}
+    anchor_monotonic = diagnostics.get("anchor_monotonic") if isinstance(diagnostics.get("anchor_monotonic"), Mapping) else {}
     score_rows = []
     for row in pool.get("score_summaries", []) or []:
         if not isinstance(row, Mapping):
@@ -910,6 +1088,17 @@ def _compact_apd_result(result: Mapping[str, Any] | None) -> dict[str, Any] | No
                 if isinstance(refine.get("refinement"), Mapping)
                 else None,
             },
+        },
+        "diagnostics": {
+            "anchor_monotonic": {
+                "enabled": anchor_monotonic.get("enabled"),
+                "success": anchor_monotonic.get("success"),
+                "reason": anchor_monotonic.get("reason"),
+                "selected_alpha": anchor_monotonic.get("selected_alpha"),
+                "sparse_anchor_median_px": anchor_monotonic.get("sparse_anchor_median_px"),
+                "selected_anchor_median_px": anchor_monotonic.get("selected_anchor_median_px"),
+                "epsilon_px": anchor_monotonic.get("epsilon_px"),
+            } if anchor_monotonic else None,
         },
     }
 
@@ -1072,6 +1261,16 @@ def _capture_dense(
     apd_anchor_group_weight: float = 1.0,
     apd_max_translation_delta_m: float = 0.0,
     apd_max_rotation_delta_deg: float = 0.0,
+    apd_anchor_monotonic: bool = False,
+    apd_anchor_monotonic_epsilon_px: float = 1.0,
+    apd_use_refined_pose: bool = False,
+    apd_risk_weighted: bool = False,
+    apd_risk_max_beta: float = 1.0,
+    apd_no_regression_gate: bool = True,
+    apd_gate_min_inlier_ratio_delta: float = 0.02,
+    apd_gate_max_median_reproj_increase_px: float = 1.0,
+    apd_gate_max_p90_reproj_increase_px: float = 3.0,
+    apd_gate_min_inlier_count_ratio: float = 0.90,
 ) -> dict[str, Any]:
     stdloc = ctx["stdloc"]
     loc = ctx["localizer"]
@@ -1549,12 +1748,15 @@ def _capture_dense(
     transition_control = None
     final_pose = pose
     apd_result = None
+    apd_switch = None
     if bool(apd_dense) and sparse_capture is not None:
         apd_policy = APDDensePolicy(
             dense_group_weight=float(apd_dense_group_weight),
             anchor_group_weight=float(apd_anchor_group_weight),
             max_translation_delta_m=None if float(apd_max_translation_delta_m) <= 0.0 else float(apd_max_translation_delta_m),
             max_rotation_delta_deg=None if float(apd_max_rotation_delta_deg) <= 0.0 else float(apd_max_rotation_delta_deg),
+            anchor_monotonic=bool(apd_anchor_monotonic),
+            anchor_monotonic_epsilon_px=float(apd_anchor_monotonic_epsilon_px),
         )
         sparse_ref_xy, _sparse_ref_valid = project_points(
             sparse_capture["p3d"],
@@ -1597,7 +1799,98 @@ def _capture_dense(
             patch_dense_candidates=patch_candidates,
             policy=apd_policy,
         )
-        final_pose = np.asarray(apd_result["final_pose"], dtype=np.float32).reshape(4, 4)
+        apd_pose = np.asarray(apd_result["final_pose"], dtype=np.float32).reshape(4, 4)
+        apd_switch = {
+            "schema": "loc_gs_apd_pose_switch_v1",
+            "mode": "apd_diagnostic_only_keep_native",
+            "accept_apd_pose": False,
+            "reason": "apd_pose_not_enabled_as_final",
+            "apd_use_refined_pose": bool(apd_use_refined_pose),
+            "apd_risk_weighted": bool(apd_risk_weighted),
+            "apd_no_regression_gate": bool(apd_no_regression_gate),
+            "diagnostic_only": True,
+        }
+        if bool(apd_use_refined_pose):
+            native_capture = {
+                "query_xy": p2d_np + 0.5,
+                "p3d": p3d_np,
+                "inliers": np.asarray(inliers).reshape(-1).astype(np.int32),
+                "pose_w2c": pose,
+                "K": K,
+            }
+            native_capture["dense_pose_quality"] = _dense_pose_quality(native_capture)
+            if bool(apd_risk_weighted):
+                risk_observation = _dense_damage_risk_observation(
+                    sparse_capture=sparse_capture,
+                    dense_capture=native_capture,
+                    intrinsic=K,
+                    image_size=(int(Wf), int(Hf)),
+                )
+                risk_report = compute_dense_damage_risk(risk_observation)
+                apd_confidence = 1.0 if bool(apd_result.get("dense_refine_success", False)) else 0.0
+                beta = float(
+                    np.clip(
+                        float(risk_report.get("risk", 0.0))
+                        * max(float(apd_risk_max_beta), 0.0)
+                        * apd_confidence,
+                        0.0,
+                        1.0,
+                    )
+                )
+                final_pose = interpolate_w2c_poses(pose, apd_pose, beta)
+                apd_switch = {
+                    "schema": "loc_gs_apd_pose_switch_v1",
+                    "mode": "apd_use_refined_pose_risk_weighted",
+                    "accept_apd_pose": bool(beta > 0.0),
+                    "reason": "risk_weighted_apd_pose_blend",
+                    "beta": beta,
+                    "risk": float(risk_report.get("risk", 0.0)),
+                    "risk_report": risk_report,
+                    "risk_observation": risk_observation,
+                    "apd_confidence": apd_confidence,
+                    "apd_risk_max_beta": float(apd_risk_max_beta),
+                    "native_dense_default": True,
+                    "apd_use_refined_pose": True,
+                    "apd_risk_weighted": True,
+                    "apd_no_regression_gate": bool(apd_no_regression_gate),
+                    "diagnostic_only": True,
+                }
+            elif bool(apd_no_regression_gate):
+                gate = _evaluate_apd_no_regression_switch(
+                    native_capture=native_capture,
+                    apd_pose_w2c=apd_pose,
+                    apd_refine_success=bool(apd_result.get("dense_refine_success", False)),
+                    min_inlier_ratio_delta=float(apd_gate_min_inlier_ratio_delta),
+                    max_median_reproj_increase_px=float(apd_gate_max_median_reproj_increase_px),
+                    max_p90_reproj_increase_px=float(apd_gate_max_p90_reproj_increase_px),
+                    min_inlier_count_ratio=float(apd_gate_min_inlier_count_ratio),
+                )
+                accept_apd = bool(gate.get("accept_apd_pose", False))
+                apd_switch = {
+                    "schema": "loc_gs_apd_pose_switch_v1",
+                    "mode": "apd_use_refined_pose_with_gate",
+                    "accept_apd_pose": accept_apd,
+                    "reason": str(gate.get("decision", "reject_apd_pose_no_regression_gate")),
+                    "gate": gate,
+                    "apd_use_refined_pose": True,
+                    "apd_risk_weighted": False,
+                    "apd_no_regression_gate": True,
+                    "diagnostic_only": True,
+                }
+                if accept_apd:
+                    final_pose = apd_pose
+            else:
+                final_pose = apd_pose
+                apd_switch = {
+                    "schema": "loc_gs_apd_pose_switch_v1",
+                    "mode": "apd_use_refined_pose_no_gate",
+                    "accept_apd_pose": True,
+                    "reason": "apd_pose_forced_without_gate",
+                    "apd_use_refined_pose": True,
+                    "apd_risk_weighted": False,
+                    "apd_no_regression_gate": False,
+                    "diagnostic_only": True,
+                }
     apply_transition_control = True
     if render_control_mode == SPARSE_CONDITIONED_RENDER_CONTROL:
         apply_transition_control = _should_apply_sparse_conditioned_transition_control(
@@ -1665,6 +1958,7 @@ def _capture_dense(
         "slcdp_transition_control": _compact_transition_result(transition_control),
         "_clean_render_visualization": clean_render_visualization,
         "apd_dense": _compact_apd_result(apd_result),
+        "apd_pose_switch": apd_switch,
     }
     result["dense_pose_quality"] = _dense_pose_quality(result)
     if (
@@ -2026,6 +2320,22 @@ def _analyze_case(
     slcdp_transition_max_translation_delta_m: float,
     slcdp_transition_max_rotation_delta_deg: float,
     slcdp_transition_line_search_fractions: tuple[float, ...],
+    apd_dense: bool,
+    apd_include_patch_candidates: bool,
+    apd_dense_group_weight: float,
+    apd_anchor_group_weight: float,
+    apd_max_translation_delta_m: float,
+    apd_max_rotation_delta_deg: float,
+    apd_anchor_monotonic: bool,
+    apd_anchor_monotonic_epsilon_px: float,
+    apd_use_refined_pose: bool,
+    apd_risk_weighted: bool,
+    apd_risk_max_beta: float,
+    apd_no_regression_gate: bool,
+    apd_gate_min_inlier_ratio_delta: float,
+    apd_gate_max_median_reproj_increase_px: float,
+    apd_gate_max_p90_reproj_increase_px: float,
+    apd_gate_min_inlier_count_ratio: float,
 ) -> dict[str, Any]:
     camera = ctx["camera_by_name"].get(row["image_name"])
     if camera is None:
@@ -2073,6 +2383,22 @@ def _analyze_case(
             slcdp_transition_max_translation_delta_m=slcdp_transition_max_translation_delta_m,
             slcdp_transition_max_rotation_delta_deg=slcdp_transition_max_rotation_delta_deg,
             slcdp_transition_line_search_fractions=slcdp_transition_line_search_fractions,
+            apd_dense=apd_dense,
+            apd_include_patch_candidates=apd_include_patch_candidates,
+            apd_dense_group_weight=apd_dense_group_weight,
+            apd_anchor_group_weight=apd_anchor_group_weight,
+            apd_max_translation_delta_m=apd_max_translation_delta_m,
+            apd_max_rotation_delta_deg=apd_max_rotation_delta_deg,
+            apd_anchor_monotonic=apd_anchor_monotonic,
+            apd_anchor_monotonic_epsilon_px=apd_anchor_monotonic_epsilon_px,
+            apd_use_refined_pose=apd_use_refined_pose,
+            apd_risk_weighted=apd_risk_weighted,
+            apd_risk_max_beta=apd_risk_max_beta,
+            apd_no_regression_gate=apd_no_regression_gate,
+            apd_gate_min_inlier_ratio_delta=apd_gate_min_inlier_ratio_delta,
+            apd_gate_max_median_reproj_increase_px=apd_gate_max_median_reproj_increase_px,
+            apd_gate_max_p90_reproj_increase_px=apd_gate_max_p90_reproj_increase_px,
+            apd_gate_min_inlier_count_ratio=apd_gate_min_inlier_count_ratio,
         )
 
     query_pil = _tensor_to_image(query_image, size=(sparse["width"], sparse["height"]))
@@ -2315,6 +2641,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--apd_anchor_group_weight", type=float, default=1.0)
     parser.add_argument("--apd_max_translation_delta_m", type=float, default=0.0)
     parser.add_argument("--apd_max_rotation_delta_deg", type=float, default=0.0)
+    parser.add_argument("--apd_anchor_monotonic", action="store_true")
+    parser.add_argument("--apd_anchor_monotonic_epsilon_px", type=float, default=1.0)
+    parser.add_argument("--apd_use_refined_pose", action="store_true")
+    parser.add_argument("--apd_risk_weighted", action="store_true")
+    parser.add_argument("--apd_risk_max_beta", type=float, default=1.0)
+    parser.add_argument("--apd_no_regression_gate", action="store_true", default=True)
+    parser.add_argument("--no_apd_no_regression_gate", action="store_false", dest="apd_no_regression_gate")
+    parser.add_argument("--apd_gate_min_inlier_ratio_delta", type=float, default=0.02)
+    parser.add_argument("--apd_gate_max_median_reproj_increase_px", type=float, default=1.0)
+    parser.add_argument("--apd_gate_max_p90_reproj_increase_px", type=float, default=3.0)
+    parser.add_argument("--apd_gate_min_inlier_count_ratio", type=float, default=0.90)
     return parser
 
 

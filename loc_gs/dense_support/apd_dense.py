@@ -6,6 +6,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from loc_gs.diagnostics.match_visualization import project_points
+from loc_gs.dense_support.sparse_anchor_residual import (
+    SparseAnchorResidualPolicy,
+    compute_sparse_anchor_residual_group,
+)
+from loc_gs.dense_support.sparse_conditioned_dense_preflight import interpolate_w2c_poses
 from loc_gs.stdloc_native.patch_guided_sparse import refine_pose_with_reference_prior
 
 
@@ -29,6 +34,9 @@ class APDDensePolicy:
     rotation_prior_weight: float = 0.05
     max_translation_delta_m: float | None = None
     max_rotation_delta_deg: float | None = None
+    anchor_monotonic: bool = False
+    anchor_monotonic_epsilon_px: float = 1.0
+    anchor_monotonic_alphas: tuple[float, ...] = (0.75, 0.5, 0.25, 0.1, 0.0)
 
 
 def _candidate_array(candidates: Mapping[str, Any], key: str, fallback: str | None = None) -> np.ndarray:
@@ -201,6 +209,140 @@ def _normalize_group_weights(raw: np.ndarray, group_weight: float) -> np.ndarray
         weights = np.ones_like(weights)
         total = float(weights.size)
     return weights / max(total, 1.0e-12) * float(group_weight)
+
+
+def _anchor_residual_for_pose(
+    pose_w2c: np.ndarray,
+    *,
+    sparse_anchors: Mapping[str, Any],
+    intrinsic: np.ndarray,
+    image_size: tuple[int, int],
+    policy: APDDensePolicy,
+) -> dict[str, Any]:
+    return compute_sparse_anchor_residual_group(
+        sparse_anchors,
+        pose_w2c=np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4),
+        intrinsic=np.asarray(intrinsic, dtype=np.float64).reshape(3, 3),
+        image_size=(int(image_size[0]), int(image_size[1])),
+        policy=SparseAnchorResidualPolicy(
+            robust_scale_px=float(policy.robust_scale_px),
+            max_anchor_count=int(policy.max_anchor_count),
+        ),
+    )
+
+
+def _anchor_metric(residual: Mapping[str, Any]) -> float | None:
+    value = residual.get("median_error_px")
+    if value is None:
+        return None
+    value_f = float(value)
+    if not np.isfinite(value_f):
+        return None
+    return value_f
+
+
+def apply_sparse_anchor_monotonic_update(
+    *,
+    sparse_pose: np.ndarray,
+    candidate_pose: np.ndarray,
+    sparse_anchors: Mapping[str, Any],
+    intrinsic: np.ndarray,
+    image_size: tuple[int, int],
+    policy: APDDensePolicy = APDDensePolicy(),
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Shrink a candidate update until sparse-anchor reprojection is monotonic."""
+
+    sparse = np.asarray(sparse_pose, dtype=np.float64).reshape(4, 4)
+    candidate = np.asarray(candidate_pose, dtype=np.float64).reshape(4, 4)
+    sparse_residual = _anchor_residual_for_pose(
+        sparse,
+        sparse_anchors=sparse_anchors,
+        intrinsic=intrinsic,
+        image_size=image_size,
+        policy=policy,
+    )
+    sparse_metric = _anchor_metric(sparse_residual)
+    if sparse_metric is None:
+        return candidate.astype(np.float32), {
+            "schema": "loc_gs_apd_anchor_monotonic_v1",
+            "uses_gt": False,
+            "enabled": bool(policy.anchor_monotonic),
+            "success": False,
+            "reason": "no_valid_sparse_anchor_residual",
+            "selected_alpha": 1.0,
+            "sparse_anchor_median_px": None,
+            "selected_anchor_median_px": None,
+            "epsilon_px": float(policy.anchor_monotonic_epsilon_px),
+            "evaluated": [],
+        }
+
+    tolerance = sparse_metric + max(float(policy.anchor_monotonic_epsilon_px), 0.0)
+    evaluated: list[dict[str, Any]] = []
+    candidate_residual = _anchor_residual_for_pose(
+        candidate,
+        sparse_anchors=sparse_anchors,
+        intrinsic=intrinsic,
+        image_size=image_size,
+        policy=policy,
+    )
+    candidate_metric = _anchor_metric(candidate_residual)
+    if candidate_metric is not None:
+        evaluated.append({"alpha": 1.0, "anchor_median_px": float(candidate_metric)})
+        if candidate_metric <= tolerance:
+            return candidate.astype(np.float32), {
+                "schema": "loc_gs_apd_anchor_monotonic_v1",
+                "uses_gt": False,
+                "enabled": bool(policy.anchor_monotonic),
+                "success": True,
+                "reason": "candidate_anchor_monotonic",
+                "selected_alpha": 1.0,
+                "sparse_anchor_median_px": float(sparse_metric),
+                "selected_anchor_median_px": float(candidate_metric),
+                "epsilon_px": float(policy.anchor_monotonic_epsilon_px),
+                "evaluated": evaluated,
+            }
+
+    alphas = [float(a) for a in policy.anchor_monotonic_alphas]
+    if 0.0 not in alphas:
+        alphas.append(0.0)
+    for alpha in alphas:
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        pose_alpha = interpolate_w2c_poses(sparse, candidate, alpha)
+        residual = _anchor_residual_for_pose(
+            pose_alpha,
+            sparse_anchors=sparse_anchors,
+            intrinsic=intrinsic,
+            image_size=image_size,
+            policy=policy,
+        )
+        metric = _anchor_metric(residual)
+        evaluated.append({"alpha": alpha, "anchor_median_px": None if metric is None else float(metric)})
+        if metric is not None and metric <= tolerance:
+            return np.asarray(pose_alpha, dtype=np.float32).reshape(4, 4), {
+                "schema": "loc_gs_apd_anchor_monotonic_v1",
+                "uses_gt": False,
+                "enabled": bool(policy.anchor_monotonic),
+                "success": True,
+                "reason": "line_search_anchor_monotonic",
+                "selected_alpha": float(alpha),
+                "sparse_anchor_median_px": float(sparse_metric),
+                "selected_anchor_median_px": float(metric),
+                "epsilon_px": float(policy.anchor_monotonic_epsilon_px),
+                "evaluated": evaluated,
+            }
+
+    return sparse.astype(np.float32), {
+        "schema": "loc_gs_apd_anchor_monotonic_v1",
+        "uses_gt": False,
+        "enabled": bool(policy.anchor_monotonic),
+        "success": True,
+        "reason": "fallback_sparse_pose",
+        "selected_alpha": 0.0,
+        "sparse_anchor_median_px": float(sparse_metric),
+        "selected_anchor_median_px": float(sparse_metric),
+        "epsilon_px": float(policy.anchor_monotonic_epsilon_px),
+        "evaluated": evaluated,
+    }
 
 
 def refine_pose_with_sparse_anchors_and_dense_candidates(
@@ -420,7 +562,28 @@ def run_anchor_patch_dense_refinement(
         image_size=image_size,
         policy=policy,
     )
+    anchor_monotonic_diag: dict[str, Any] | None = None
+    if bool(policy.anchor_monotonic):
+        final_pose, anchor_monotonic_diag = apply_sparse_anchor_monotonic_update(
+            sparse_pose=sparse_pose,
+            candidate_pose=final_pose,
+            sparse_anchors=sparse_anchors,
+            intrinsic=intrinsic,
+            image_size=image_size,
+            policy=policy,
+        )
     anchor_xy, _anchor_points = _selected_anchor_arrays(sparse_anchors, int(policy.max_anchor_count))
+    diagnostics: dict[str, Any] = {
+        "candidate_pool": {
+            "candidate_count": int(pool["query_xy"].shape[0]),
+            "source_counts": source_counts,
+            "score_summaries": pool.get("_score_rows", []),
+        },
+        "refinement": refine_diag,
+        "core_judgements": ["anchor_consistency", "candidate_geometry", "query_render_match_quality"],
+    }
+    if anchor_monotonic_diag is not None:
+        diagnostics["anchor_monotonic"] = anchor_monotonic_diag
     return {
         "schema": "loc_gs_apd_dense_result_v1",
         "uses_gt": False,
@@ -432,13 +595,5 @@ def run_anchor_patch_dense_refinement(
         "num_patch_candidates": int(source_counts.get("patch", 0)),
         "num_anchor_residuals": int(anchor_xy.shape[0]),
         "dense_refine_success": bool(refine_diag.get("success", False)),
-        "diagnostics": {
-            "candidate_pool": {
-                "candidate_count": int(pool["query_xy"].shape[0]),
-                "source_counts": source_counts,
-                "score_summaries": pool.get("_score_rows", []),
-            },
-            "refinement": refine_diag,
-            "core_judgements": ["anchor_consistency", "candidate_geometry", "query_render_match_quality"],
-        },
+        "diagnostics": diagnostics,
     }

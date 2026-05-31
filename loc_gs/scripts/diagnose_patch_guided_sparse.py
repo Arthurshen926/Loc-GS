@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
+from loc_gs.data.cambridge_semantic_masks import CambridgeSemanticMaskStore, resize_semantic_mask
 from loc_gs.diagnostics.match_visualization import (
     draw_match_canvas,
     pose_error_cm_deg,
@@ -48,6 +49,7 @@ from loc_gs.stdloc_native.patch_guided_sparse import (
     PatchResidualWeightPolicy,
     apply_patch_residual_group_weight,
     evaluate_pose_global_consistency,
+    filter_matches_by_quality,
     filter_matches_by_reference_reprojection,
     filter_matches_by_patch,
     generate_patch_grid,
@@ -153,6 +155,49 @@ def _capture_sparse_with_overrides(
 
 def _parse_ints(value: str) -> tuple[int, ...]:
     return tuple(int(item) for item in str(value).split(",") if item.strip())
+
+
+def _resolve_patch_semantic_mask(
+    *,
+    ctx: Mapping[str, Any],
+    image_name: str,
+    height: int,
+    width: int,
+    mode: str,
+    require: bool,
+) -> tuple[torch.Tensor | None, dict[str, Any]]:
+    mode = str(mode or "none")
+    audit: dict[str, Any] = {
+        "mode": mode,
+        "enabled": mode != "none",
+        "require": bool(require),
+        "loaded": False,
+        "available": False,
+        "valid_ratio": None,
+        "mask_path": None,
+    }
+    if mode == "none":
+        return None, audit
+    if mode not in {"dynamic", "dynamic_sky"}:
+        raise ValueError("patch_semantic_mask_mode must be one of: none, dynamic, dynamic_sky")
+    store = CambridgeSemanticMaskStore.from_scene(
+        ctx["scene_root"],
+        image_subdir="processed",
+        remove_sky=mode == "dynamic_sky",
+        require=bool(require),
+    )
+    store_audit = store.audit()
+    audit.update(store_audit)
+    audit["loaded"] = bool(store.loaded)
+    audit["mask_path"] = store_audit.get("mask_path")
+    available = bool(store.loaded and str(image_name) in store.masks)
+    audit["available"] = available
+    if not available and bool(require):
+        raise KeyError(f"Required Cambridge semantic mask is missing for {image_name!r}")
+    mask = store.valid_mask(str(image_name), fallback_hw=(int(height), int(width)))
+    mask = resize_semantic_mask(mask, height=int(height), width=int(width))
+    audit["valid_ratio"] = float(mask.float().mean().item()) if mask.numel() else None
+    return mask.contiguous(), audit
 
 
 def _camera_center_rotation(pose_w2c: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -284,17 +329,63 @@ def _solve_sparse_pose(
     solver: str | None = None,
     max_iterations: int | None = None,
     min_iterations: int | None = None,
+    match_scores: np.ndarray | None = None,
+    reprojection_error: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     loc = ctx["localizer"]
     stdloc = ctx["stdloc"]
     if int(np.asarray(query_xy).shape[0]) < 4:
         return np.eye(4, dtype=np.float32), np.empty((0,), dtype=np.int32)
+    solver_name = str(solver if solver is not None else loc.config["sparse"]["solver"])
+    threshold = (
+        float(reprojection_error)
+        if reprojection_error is not None and float(reprojection_error) > 0.0
+        else float(loc.config["sparse"]["reprojection_error"])
+    )
+    if solver_name in {"opencv_prosac", "opencv_prosac_magsac"}:
+        import cv2
+
+        p2d = np.asarray(query_xy, dtype=np.float64).reshape(-1, 2)
+        p3d = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+        order = np.arange(p2d.shape[0], dtype=np.int64)
+        if match_scores is not None:
+            scores = np.asarray(match_scores, dtype=np.float64).reshape(-1)
+            if scores.shape[0] == p2d.shape[0]:
+                order = np.argsort(np.where(np.isfinite(scores), scores, -np.inf))[::-1].astype(np.int64)
+                p2d = p2d[order]
+                p3d = p3d[order]
+        params = cv2.UsacParams()
+        params.confidence = float(loc.config["sparse"]["confidence"])
+        params.maxIterations = int(max_iterations if max_iterations is not None else loc.config["sparse"]["max_iterations"])
+        params.threshold = float(threshold)
+        params.sampler = cv2.SAMPLING_PROSAC
+        params.score = cv2.SCORE_METHOD_MAGSAC if solver_name == "opencv_prosac_magsac" else cv2.SCORE_METHOD_MSAC
+        ok, _camera_matrix, rvec, tvec, inliers = cv2.solvePnPRansac(
+            p3d,
+            p2d,
+            np.asarray(intrinsic, dtype=np.float64),
+            None,
+            None,
+            None,
+            None,
+            params,
+        )
+        if ok:
+            w2c = np.eye(4, dtype=np.float64)
+            cv2.Rodrigues(rvec, w2c[:3, :3])
+            w2c[:3, 3] = np.asarray(tvec).reshape(3)
+            if inliers is None:
+                mapped_inliers = np.empty((0,), dtype=np.int32)
+            else:
+                mapped_inliers = order[np.asarray(inliers).reshape(-1)].astype(np.int32)
+            return w2c.astype(np.float32), mapped_inliers
+        return np.eye(4, dtype=np.float32), np.empty((0,), dtype=np.int32)
     pose, inliers = stdloc.solve_pose(
         np.asarray(query_xy, dtype=np.float32),
         np.asarray(points_world, dtype=np.float32),
         intrinsic,
-        str(solver if solver is not None else loc.config["sparse"]["solver"]),
-        loc.config["sparse"]["reprojection_error"],
+        solver_name,
+        threshold,
         loc.config["sparse"]["confidence"],
         int(max_iterations if max_iterations is not None else loc.config["sparse"]["max_iterations"]),
         int(min_iterations if min_iterations is not None else loc.config["sparse"]["min_iterations"]),
@@ -397,6 +488,165 @@ def _matches_from_sparse(sparse: Mapping[str, Any]) -> dict[str, np.ndarray]:
     return matches
 
 
+def _select_sparse_anchor_indices(
+    candidate_indices: np.ndarray,
+    *,
+    errors: np.ndarray,
+    query_xy: np.ndarray,
+    depths: np.ndarray,
+    image_size: tuple[int, int],
+    max_anchor_count: int,
+    selection_mode: str = "error",
+    grid_size: int = 4,
+) -> np.ndarray:
+    """Select base sparse anchors for PGSH fusion without using GT.
+
+    ``error`` preserves the previous behavior: keep the lowest reprojection
+    error anchors under the patch pose. ``spatial_depth_diverse`` still prefers
+    low-error anchors, but round-robins over image/depth bins so anchor fusion
+    restores PnP geometry instead of adding many near-duplicate local points.
+    """
+
+    candidate_indices = np.asarray(candidate_indices, dtype=np.int64).reshape(-1)
+    if candidate_indices.size == 0 or int(max_anchor_count) == 0:
+        return np.empty((0,), dtype=np.int64)
+    if int(max_anchor_count) < 0 or candidate_indices.size <= int(max_anchor_count):
+        return candidate_indices.copy()
+
+    mode = str(selection_mode or "error")
+    candidate_errors = np.asarray(errors, dtype=np.float64).reshape(-1)[candidate_indices]
+    finite_error = np.where(np.isfinite(candidate_errors), candidate_errors, np.inf)
+    if mode == "error":
+        order = np.lexsort((candidate_indices, finite_error))
+        return candidate_indices[order[: int(max_anchor_count)]].astype(np.int64)
+    if mode != "spatial_depth_diverse":
+        raise ValueError("pgsh_sparse_anchor_selection must be 'error' or 'spatial_depth_diverse'")
+
+    xy = np.asarray(query_xy, dtype=np.float64).reshape(-1, 2)
+    depth_values = np.asarray(depths, dtype=np.float64).reshape(-1)
+    width, height = max(1, int(image_size[0])), max(1, int(image_size[1]))
+    grid = max(1, int(grid_size))
+    if xy.shape[0] <= int(np.max(candidate_indices)) or depth_values.shape[0] <= int(np.max(candidate_indices)):
+        order = np.lexsort((candidate_indices, finite_error))
+        return candidate_indices[order[: int(max_anchor_count)]].astype(np.int64)
+
+    cand_xy = xy[candidate_indices]
+    xbin = np.clip(np.floor(cand_xy[:, 0] / max(1.0, width / float(grid))).astype(np.int64), 0, grid - 1)
+    ybin = np.clip(np.floor(cand_xy[:, 1] / max(1.0, height / float(grid))).astype(np.int64), 0, grid - 1)
+    cand_depth = depth_values[candidate_indices]
+    finite_depth = cand_depth[np.isfinite(cand_depth)]
+    if finite_depth.size >= 3 and float(np.ptp(finite_depth)) > 1.0e-6:
+        q1, q2 = np.percentile(finite_depth, [33.3, 66.7])
+        zbin = np.digitize(np.where(np.isfinite(cand_depth), cand_depth, q2), [q1, q2]).astype(np.int64)
+    else:
+        zbin = np.zeros((candidate_indices.shape[0],), dtype=np.int64)
+
+    groups: dict[tuple[int, int, int], list[int]] = {}
+    for local_idx, anchor_idx in enumerate(candidate_indices):
+        key = (int(xbin[local_idx]), int(ybin[local_idx]), int(zbin[local_idx]))
+        groups.setdefault(key, []).append(int(local_idx))
+    for key, local_indices in groups.items():
+        local_indices.sort(key=lambda idx: (float(finite_error[idx]), int(candidate_indices[idx])))
+
+    selected: list[int] = []
+    used_spatial_cells: set[tuple[int, int]] = set()
+    while len(selected) < int(max_anchor_count):
+        available = [key for key, local_indices in groups.items() if local_indices]
+        if not available:
+            break
+        spatial_novel = [key for key in available if (key[0], key[1]) not in used_spatial_cells]
+        candidate_keys = spatial_novel if spatial_novel else available
+        key = min(candidate_keys, key=lambda item: (float(finite_error[groups[item][0]]), item))
+        local_idx = groups[key].pop(0)
+        selected.append(int(candidate_indices[local_idx]))
+        used_spatial_cells.add((int(key[0]), int(key[1])))
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _fuse_sparse_anchors_with_matches(
+    *,
+    base_sparse: Mapping[str, Any],
+    patch_matches: Mapping[str, Any],
+    candidate_pose_w2c: np.ndarray,
+    max_reprojection_error_px: float,
+    max_anchor_count: int,
+    anchor_selection: str = "error",
+    anchor_grid_size: int = 4,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    base_matches = _matches_from_sparse(base_sparse)
+    base_count = int(np.asarray(base_matches["xy"]).reshape(-1, 2).shape[0])
+    base_inlier_mask = _inlier_mask(base_count, np.asarray(base_sparse.get("inliers", []), dtype=np.int64))
+    base_errors = _reprojection_errors(
+        query_xy=base_matches["xy"],
+        points_world=base_matches["xyz"],
+        pose_w2c=np.asarray(candidate_pose_w2c, dtype=np.float64).reshape(4, 4),
+        intrinsic=base_sparse["K"],
+        width=int(base_sparse["width"]),
+        height=int(base_sparse["height"]),
+    )
+    anchor_mask = base_inlier_mask & np.isfinite(base_errors) & (base_errors <= float(max_reprojection_error_px))
+    anchor_indices = np.flatnonzero(anchor_mask).astype(np.int64)
+    base_depths = _camera_depths(base_matches["xyz"], np.asarray(candidate_pose_w2c, dtype=np.float64).reshape(4, 4))
+    anchor_indices = _select_sparse_anchor_indices(
+        anchor_indices,
+        errors=base_errors,
+        query_xy=np.asarray(base_matches["xy"], dtype=np.float32).reshape(-1, 2),
+        depths=base_depths,
+        image_size=(int(base_sparse["width"]), int(base_sparse["height"])),
+        max_anchor_count=int(max_anchor_count),
+        selection_mode=str(anchor_selection),
+        grid_size=int(anchor_grid_size),
+    )
+
+    patch_xy = np.asarray(patch_matches.get("xy", []), dtype=np.float32).reshape(-1, 2)
+    patch_count = int(patch_xy.shape[0])
+    fused: dict[str, np.ndarray] = {}
+    defaults: dict[str, Any] = {
+        "gs_ids": np.zeros((patch_count,), dtype=np.int64),
+        "score": np.ones((patch_count,), dtype=np.float32),
+        "detector_score": np.full((patch_count,), 0.5, dtype=np.float32),
+    }
+    for key in ("xy", "xyz", "gs_ids", "score", "detector_score"):
+        patch_value = np.asarray(patch_matches.get(key, defaults.get(key)))
+        if key == "xy":
+            patch_value = patch_value.astype(np.float32).reshape(-1, 2)
+            anchor_value = np.asarray(base_matches[key], dtype=np.float32).reshape(-1, 2)[anchor_indices]
+        elif key == "xyz":
+            patch_value = patch_value.astype(np.float32).reshape(-1, 3)
+            anchor_value = np.asarray(base_matches[key], dtype=np.float32).reshape(-1, 3)[anchor_indices]
+        elif key == "gs_ids":
+            patch_value = patch_value.astype(np.int64).reshape(-1)
+            anchor_value = np.asarray(base_matches[key], dtype=np.int64).reshape(-1)[anchor_indices]
+        else:
+            patch_value = patch_value.astype(np.float32).reshape(-1)
+            anchor_value = np.asarray(base_matches[key], dtype=np.float32).reshape(-1)[anchor_indices]
+        fused[key] = np.concatenate([patch_value, anchor_value], axis=0)
+
+    if "reference_reprojection_error_px" in patch_matches or anchor_indices.size:
+        patch_ref = np.asarray(
+            patch_matches.get("reference_reprojection_error_px", np.zeros((patch_count,), dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape(-1)
+        fused["reference_reprojection_error_px"] = np.concatenate(
+            [patch_ref, base_errors[anchor_indices].astype(np.float32)],
+            axis=0,
+        )
+    diagnostics = {
+        "schema": "loc_gs_pgsh_sparse_anchor_fusion_v1",
+        "enabled": True,
+        "patch_match_count": patch_count,
+        "base_inlier_count": int(np.count_nonzero(base_inlier_mask)),
+        "anchor_candidate_count": int(np.count_nonzero(anchor_mask)),
+        "added_anchor_count": int(anchor_indices.shape[0]),
+        "max_reprojection_error_px": float(max_reprojection_error_px),
+        "max_anchor_count": int(max_anchor_count),
+        "anchor_selection": str(anchor_selection),
+        "anchor_grid_size": int(anchor_grid_size),
+        "median_anchor_reprojection_error_px": float(np.median(base_errors[anchor_indices])) if anchor_indices.size else None,
+    }
+    return fused, diagnostics
+
+
 def _matches_from_dense(dense: Mapping[str, Any]) -> dict[str, np.ndarray]:
     query_xy = np.asarray(dense["query_xy"], dtype=np.float32).reshape(-1, 2)
     rendered_xy = np.asarray(dense.get("rendered_xy", np.empty((0, 2), dtype=np.float32)), dtype=np.float32).reshape(-1, 2)
@@ -415,6 +665,44 @@ def _matches_from_dense(dense: Mapping[str, Any]) -> dict[str, np.ndarray]:
         if detector_scores.shape[0] == query_xy.shape[0]:
             matches["detector_score"] = detector_scores
     return matches
+
+
+def _match_solver_scores(
+    matches: Mapping[str, Any],
+    *,
+    mode: str,
+    reference_max_reprojection_px: float = 0.0,
+) -> np.ndarray | None:
+    """Build a query-observable PROSAC ordering score for patch PnP."""
+
+    mode = str(mode or "native")
+    if mode == "native":
+        return None
+    xy = np.asarray(matches.get("xy", []), dtype=np.float32).reshape(-1, 2)
+    n_matches = int(xy.shape[0])
+    if n_matches == 0:
+        return np.empty((0,), dtype=np.float32)
+    score = np.asarray(matches.get("score", np.ones((n_matches,), dtype=np.float32)), dtype=np.float64).reshape(-1)
+    if score.shape[0] != n_matches:
+        score = np.ones((n_matches,), dtype=np.float64)
+    score = np.where(np.isfinite(score), score, 0.0)
+    if "margin" in matches:
+        margin = np.asarray(matches["margin"], dtype=np.float64).reshape(-1)
+        if margin.shape[0] == n_matches:
+            score = score + 0.25 * np.where(np.isfinite(margin), np.maximum(margin, 0.0), 0.0)
+    if "detector_score" in matches:
+        detector = np.asarray(matches["detector_score"], dtype=np.float64).reshape(-1)
+        if detector.shape[0] == n_matches:
+            score = score + 0.10 * np.where(np.isfinite(detector), np.clip(detector, 0.0, 1.0), 0.0)
+    if mode == "reference":
+        ref_err = np.asarray(matches.get("reference_reprojection_error_px", []), dtype=np.float64).reshape(-1)
+        if ref_err.shape[0] == n_matches:
+            scale = max(1.0, float(reference_max_reprojection_px))
+            ref_score = np.exp(-np.clip(np.where(np.isfinite(ref_err), ref_err, scale), 0.0, scale) / scale)
+            score = score + 0.50 * ref_score
+    elif mode != "descriptor":
+        raise ValueError("patch_solver_score_mode must be 'native', 'descriptor', or 'reference'")
+    return score.astype(np.float32)
 
 
 @torch.no_grad()
@@ -533,6 +821,8 @@ def _match_patch_locally(
     patch_dual_softmax: str,
     patch_mnn_match: str,
     patch_match_threshold: float | None,
+    patch_match_second_best_margin: float = 0.0,
+    semantic_valid_mask: torch.Tensor | None = None,
 ) -> dict[str, np.ndarray]:
     """Run STDLoc-style sparse matching on patch-local query keypoints only."""
 
@@ -552,6 +842,10 @@ def _match_patch_locally(
         & (ys < int(patch.y1))
         & (kp_scores > 0)
     )
+    if semantic_valid_mask is not None:
+        valid_mask = semantic_valid_mask.to(device=kp_scores.device, dtype=torch.bool).reshape(-1)
+        if valid_mask.numel() == kp_scores.numel():
+            patch_mask = patch_mask & valid_mask
     candidate_ids = torch.nonzero(patch_mask, as_tuple=False).reshape(-1)
     if candidate_ids.numel() == 0:
         return _empty_matches()
@@ -580,6 +874,11 @@ def _match_patch_locally(
     threshold = loc.config["sparse"]["threshold"] if patch_match_threshold is None else float(patch_match_threshold)
     if use_dual_softmax:
         corr = stdloc.dual_softmax(corr, temp=loc.config["sparse"]["dual_softmax_temp"])
+    if corr.shape[1] >= 2:
+        top2_margin = torch.topk(corr, k=2, dim=1).values
+        top2_margin = (top2_margin[:, 0] - top2_margin[:, 1]).clamp_min(0.0)
+    else:
+        top2_margin = torch.zeros((corr.shape[0],), dtype=corr.dtype, device=corr.device)
     if use_mnn_match:
         _b, im_idx, gs_ids = stdloc.mnn_match(corr[None], thr=threshold)
         im_idx = im_idx.reshape(-1)
@@ -600,11 +899,13 @@ def _match_patch_locally(
     p2d = grid[kp_ids.detach().cpu()][im_idx.detach().cpu()].numpy().astype(np.float32) + 0.5
     p3d = loc.landmarks.get_xyz[gs_ids].detach().cpu().numpy().astype(np.float32)
     detector_scores = kp_scores[kp_ids][im_idx].detach().cpu().numpy().astype(np.float32)
+    margins = top2_margin[im_idx].detach().cpu().numpy().astype(np.float32)
     return {
         "xy": p2d,
         "xyz": p3d,
         "gs_ids": gs_ids.detach().cpu().numpy().astype(np.int64),
         "score": scores.detach().cpu().numpy().astype(np.float32),
+        "margin": margins,
         "detector_score": detector_scores,
         "indices": np.arange(int(p2d.shape[0]), dtype=np.int64),
     }
@@ -651,10 +952,18 @@ def build_patch_guided_sparse_hypotheses(
     patch_dual_softmax: str,
     patch_mnn_match: str,
     patch_match_threshold: float | None,
+    patch_match_second_best_margin: float = 0.0,
+    patch_match_best_per_landmark: bool = False,
+    patch_match_max_matches: int = 0,
+    patch_match_quality_min_keep: int = 0,
+    patch_score_profile: str = "balanced",
+    patch_solver_score_mode: str = "native",
+    semantic_valid_mask: torch.Tensor | None = None,
     min_patch_matches: int,
     min_patch_inliers: int,
     patch_pnp_max_iterations: int,
     patch_pnp_min_iterations: int,
+    patch_pnp_reprojection_error: float,
     patch_pnp_solver: str,
     detector_score_weight: float = 0.0,
     global_consistency: bool = True,
@@ -685,11 +994,20 @@ def build_patch_guided_sparse_hypotheses(
                 patch_dual_softmax=str(patch_dual_softmax),
                 patch_mnn_match=str(patch_mnn_match),
                 patch_match_threshold=patch_match_threshold,
+                patch_match_second_best_margin=float(patch_match_second_best_margin),
+                semantic_valid_mask=semantic_valid_mask,
             )
         else:
             patch_matches = filter_matches_by_patch(global_matches, patch)
         reference_filter = None
         original_match_count = int(np.asarray(patch_matches["xy"]).shape[0])
+        patch_matches, quality_filter = filter_matches_by_quality(
+            patch_matches,
+            min_margin=float(patch_match_second_best_margin),
+            best_per_landmark=bool(patch_match_best_per_landmark),
+            max_matches=int(patch_match_max_matches),
+            min_matches=int(patch_match_quality_min_keep),
+        )
         if reference_pose_w2c is not None and float(reference_match_max_reprojection_px) > 0.0 and original_match_count > 0:
             patch_matches, reference_filter = filter_matches_by_reference_reprojection(
                 patch_matches,
@@ -706,6 +1024,7 @@ def build_patch_guided_sparse_hypotheses(
                     "match_mode": str(patch_match_mode),
                     "match_count": match_count,
                     "original_match_count": original_match_count,
+                    "quality_filter": quality_filter,
                     "skipped": "too_few_reference_consistent_matches",
                     "reference_filter": reference_filter,
                 }
@@ -718,6 +1037,7 @@ def build_patch_guided_sparse_hypotheses(
                     "match_mode": str(patch_match_mode),
                     "match_count": match_count,
                     "original_match_count": original_match_count,
+                    "quality_filter": quality_filter,
                     "reference_filter": reference_filter,
                     "skipped": "too_few_matches",
                 }
@@ -731,6 +1051,12 @@ def build_patch_guided_sparse_hypotheses(
             solver=str(patch_pnp_solver),
             max_iterations=int(patch_pnp_max_iterations),
             min_iterations=int(patch_pnp_min_iterations),
+            reprojection_error=float(patch_pnp_reprojection_error) if float(patch_pnp_reprojection_error) > 0.0 else None,
+            match_scores=_match_solver_scores(
+                patch_matches,
+                mode=str(patch_solver_score_mode),
+                reference_max_reprojection_px=float(reference_match_max_reprojection_px),
+            ),
         )
         inlier_mask = _inlier_mask(match_count, inliers)
         if int(inlier_mask.sum()) < int(min_patch_inliers):
@@ -741,6 +1067,7 @@ def build_patch_guided_sparse_hypotheses(
                     "match_count": match_count,
                     "original_match_count": original_match_count,
                     "inlier_count": int(inlier_mask.sum()),
+                    "quality_filter": quality_filter,
                     "reference_filter": reference_filter,
                     "skipped": "too_few_inliers",
                 }
@@ -779,6 +1106,7 @@ def build_patch_guided_sparse_hypotheses(
                         "match_count": match_count,
                         "original_match_count": original_match_count,
                         "inlier_count": int(inlier_mask.sum()),
+                        "quality_filter": quality_filter,
                         "skipped": "global_consistency_reject",
                         "reference_filter": reference_filter,
                         "global_consistency": consistency,
@@ -798,11 +1126,13 @@ def build_patch_guided_sparse_hypotheses(
             match_indices=pool_indices,
             detector_scores=patch_matches.get("detector_score"),
             detector_score_weight=float(detector_score_weight),
+            score_profile=str(patch_score_profile),
         )
         hypotheses.append(hypothesis)
         row = _hypothesis_to_dict(hypothesis, patch, match_count=match_count)
         row["match_mode"] = str(patch_match_mode)
         row["original_match_count"] = original_match_count
+        row["quality_filter"] = quality_filter
         if reference_filter is not None:
             row["reference_filter"] = reference_filter
         if consistency is not None:
@@ -826,6 +1156,30 @@ def build_patch_guided_sparse_hypotheses(
             row["diagnostic_pose_te_cm"] = float(patch_te)
             row["diagnostic_pose_re_deg"] = float(patch_re)
             row["diagnostic_median_gt_reprojection_px"] = float(np.median(gt_errors[np.isfinite(gt_errors)])) if np.isfinite(gt_errors).any() else None
+            if int(gt_good.sum()) >= 4:
+                forced_pose, forced_inliers = _solve_sparse_pose(
+                    ctx,
+                    patch_matches["xy"][gt_good],
+                    patch_matches["xyz"][gt_good],
+                    sparse["K"],
+                    solver=str(patch_pnp_solver),
+                    max_iterations=int(patch_pnp_max_iterations),
+                    min_iterations=int(patch_pnp_min_iterations),
+                    reprojection_error=float(patch_pnp_reprojection_error) if float(patch_pnp_reprojection_error) > 0.0 else None,
+                    match_scores=_match_solver_scores(
+                        {key: np.asarray(value)[gt_good] if np.asarray(value).shape[:1] == (gt_good.shape[0],) else value for key, value in patch_matches.items()},
+                        mode=str(patch_solver_score_mode),
+                        reference_max_reprojection_px=float(reference_match_max_reprojection_px),
+                    ),
+                )
+                forced_te, forced_re = pose_error_cm_deg(forced_pose, np.asarray(diagnostic_gt_w2c, dtype=np.float64).reshape(4, 4))
+                row["diagnostic_forced_good_pnp_te_cm"] = float(forced_te)
+                row["diagnostic_forced_good_pnp_re_deg"] = float(forced_re)
+                row["diagnostic_forced_good_pnp_inliers"] = int(np.asarray(forced_inliers).reshape(-1).shape[0])
+            else:
+                row["diagnostic_forced_good_pnp_te_cm"] = None
+                row["diagnostic_forced_good_pnp_re_deg"] = None
+                row["diagnostic_forced_good_pnp_inliers"] = 0
         rows.append(row)
     return hypotheses, rows, _finalize_match_pool(candidate_pool)
 
@@ -1121,6 +1475,9 @@ def _write_hypotheses_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None
         "diagnostic_pose_te_cm",
         "diagnostic_pose_re_deg",
         "diagnostic_median_gt_reprojection_px",
+        "diagnostic_forced_good_pnp_te_cm",
+        "diagnostic_forced_good_pnp_re_deg",
+        "diagnostic_forced_good_pnp_inliers",
         "skipped",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -1152,6 +1509,9 @@ def _write_hypotheses_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None
                     "diagnostic_pose_te_cm": row.get("diagnostic_pose_te_cm"),
                     "diagnostic_pose_re_deg": row.get("diagnostic_pose_re_deg"),
                     "diagnostic_median_gt_reprojection_px": row.get("diagnostic_median_gt_reprojection_px"),
+                    "diagnostic_forced_good_pnp_te_cm": row.get("diagnostic_forced_good_pnp_te_cm"),
+                    "diagnostic_forced_good_pnp_re_deg": row.get("diagnostic_forced_good_pnp_re_deg"),
+                    "diagnostic_forced_good_pnp_inliers": row.get("diagnostic_forced_good_pnp_inliers"),
                     "skipped": row.get("skipped", ""),
                 }
             )
@@ -1240,6 +1600,18 @@ def _make_contact_sheet(items: Sequence[tuple[str, Path]], output_path: Path) ->
     canvas.save(output_path, quality=92)
 
 
+def _camera_collection_len(cameras: Any) -> int:
+    if hasattr(cameras, "dataset"):
+        return int(len(cameras.dataset))
+    return int(len(cameras))
+
+
+def _camera_collection_get(cameras: Any, index: int) -> Any:
+    if hasattr(cameras, "dataset"):
+        return cameras.dataset[int(index)]
+    return cameras[int(index)]
+
+
 def _resolve_camera(ctx: Mapping[str, Any], *, image_name: str, query_index: int | None) -> Any:
     if image_name:
         camera = ctx["camera_by_name"].get(image_name)
@@ -1248,10 +1620,11 @@ def _resolve_camera(ctx: Mapping[str, Any], *, image_name: str, query_index: int
         return camera
     if query_index is None:
         raise ValueError("provide --image_name or --query_index")
-    cameras = list(ctx["cameras"])
-    if query_index < 0 or query_index >= len(cameras):
-        raise IndexError(f"query_index {query_index} is outside split camera count {len(cameras)}")
-    return cameras[int(query_index)]
+    cameras = ctx["cameras"]
+    camera_count = _camera_collection_len(cameras)
+    if query_index < 0 or query_index >= camera_count:
+        raise IndexError(f"query_index {query_index} is outside split camera count {camera_count}")
+    return _camera_collection_get(cameras, int(query_index))
 
 
 def analyze_case(
@@ -1269,6 +1642,15 @@ def analyze_case(
     patch_dual_softmax: str,
     patch_mnn_match: str,
     patch_match_threshold: float | None,
+    patch_match_second_best_margin: float,
+    patch_match_best_per_landmark: bool,
+    patch_match_max_matches: int,
+    patch_match_quality_min_keep: int,
+    patch_semantic_mask_mode: str,
+    patch_require_semantic_mask: bool,
+    pgsh_patch_score_profile: str,
+    pgsh_cluster_rank: str,
+    patch_solver_score_mode: str,
     pgsh_detector_score_weight: float,
     min_patch_matches: int,
     min_patch_inliers: int,
@@ -1278,14 +1660,30 @@ def analyze_case(
     patch_pnp_max_iterations: int,
     patch_pnp_min_iterations: int,
     patch_pnp_solver: str,
+    patch_pnp_reprojection_error: float,
     pgsh_global_consistency: bool,
     pgsh_sparse_retention_min_ratio: float,
     pgsh_sparse_retention_max_error_px: float,
+    pgsh_sparse_reference_filter_from_base: bool,
     pgsh_reference_match_max_reprojection_px: float,
     pgsh_reference_match_min_keep: int,
+    pgsh_sparse_anchor_fusion: bool,
+    pgsh_sparse_anchor_max_reprojection_px: float,
+    pgsh_sparse_anchor_max_count: int,
+    pgsh_sparse_anchor_selection: str,
+    pgsh_sparse_anchor_grid: int,
+    pgsh_sparse_reference_local_refine: bool,
+    pgsh_sparse_refine_max_iterations: int,
+    pgsh_sparse_refine_loss_scale_px: float,
+    pgsh_sparse_refine_translation_prior_weight: float,
+    pgsh_sparse_refine_rotation_prior_weight: float,
+    pgsh_sparse_refine_max_translation_delta_m: float,
+    pgsh_sparse_refine_max_rotation_delta_deg: float,
+    pgsh_sparse_refine_pose_mix: str,
     cluster_center_thresh_m: float,
     cluster_rotation_thresh_deg: float,
     min_group_patches: int,
+    pgsh_group_max_patches: int,
     min_final_inliers: int,
     pgsh_max_base_inliers_for_override: int,
     pgsh_fallback_to_base: bool,
@@ -1319,6 +1717,7 @@ def analyze_case(
     dense_pgsh_max_rotation_from_base_dense_deg: float,
     good_px: float,
     max_draw: int,
+    skip_visualization: bool,
     slcdp_options: Mapping[str, Any],
 ) -> dict[str, Any]:
     ctx = _build_context(candidate_root / scene, split_override=split)
@@ -1342,7 +1741,16 @@ def analyze_case(
         grids=patch_grids,
         overlap_ratio=float(overlap_ratio),
     )
+    semantic_valid_mask, semantic_mask_audit = _resolve_patch_semantic_mask(
+        ctx=ctx,
+        image_name=str(camera.image_name),
+        height=int(base_sparse["height"]),
+        width=int(base_sparse["width"]),
+        mode=str(patch_semantic_mask_mode),
+        require=bool(patch_require_semantic_mask),
+    )
     base_sparse_inlier_count = int(np.asarray(base_sparse.get("inliers", [])).reshape(-1).shape[0])
+    sparse_reference_pose_w2c = base_sparse["pose_w2c"] if bool(pgsh_sparse_reference_filter_from_base) else None
     skip_pgsh_search = (
         bool(disable_sparse_pgsh)
         or (
@@ -1363,10 +1771,18 @@ def analyze_case(
             patch_dual_softmax=str(patch_dual_softmax),
             patch_mnn_match=str(patch_mnn_match),
             patch_match_threshold=patch_match_threshold,
+            patch_match_second_best_margin=float(patch_match_second_best_margin),
+            patch_match_best_per_landmark=bool(patch_match_best_per_landmark),
+            patch_match_max_matches=int(patch_match_max_matches),
+            patch_match_quality_min_keep=int(patch_match_quality_min_keep),
+            patch_score_profile=str(pgsh_patch_score_profile),
+            patch_solver_score_mode=str(patch_solver_score_mode),
+            semantic_valid_mask=semantic_valid_mask,
             min_patch_matches=int(min_patch_matches),
             min_patch_inliers=int(min_patch_inliers),
             patch_pnp_max_iterations=int(patch_pnp_max_iterations),
             patch_pnp_min_iterations=int(patch_pnp_min_iterations),
+            patch_pnp_reprojection_error=float(patch_pnp_reprojection_error),
             patch_pnp_solver=str(patch_pnp_solver),
             detector_score_weight=float(pgsh_detector_score_weight),
             global_consistency=bool(pgsh_global_consistency),
@@ -1375,6 +1791,7 @@ def analyze_case(
             global_sparse_inlier_indices=base_sparse["inliers"],
             sparse_retention_min_ratio=float(pgsh_sparse_retention_min_ratio),
             sparse_retention_max_error_px=float(pgsh_sparse_retention_max_error_px),
+            reference_pose_w2c=sparse_reference_pose_w2c,
             reference_match_max_reprojection_px=float(pgsh_reference_match_max_reprojection_px),
             reference_match_min_keep=int(pgsh_reference_match_min_keep),
             diagnostic_gt_w2c=gt_w2c,
@@ -1385,6 +1802,8 @@ def analyze_case(
         center_thresh=float(cluster_center_thresh_m),
         rotation_thresh_deg=float(cluster_rotation_thresh_deg),
         min_patch_count=int(min_group_patches),
+        rank_by=str(pgsh_cluster_rank),
+        max_patch_count=int(pgsh_group_max_patches),
     )
     merged = merge_group_matches(candidate_matches, group)
     selected_merged_match_count = int(np.asarray(merged.get("xy", [])).shape[0])
@@ -1396,6 +1815,8 @@ def analyze_case(
         pgsh_decision = "use_patch_guided_sparse"
     candidate_pgsh_pose = np.asarray(base_sparse["pose_w2c"], dtype=np.float32).reshape(4, 4)
     candidate_pgsh_inliers = np.empty((0,), dtype=np.int32)
+    sparse_anchor_fusion_diag: dict[str, Any] | None = None
+    sparse_reference_local_refine_diag: dict[str, Any] | None = None
     if pgsh_decision == "use_patch_guided_sparse" and int(np.asarray(merged.get("xy", [])).shape[0]) >= 4:
         candidate_pgsh_pose, candidate_pgsh_inliers = _solve_sparse_pose(
             ctx,
@@ -1405,7 +1826,98 @@ def analyze_case(
             solver=str(patch_pnp_solver),
             max_iterations=int(max(patch_pnp_max_iterations, 20000)),
             min_iterations=int(max(patch_pnp_min_iterations, 100)),
+            reprojection_error=float(patch_pnp_reprojection_error) if float(patch_pnp_reprojection_error) > 0.0 else None,
+            match_scores=_match_solver_scores(
+                merged,
+                mode=str(patch_solver_score_mode),
+                reference_max_reprojection_px=float(pgsh_reference_match_max_reprojection_px),
+            ),
         )
+        if bool(pgsh_sparse_anchor_fusion):
+            anchor_merged, sparse_anchor_fusion_diag = _fuse_sparse_anchors_with_matches(
+                base_sparse=base_sparse,
+                patch_matches=merged,
+                candidate_pose_w2c=candidate_pgsh_pose,
+                max_reprojection_error_px=float(pgsh_sparse_anchor_max_reprojection_px),
+                max_anchor_count=int(pgsh_sparse_anchor_max_count),
+                anchor_selection=str(pgsh_sparse_anchor_selection),
+                anchor_grid_size=int(pgsh_sparse_anchor_grid),
+            )
+            if int(np.asarray(anchor_merged.get("xy", [])).shape[0]) >= 4:
+                anchor_pose, anchor_inliers = _solve_sparse_pose(
+                    ctx,
+                    anchor_merged["xy"],
+                    anchor_merged["xyz"],
+                    base_sparse["K"],
+                    solver=str(patch_pnp_solver),
+                    max_iterations=int(max(patch_pnp_max_iterations, 20000)),
+                    min_iterations=int(max(patch_pnp_min_iterations, 100)),
+                    reprojection_error=float(patch_pnp_reprojection_error) if float(patch_pnp_reprojection_error) > 0.0 else None,
+                    match_scores=_match_solver_scores(
+                        anchor_merged,
+                        mode=str(patch_solver_score_mode),
+                        reference_max_reprojection_px=float(pgsh_reference_match_max_reprojection_px),
+                    ),
+                )
+                candidate_pgsh_pose = anchor_pose
+                candidate_pgsh_inliers = anchor_inliers
+                merged = anchor_merged
+                selected_merged_match_count = int(np.asarray(merged.get("xy", [])).shape[0])
+        if bool(pgsh_sparse_reference_local_refine):
+            pre_refine_pose = np.asarray(candidate_pgsh_pose, dtype=np.float32).reshape(4, 4)
+            refined_pose, sparse_reference_local_refine_diag = refine_pose_with_reference_prior(
+                reference_pose_w2c=np.asarray(base_sparse["pose_w2c"], dtype=np.float32).reshape(4, 4),
+                match_xy=np.asarray(merged["xy"], dtype=np.float32).reshape(-1, 2),
+                points_world=np.asarray(merged["xyz"], dtype=np.float32).reshape(-1, 3),
+                intrinsic=np.asarray(base_sparse["K"], dtype=np.float32).reshape(3, 3),
+                image_size=(int(base_sparse["width"]), int(base_sparse["height"])),
+                max_iterations=int(pgsh_sparse_refine_max_iterations),
+                reprojection_loss_scale_px=float(pgsh_sparse_refine_loss_scale_px),
+                translation_prior_weight=float(pgsh_sparse_refine_translation_prior_weight),
+                rotation_prior_weight=float(pgsh_sparse_refine_rotation_prior_weight),
+                max_translation_delta_m=float(pgsh_sparse_refine_max_translation_delta_m),
+                max_rotation_delta_deg=float(pgsh_sparse_refine_max_rotation_delta_deg),
+                match_weights=_match_solver_scores(
+                    merged,
+                    mode=str(patch_solver_score_mode),
+                    reference_max_reprojection_px=float(pgsh_reference_match_max_reprojection_px),
+                ),
+            )
+            pose_mix = str(pgsh_sparse_refine_pose_mix or "full")
+            if pose_mix == "rotation_only":
+                candidate_center, _candidate_rotation = _camera_center_rotation(pre_refine_pose)
+                _refined_center, refined_rotation = _camera_center_rotation(refined_pose)
+                candidate_pgsh_pose = _pose_from_center_rotation(candidate_center, refined_rotation)
+            elif pose_mix == "full":
+                candidate_pgsh_pose = refined_pose
+            else:
+                raise ValueError("pgsh_sparse_refine_pose_mix must be 'full' or 'rotation_only'")
+            inlier_threshold = (
+                float(patch_pnp_reprojection_error)
+                if float(patch_pnp_reprojection_error) > 0.0
+                else float(ctx["localizer"].config["sparse"]["reprojection_error"])
+            )
+            refined_errors = _reprojection_errors(
+                query_xy=np.asarray(merged["xy"], dtype=np.float32).reshape(-1, 2),
+                points_world=np.asarray(merged["xyz"], dtype=np.float32).reshape(-1, 3),
+                pose_w2c=np.asarray(candidate_pgsh_pose, dtype=np.float32).reshape(4, 4),
+                intrinsic=np.asarray(base_sparse["K"], dtype=np.float32).reshape(3, 3),
+                width=int(base_sparse["width"]),
+                height=int(base_sparse["height"]),
+            )
+            candidate_pgsh_inliers = np.flatnonzero(np.isfinite(refined_errors) & (refined_errors <= inlier_threshold)).astype(np.int32)
+            sparse_reference_local_refine_diag = dict(sparse_reference_local_refine_diag or {})
+            sparse_reference_local_refine_diag.update(
+                {
+                    "enabled": True,
+                    "pose_mix": pose_mix,
+                    "inlier_threshold_px": float(inlier_threshold),
+                    "inlier_count_after_refine": int(candidate_pgsh_inliers.shape[0]),
+                    "after_solver_median_reprojection_error_px": (
+                        float(np.median(refined_errors[candidate_pgsh_inliers])) if candidate_pgsh_inliers.size else None
+                    ),
+                }
+            )
     elif pgsh_decision == "use_patch_guided_sparse":
         pgsh_decision = "fallback_base_no_pose_consistent_patch_group"
     final_inlier_count = int(np.asarray(candidate_pgsh_inliers).reshape(-1).shape[0])
@@ -1425,34 +1937,6 @@ def analyze_case(
 
     case_name = f"{scene}_{int(query_index if query_index is not None else 0):05d}_{Path(str(camera.image_name)).stem}"
     case_dir = output_dir / scene / case_name
-    query_pil = _tensor_to_image(query_image, size=(int(base_sparse["width"]), int(base_sparse["height"])))
-    base_render_pkg = ctx["stdloc"].render_from_pose_gsplat(
-        ctx["localizer"].gaussians,
-        torch.tensor(base_sparse["pose_w2c"], device="cuda"),
-        camera.FoVx,
-        camera.FoVy,
-        int(base_sparse["width"]),
-        int(base_sparse["height"]),
-        render_mode="RGB+ED",
-        rgb_only=True,
-        norm_feat_bf_render=ctx["config"]["dense"]["norm_before_render"],
-        rasterize_mode="antialiased",
-    )
-    pgsh_render_pkg = ctx["stdloc"].render_from_pose_gsplat(
-        ctx["localizer"].gaussians,
-        torch.tensor(pgsh_sparse["pose_w2c"], device="cuda"),
-        camera.FoVx,
-        camera.FoVy,
-        int(base_sparse["width"]),
-        int(base_sparse["height"]),
-        render_mode="RGB+ED",
-        rgb_only=True,
-        norm_feat_bf_render=ctx["config"]["dense"]["norm_before_render"],
-        rasterize_mode="antialiased",
-    )
-    base_render = _tensor_to_image(base_render_pkg["render"], size=query_pil.size)
-    pgsh_render = _tensor_to_image(pgsh_render_pkg["render"], size=query_pil.size)
-
     base_summary, base_ref_xy, base_errors, base_inlier_mask, base_good = _summarize_sparse_pose(
         base_sparse,
         gt_w2c=gt_w2c,
@@ -1470,37 +1954,70 @@ def analyze_case(
     base_sparse_path = case_dir / "base_sparse_matches.jpg"
     pgsh_sparse_path = case_dir / "pgsh_sparse_matches.jpg"
     patch_overlay_path = case_dir / "pgsh_patch_overlay.jpg"
-    draw_match_canvas(
-        query_pil,
-        base_render,
-        query_xy=base_sparse["query_xy"],
-        reference_xy=base_ref_xy,
-        gt_good_mask=base_good,
-        solver_inlier_mask=base_inlier_mask,
-        output_path=base_sparse_path,
-        max_draw=int(max_draw),
-    )
-    draw_match_canvas(
-        query_pil,
-        pgsh_render,
-        query_xy=pgsh_sparse["query_xy"],
-        reference_xy=pgsh_ref_xy,
-        gt_good_mask=pgsh_good,
-        solver_inlier_mask=pgsh_inlier_mask,
-        output_path=pgsh_sparse_path,
-        max_draw=int(max_draw),
-    )
-    _draw_patch_overlay(query_pil, patches, set(group.patch_ids), hypothesis_rows, patch_overlay_path)
+    query_pil: Image.Image | None = None
+    if not bool(skip_visualization):
+        query_pil = _tensor_to_image(query_image, size=(int(base_sparse["width"]), int(base_sparse["height"])))
+        base_render_pkg = ctx["stdloc"].render_from_pose_gsplat(
+            ctx["localizer"].gaussians,
+            torch.tensor(base_sparse["pose_w2c"], device="cuda"),
+            camera.FoVx,
+            camera.FoVy,
+            int(base_sparse["width"]),
+            int(base_sparse["height"]),
+            render_mode="RGB+ED",
+            rgb_only=True,
+            norm_feat_bf_render=ctx["config"]["dense"]["norm_before_render"],
+            rasterize_mode="antialiased",
+        )
+        pgsh_render_pkg = ctx["stdloc"].render_from_pose_gsplat(
+            ctx["localizer"].gaussians,
+            torch.tensor(pgsh_sparse["pose_w2c"], device="cuda"),
+            camera.FoVx,
+            camera.FoVy,
+            int(base_sparse["width"]),
+            int(base_sparse["height"]),
+            render_mode="RGB+ED",
+            rgb_only=True,
+            norm_feat_bf_render=ctx["config"]["dense"]["norm_before_render"],
+            rasterize_mode="antialiased",
+        )
+        base_render = _tensor_to_image(base_render_pkg["render"], size=query_pil.size)
+        pgsh_render = _tensor_to_image(pgsh_render_pkg["render"], size=query_pil.size)
+        draw_match_canvas(
+            query_pil,
+            base_render,
+            query_xy=base_sparse["query_xy"],
+            reference_xy=base_ref_xy,
+            gt_good_mask=base_good,
+            solver_inlier_mask=base_inlier_mask,
+            output_path=base_sparse_path,
+            max_draw=int(max_draw),
+        )
+        draw_match_canvas(
+            query_pil,
+            pgsh_render,
+            query_xy=pgsh_sparse["query_xy"],
+            reference_xy=pgsh_ref_xy,
+            gt_good_mask=pgsh_good,
+            solver_inlier_mask=pgsh_inlier_mask,
+            output_path=pgsh_sparse_path,
+            max_draw=int(max_draw),
+        )
+        _draw_patch_overlay(query_pil, patches, set(group.patch_ids), hypothesis_rows, patch_overlay_path)
     _write_matches_csv(case_dir / "base_sparse_matches.csv", base_sparse["query_xy"], base_ref_xy, base_errors, base_inlier_mask, base_good)
     _write_matches_csv(case_dir / "pgsh_sparse_matches.csv", pgsh_sparse["query_xy"], pgsh_ref_xy, pgsh_errors, pgsh_inlier_mask, pgsh_good)
     _write_hypotheses_csv(case_dir / "patch_hypotheses.csv", hypothesis_rows)
 
     dense_summary: dict[str, Any] = {}
-    sheet_items: list[tuple[str, Path]] = [
-        ("patch overlay", patch_overlay_path),
-        ("base sparse", base_sparse_path),
-        ("PGSH sparse", pgsh_sparse_path),
-    ]
+    sheet_items: list[tuple[str, Path]] = []
+    if not bool(skip_visualization):
+        sheet_items.extend(
+            [
+                ("patch overlay", patch_overlay_path),
+                ("base sparse", base_sparse_path),
+                ("PGSH sparse", pgsh_sparse_path),
+            ]
+        )
     if bool(run_dense):
         with torch.no_grad():
             base_dense = _capture_dense(
@@ -1558,26 +2075,27 @@ def analyze_case(
         )
         base_dense_path = case_dir / "base_dense_matches.jpg"
         pgsh_dense_path = case_dir / "pgsh_sparse_then_dense_matches.jpg"
-        draw_match_canvas(
-            query_pil,
-            _tensor_to_image(base_dense["render"], size=query_pil.size),
-            query_xy=base_dense["query_xy"],
-            reference_xy=base_dense.get("rendered_xy", np.empty((0, 2), dtype=np.float32)),
-            gt_good_mask=base_dense_good,
-            solver_inlier_mask=base_dense_inlier_mask,
-            output_path=base_dense_path,
-            max_draw=int(max_draw),
-        )
-        draw_match_canvas(
-            query_pil,
-            _tensor_to_image(pgsh_dense["render"], size=query_pil.size),
-            query_xy=pgsh_dense["query_xy"],
-            reference_xy=pgsh_dense.get("rendered_xy", np.empty((0, 2), dtype=np.float32)),
-            gt_good_mask=pgsh_dense_good,
-            solver_inlier_mask=pgsh_dense_inlier_mask,
-            output_path=pgsh_dense_path,
-            max_draw=int(max_draw),
-        )
+        if not bool(skip_visualization) and query_pil is not None:
+            draw_match_canvas(
+                query_pil,
+                _tensor_to_image(base_dense["render"], size=query_pil.size),
+                query_xy=base_dense["query_xy"],
+                reference_xy=base_dense.get("rendered_xy", np.empty((0, 2), dtype=np.float32)),
+                gt_good_mask=base_dense_good,
+                solver_inlier_mask=base_dense_inlier_mask,
+                output_path=base_dense_path,
+                max_draw=int(max_draw),
+            )
+            draw_match_canvas(
+                query_pil,
+                _tensor_to_image(pgsh_dense["render"], size=query_pil.size),
+                query_xy=pgsh_dense["query_xy"],
+                reference_xy=pgsh_dense.get("rendered_xy", np.empty((0, 2), dtype=np.float32)),
+                gt_good_mask=pgsh_dense_good,
+                solver_inlier_mask=pgsh_dense_inlier_mask,
+                output_path=pgsh_dense_path,
+                max_draw=int(max_draw),
+            )
         _write_matches_csv(
             case_dir / "base_dense_matches.csv",
             base_dense["query_xy"],
@@ -1594,12 +2112,13 @@ def analyze_case(
             pgsh_dense_inlier_mask,
             pgsh_dense_good,
         )
-        sheet_items.extend(
-            [
-                ("base sparse-conditioned dense", base_dense_path),
-                ("PGSH sparse then dense", pgsh_dense_path),
-            ]
-        )
+        if not bool(skip_visualization):
+            sheet_items.extend(
+                [
+                    ("base sparse-conditioned dense", base_dense_path),
+                    ("PGSH sparse then dense", pgsh_dense_path),
+                ]
+            )
 
         dense_pgsh_summary: dict[str, Any] = {"enabled": bool(dense_pgsh)}
         if bool(dense_pgsh):
@@ -1851,17 +2370,18 @@ def analyze_case(
             )
             dense_pgsh_path = case_dir / "dense_pgsh_matches.jpg"
             dense_patch_overlay_path = case_dir / "dense_pgsh_patch_overlay.jpg"
-            draw_match_canvas(
-                query_pil,
-                _tensor_to_image(dense_pgsh_capture["render"], size=query_pil.size),
-                query_xy=dense_pgsh_capture["query_xy"],
-                reference_xy=dense_pgsh_capture.get("rendered_xy", np.empty((0, 2), dtype=np.float32)),
-                gt_good_mask=dense_pgsh_good,
-                solver_inlier_mask=dense_pgsh_inlier_mask,
-                output_path=dense_pgsh_path,
-                max_draw=int(max_draw),
-            )
-            _draw_patch_overlay(query_pil, patches, set(dense_group.patch_ids), dense_rows, dense_patch_overlay_path)
+            if not bool(skip_visualization) and query_pil is not None:
+                draw_match_canvas(
+                    query_pil,
+                    _tensor_to_image(dense_pgsh_capture["render"], size=query_pil.size),
+                    query_xy=dense_pgsh_capture["query_xy"],
+                    reference_xy=dense_pgsh_capture.get("rendered_xy", np.empty((0, 2), dtype=np.float32)),
+                    gt_good_mask=dense_pgsh_good,
+                    solver_inlier_mask=dense_pgsh_inlier_mask,
+                    output_path=dense_pgsh_path,
+                    max_draw=int(max_draw),
+                )
+                _draw_patch_overlay(query_pil, patches, set(dense_group.patch_ids), dense_rows, dense_patch_overlay_path)
             _write_matches_csv(
                 case_dir / "dense_pgsh_matches.csv",
                 dense_pgsh_capture["query_xy"],
@@ -1871,12 +2391,13 @@ def analyze_case(
                 dense_pgsh_good,
             )
             _write_hypotheses_csv(case_dir / "dense_patch_hypotheses.csv", dense_rows)
-            sheet_items.extend(
-                [
-                    ("dense PGSH patch overlay", dense_patch_overlay_path),
-                    ("dense-only PGSH", dense_pgsh_path),
-                ]
-            )
+            if not bool(skip_visualization):
+                sheet_items.extend(
+                    [
+                        ("dense PGSH patch overlay", dense_patch_overlay_path),
+                        ("dense-only PGSH", dense_pgsh_path),
+                    ]
+                )
             dense_pgsh_summary = {
                 "enabled": True,
                 "decision": dense_pgsh_decision,
@@ -1938,7 +2459,8 @@ def analyze_case(
             },
         }
     sheet_path = case_dir / "pgsh_contact_sheet.jpg"
-    _make_contact_sheet(sheet_items, sheet_path)
+    if not bool(skip_visualization):
+        _make_contact_sheet(sheet_items, sheet_path)
 
     summary = {
         "schema": "loc_gs_patch_guided_sparse_diagnostic_v1",
@@ -1958,6 +2480,15 @@ def analyze_case(
             "patch_dual_softmax": str(patch_dual_softmax),
             "patch_mnn_match": str(patch_mnn_match),
             "patch_match_threshold": patch_match_threshold,
+            "patch_match_second_best_margin": float(patch_match_second_best_margin),
+            "patch_match_best_per_landmark": bool(patch_match_best_per_landmark),
+            "patch_match_max_matches": int(patch_match_max_matches),
+            "patch_match_quality_min_keep": int(patch_match_quality_min_keep),
+            "patch_semantic_mask_mode": str(patch_semantic_mask_mode),
+            "patch_semantic_mask": semantic_mask_audit,
+            "pgsh_patch_score_profile": str(pgsh_patch_score_profile),
+            "pgsh_cluster_rank": str(pgsh_cluster_rank),
+            "patch_solver_score_mode": str(patch_solver_score_mode),
             "pgsh_detector_score_weight": float(pgsh_detector_score_weight),
             "min_patch_matches": int(min_patch_matches),
             "min_patch_inliers": int(min_patch_inliers),
@@ -1967,18 +2498,35 @@ def analyze_case(
             "patch_pnp_max_iterations": int(patch_pnp_max_iterations),
             "patch_pnp_min_iterations": int(patch_pnp_min_iterations),
             "patch_pnp_solver": str(patch_pnp_solver),
+            "patch_pnp_reprojection_error": float(patch_pnp_reprojection_error),
             "pgsh_global_consistency": bool(pgsh_global_consistency),
             "pgsh_sparse_retention_min_ratio": float(pgsh_sparse_retention_min_ratio),
             "pgsh_sparse_retention_max_error_px": float(pgsh_sparse_retention_max_error_px),
+            "pgsh_sparse_reference_filter_from_base": bool(pgsh_sparse_reference_filter_from_base),
             "pgsh_reference_match_max_reprojection_px": float(pgsh_reference_match_max_reprojection_px),
             "pgsh_reference_match_min_keep": int(pgsh_reference_match_min_keep),
+            "pgsh_sparse_anchor_fusion": bool(pgsh_sparse_anchor_fusion),
+            "pgsh_sparse_anchor_max_reprojection_px": float(pgsh_sparse_anchor_max_reprojection_px),
+            "pgsh_sparse_anchor_max_count": int(pgsh_sparse_anchor_max_count),
+            "pgsh_sparse_anchor_selection": str(pgsh_sparse_anchor_selection),
+            "pgsh_sparse_anchor_grid": int(pgsh_sparse_anchor_grid),
+            "pgsh_sparse_reference_local_refine": bool(pgsh_sparse_reference_local_refine),
+            "pgsh_sparse_refine_max_iterations": int(pgsh_sparse_refine_max_iterations),
+            "pgsh_sparse_refine_loss_scale_px": float(pgsh_sparse_refine_loss_scale_px),
+            "pgsh_sparse_refine_translation_prior_weight": float(pgsh_sparse_refine_translation_prior_weight),
+            "pgsh_sparse_refine_rotation_prior_weight": float(pgsh_sparse_refine_rotation_prior_weight),
+            "pgsh_sparse_refine_max_translation_delta_m": float(pgsh_sparse_refine_max_translation_delta_m),
+            "pgsh_sparse_refine_max_rotation_delta_deg": float(pgsh_sparse_refine_max_rotation_delta_deg),
+            "pgsh_sparse_refine_pose_mix": str(pgsh_sparse_refine_pose_mix),
             "cluster_center_thresh_m": float(cluster_center_thresh_m),
             "cluster_rotation_thresh_deg": float(cluster_rotation_thresh_deg),
             "min_group_patches": int(min_group_patches),
+            "pgsh_group_max_patches": int(pgsh_group_max_patches),
             "min_final_inliers": int(min_final_inliers),
             "pgsh_max_base_inliers_for_override": int(pgsh_max_base_inliers_for_override),
             "pgsh_fallback_to_base": bool(pgsh_fallback_to_base),
             "disable_sparse_pgsh": bool(disable_sparse_pgsh),
+            "skip_visualization": bool(skip_visualization),
             "dense_pgsh": bool(dense_pgsh),
             "anchor_conditioned_patch_dense": bool(dense_pgsh and dense_pgsh_reference_local_refine and float(dense_pgsh_sparse_anchor_weight) > 0.0),
             "dense_pgsh_min_patch_matches": int(dense_pgsh_min_patch_matches),
@@ -2026,6 +2574,8 @@ def analyze_case(
             "merged_match_count": int(selected_merged_match_count),
             "candidate_match_count": int(np.asarray(candidate_matches.get("xy", [])).shape[0]),
         },
+        "sparse_anchor_fusion": sparse_anchor_fusion_diag,
+        "sparse_reference_local_refine": sparse_reference_local_refine_diag,
         "hypotheses": hypothesis_rows,
         "dense": dense_summary,
         "paths": {
@@ -2085,6 +2635,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--patch_dual_softmax", default="native", choices=["native", "on", "off"])
     parser.add_argument("--patch_mnn_match", default="native", choices=["native", "on", "off"])
     parser.add_argument("--patch_match_threshold", type=float, default=None)
+    parser.add_argument("--patch_match_second_best_margin", type=float, default=0.0)
+    parser.add_argument("--patch_match_best_per_landmark", action="store_true")
+    parser.add_argument("--patch_match_max_matches", type=int, default=0)
+    parser.add_argument("--patch_match_quality_min_keep", type=int, default=0)
+    parser.add_argument("--patch_semantic_mask_mode", default="none", choices=["none", "dynamic", "dynamic_sky"])
+    parser.add_argument("--patch_require_semantic_mask", action="store_true")
+    parser.add_argument("--pgsh_patch_score_profile", default="balanced", choices=["balanced", "precision"])
+    parser.add_argument("--pgsh_cluster_rank", default="inlier_count", choices=["inlier_count", "score"])
     parser.add_argument("--pgsh_detector_score_weight", type=float, default=0.0)
     parser.add_argument("--min_patch_matches", type=int, default=24)
     parser.add_argument("--min_patch_inliers", type=int, default=6)
@@ -2093,15 +2651,32 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--base_sparse_min_iterations", type=int, default=0)
     parser.add_argument("--patch_pnp_max_iterations", type=int, default=5000)
     parser.add_argument("--patch_pnp_min_iterations", type=int, default=50)
-    parser.add_argument("--patch_pnp_solver", default="opencv", choices=["opencv", "poselib"])
+    parser.add_argument("--patch_pnp_solver", default="opencv", choices=["opencv", "poselib", "opencv_prosac", "opencv_prosac_magsac"])
+    parser.add_argument("--patch_pnp_reprojection_error", type=float, default=0.0)
+    parser.add_argument("--patch_solver_score_mode", default="native", choices=["native", "descriptor", "reference"])
     parser.add_argument("--disable_pgsh_global_consistency", action="store_true")
     parser.add_argument("--pgsh_sparse_retention_min_ratio", type=float, default=0.70)
     parser.add_argument("--pgsh_sparse_retention_max_error_px", type=float, default=8.0)
+    parser.add_argument("--pgsh_sparse_reference_filter_from_base", action="store_true")
     parser.add_argument("--pgsh_reference_match_max_reprojection_px", type=float, default=0.0)
     parser.add_argument("--pgsh_reference_match_min_keep", type=int, default=4)
+    parser.add_argument("--pgsh_sparse_anchor_fusion", action="store_true")
+    parser.add_argument("--pgsh_sparse_anchor_max_reprojection_px", type=float, default=8.0)
+    parser.add_argument("--pgsh_sparse_anchor_max_count", type=int, default=128)
+    parser.add_argument("--pgsh_sparse_anchor_selection", default="error", choices=["error", "spatial_depth_diverse"])
+    parser.add_argument("--pgsh_sparse_anchor_grid", type=int, default=4)
+    parser.add_argument("--pgsh_sparse_reference_local_refine", action="store_true")
+    parser.add_argument("--pgsh_sparse_refine_max_iterations", type=int, default=50)
+    parser.add_argument("--pgsh_sparse_refine_loss_scale_px", type=float, default=4.0)
+    parser.add_argument("--pgsh_sparse_refine_translation_prior_weight", type=float, default=0.02)
+    parser.add_argument("--pgsh_sparse_refine_rotation_prior_weight", type=float, default=0.20)
+    parser.add_argument("--pgsh_sparse_refine_max_translation_delta_m", type=float, default=2.0)
+    parser.add_argument("--pgsh_sparse_refine_max_rotation_delta_deg", type=float, default=2.0)
+    parser.add_argument("--pgsh_sparse_refine_pose_mix", default="full", choices=["full", "rotation_only"])
     parser.add_argument("--cluster_center_thresh_m", type=float, default=2.0)
     parser.add_argument("--cluster_rotation_thresh_deg", type=float, default=12.0)
     parser.add_argument("--min_group_patches", type=int, default=2)
+    parser.add_argument("--pgsh_group_max_patches", type=int, default=0)
     parser.add_argument("--min_final_inliers", type=int, default=12)
     parser.add_argument("--pgsh_max_base_inliers_for_override", type=int, default=80)
     parser.add_argument("--disable_pgsh_fallback", action="store_true")
@@ -2137,6 +2712,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dense_pgsh_max_rotation_from_base_dense_deg", type=float, default=3.0)
     parser.add_argument("--good_px", type=float, default=5.0)
     parser.add_argument("--max_draw", type=int, default=350)
+    parser.add_argument("--skip_visualization", action="store_true")
     from loc_gs.scripts.visualize_stdloc_hard_matches import build_argparser as build_match_argparser
 
     match_parser = build_match_argparser()
@@ -2180,6 +2756,15 @@ def main(argv: list[str] | None = None) -> int:
         patch_dual_softmax=str(args.patch_dual_softmax),
         patch_mnn_match=str(args.patch_mnn_match),
         patch_match_threshold=args.patch_match_threshold,
+        patch_match_second_best_margin=float(args.patch_match_second_best_margin),
+        patch_match_best_per_landmark=bool(args.patch_match_best_per_landmark),
+        patch_match_max_matches=int(args.patch_match_max_matches),
+        patch_match_quality_min_keep=int(args.patch_match_quality_min_keep),
+        patch_semantic_mask_mode=str(args.patch_semantic_mask_mode),
+        patch_require_semantic_mask=bool(args.patch_require_semantic_mask),
+        pgsh_patch_score_profile=str(args.pgsh_patch_score_profile),
+        pgsh_cluster_rank=str(args.pgsh_cluster_rank),
+        patch_solver_score_mode=str(args.patch_solver_score_mode),
         pgsh_detector_score_weight=float(args.pgsh_detector_score_weight),
         min_patch_matches=int(args.min_patch_matches),
         min_patch_inliers=int(args.min_patch_inliers),
@@ -2189,14 +2774,30 @@ def main(argv: list[str] | None = None) -> int:
         patch_pnp_max_iterations=int(args.patch_pnp_max_iterations),
         patch_pnp_min_iterations=int(args.patch_pnp_min_iterations),
         patch_pnp_solver=str(args.patch_pnp_solver),
+        patch_pnp_reprojection_error=float(args.patch_pnp_reprojection_error),
         pgsh_global_consistency=not bool(args.disable_pgsh_global_consistency),
         pgsh_sparse_retention_min_ratio=float(args.pgsh_sparse_retention_min_ratio),
         pgsh_sparse_retention_max_error_px=float(args.pgsh_sparse_retention_max_error_px),
+        pgsh_sparse_reference_filter_from_base=bool(args.pgsh_sparse_reference_filter_from_base),
         pgsh_reference_match_max_reprojection_px=float(args.pgsh_reference_match_max_reprojection_px),
         pgsh_reference_match_min_keep=int(args.pgsh_reference_match_min_keep),
+        pgsh_sparse_anchor_fusion=bool(args.pgsh_sparse_anchor_fusion),
+        pgsh_sparse_anchor_max_reprojection_px=float(args.pgsh_sparse_anchor_max_reprojection_px),
+        pgsh_sparse_anchor_max_count=int(args.pgsh_sparse_anchor_max_count),
+        pgsh_sparse_anchor_selection=str(args.pgsh_sparse_anchor_selection),
+        pgsh_sparse_anchor_grid=int(args.pgsh_sparse_anchor_grid),
+        pgsh_sparse_reference_local_refine=bool(args.pgsh_sparse_reference_local_refine),
+        pgsh_sparse_refine_max_iterations=int(args.pgsh_sparse_refine_max_iterations),
+        pgsh_sparse_refine_loss_scale_px=float(args.pgsh_sparse_refine_loss_scale_px),
+        pgsh_sparse_refine_translation_prior_weight=float(args.pgsh_sparse_refine_translation_prior_weight),
+        pgsh_sparse_refine_rotation_prior_weight=float(args.pgsh_sparse_refine_rotation_prior_weight),
+        pgsh_sparse_refine_max_translation_delta_m=float(args.pgsh_sparse_refine_max_translation_delta_m),
+        pgsh_sparse_refine_max_rotation_delta_deg=float(args.pgsh_sparse_refine_max_rotation_delta_deg),
+        pgsh_sparse_refine_pose_mix=str(args.pgsh_sparse_refine_pose_mix),
         cluster_center_thresh_m=float(args.cluster_center_thresh_m),
         cluster_rotation_thresh_deg=float(args.cluster_rotation_thresh_deg),
         min_group_patches=int(args.min_group_patches),
+        pgsh_group_max_patches=int(args.pgsh_group_max_patches),
         min_final_inliers=int(args.min_final_inliers),
         pgsh_max_base_inliers_for_override=int(args.pgsh_max_base_inliers_for_override),
         pgsh_fallback_to_base=not bool(args.disable_pgsh_fallback),
@@ -2230,6 +2831,7 @@ def main(argv: list[str] | None = None) -> int:
         dense_pgsh_max_rotation_from_base_dense_deg=float(args.dense_pgsh_max_rotation_from_base_dense_deg),
         good_px=float(args.good_px),
         max_draw=int(args.max_draw),
+        skip_visualization=bool(args.skip_visualization),
         slcdp_options=slcdp_options,
     )
     return 0

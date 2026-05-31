@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -19,6 +20,10 @@ import torch
 
 torch.set_num_threads(max(1, int(os.environ.get("OMP_NUM_THREADS", "4"))))
 
+from loc_gs.dense_support.sparse_anchor_residual import (
+    SparseAnchorResidualPolicy,
+    compute_sparse_anchor_residual_group,
+)
 from loc_gs.scripts.visualize_stdloc_hard_matches import (
     _build_context,
     _capture_dense,
@@ -153,6 +158,55 @@ def summarize_comparison(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _camera_center(pose_w2c: np.ndarray) -> np.ndarray:
+    pose = np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
+    rotation = pose[:3, :3]
+    translation = pose[:3, 3]
+    return -rotation.T @ translation
+
+
+def _rotation_delta_deg(reference_w2c: np.ndarray, candidate_w2c: np.ndarray) -> float:
+    reference = np.asarray(reference_w2c, dtype=np.float64).reshape(4, 4)
+    candidate = np.asarray(candidate_w2c, dtype=np.float64).reshape(4, 4)
+    relative = candidate[:3, :3] @ reference[:3, :3].T
+    cos_angle = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def _pose_delta_fields(prefix: str, reference_w2c: np.ndarray, candidate_w2c: np.ndarray) -> dict[str, float]:
+    return {
+        f"{prefix}_translation_delta_m": float(np.linalg.norm(_camera_center(candidate_w2c) - _camera_center(reference_w2c))),
+        f"{prefix}_rotation_delta_deg": _rotation_delta_deg(reference_w2c, candidate_w2c),
+    }
+
+
+def _sparse_anchor_residual_fields(
+    prefix: str,
+    *,
+    pose_w2c: np.ndarray,
+    sparse_capture: Mapping[str, Any],
+    image_size: tuple[int, int],
+) -> dict[str, Any]:
+    anchors = {
+        "query_xy": sparse_capture.get("query_xy", np.empty((0, 2), dtype=np.float32)),
+        "p3d": sparse_capture.get("p3d", np.empty((0, 3), dtype=np.float32)),
+        "inliers": sparse_capture.get("inliers", np.empty((0,), dtype=np.int32)),
+    }
+    residual = compute_sparse_anchor_residual_group(
+        anchors,
+        pose_w2c=np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4),
+        intrinsic=np.asarray(sparse_capture.get("K"), dtype=np.float64).reshape(3, 3),
+        image_size=(int(image_size[0]), int(image_size[1])),
+        policy=SparseAnchorResidualPolicy(max_anchor_count=256),
+    )
+    return {
+        f"{prefix}_anchor_valid_count": residual.get("valid_anchor_count"),
+        f"{prefix}_anchor_median_px": residual.get("median_error_px"),
+        f"{prefix}_anchor_p90_px": residual.get("p90_error_px"),
+        f"{prefix}_anchor_group_loss": residual.get("group_loss"),
+    }
+
+
 def _fixed_options(
     render_control: str,
     *,
@@ -162,6 +216,16 @@ def _fixed_options(
     apd_anchor_group_weight: float = 1.0,
     apd_max_translation_delta_m: float = 0.0,
     apd_max_rotation_delta_deg: float = 0.0,
+    apd_anchor_monotonic: bool = False,
+    apd_anchor_monotonic_epsilon_px: float = 1.0,
+    apd_use_refined_pose: bool = False,
+    apd_risk_weighted: bool = False,
+    apd_risk_max_beta: float = 1.0,
+    apd_no_regression_gate: bool = True,
+    apd_gate_min_inlier_ratio_delta: float = 0.02,
+    apd_gate_max_median_reproj_increase_px: float = 1.0,
+    apd_gate_max_p90_reproj_increase_px: float = 3.0,
+    apd_gate_min_inlier_count_ratio: float = 0.90,
 ) -> dict[str, Any]:
     parser = argparse.ArgumentParser(add_help=False)
     from loc_gs.scripts.visualize_stdloc_hard_matches import build_argparser as build_visualizer_argparser
@@ -172,6 +236,14 @@ def _fixed_options(
         argv.append("--apd_dense")
     if bool(apd_include_patch_candidates):
         argv.append("--apd_include_patch_candidates")
+    if bool(apd_anchor_monotonic):
+        argv.append("--apd_anchor_monotonic")
+    if bool(apd_use_refined_pose):
+        argv.append("--apd_use_refined_pose")
+    if bool(apd_risk_weighted):
+        argv.append("--apd_risk_weighted")
+    if not bool(apd_no_regression_gate):
+        argv.append("--no_apd_no_regression_gate")
     argv.extend(
         [
             "--apd_dense_group_weight",
@@ -182,6 +254,18 @@ def _fixed_options(
             str(float(apd_max_translation_delta_m)),
             "--apd_max_rotation_delta_deg",
             str(float(apd_max_rotation_delta_deg)),
+            "--apd_anchor_monotonic_epsilon_px",
+            str(float(apd_anchor_monotonic_epsilon_px)),
+            "--apd_risk_max_beta",
+            str(float(apd_risk_max_beta)),
+            "--apd_gate_min_inlier_ratio_delta",
+            str(float(apd_gate_min_inlier_ratio_delta)),
+            "--apd_gate_max_median_reproj_increase_px",
+            str(float(apd_gate_max_median_reproj_increase_px)),
+            "--apd_gate_max_p90_reproj_increase_px",
+            str(float(apd_gate_max_p90_reproj_increase_px)),
+            "--apd_gate_min_inlier_count_ratio",
+            str(float(apd_gate_min_inlier_count_ratio)),
         ]
     )
     args = parser.parse_args(argv)
@@ -190,6 +274,35 @@ def _fixed_options(
 
 def _scene_output_dir(output_dir: Path, scene: str) -> Path:
     return output_dir / scene
+
+
+def _read_case_rows(
+    paths: Sequence[str],
+    *,
+    case_types: Sequence[str],
+    phase0_split: str,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    selected_types = {str(item) for item in case_types if str(item)}
+    selected_phase0 = str(phase0_split)
+    by_scene: dict[str, dict[str, dict[str, Any]]] = {}
+    for raw_path in paths:
+        path = Path(raw_path)
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if selected_types and str(row.get("case_type", "")) not in selected_types:
+                    continue
+                if selected_phase0 != "all" and str(row.get("phase0_split", "")) != selected_phase0:
+                    continue
+                if str(row.get("source_split", "unknown")) == "test":
+                    raise ValueError(
+                        "case_csv contains official test rows; this evaluator is for train/self-map diagnostics"
+                    )
+                scene = str(row.get("scene", ""))
+                image_name = str(row.get("image_name", ""))
+                if not scene or not image_name:
+                    continue
+                by_scene.setdefault(scene, {})[image_name] = dict(row)
+    return by_scene
 
 
 def _resume_rows(scene_dir: Path, cameras: Sequence[Any], *, resume_partial: bool) -> list[dict[str, Any]]:
@@ -254,6 +367,17 @@ def evaluate_scene(
     apd_anchor_group_weight: float = 1.0,
     apd_max_translation_delta_m: float = 0.0,
     apd_max_rotation_delta_deg: float = 0.0,
+    apd_anchor_monotonic: bool = False,
+    apd_anchor_monotonic_epsilon_px: float = 1.0,
+    apd_use_refined_pose: bool = False,
+    apd_risk_weighted: bool = False,
+    apd_risk_max_beta: float = 1.0,
+    apd_no_regression_gate: bool = True,
+    apd_gate_min_inlier_ratio_delta: float = 0.02,
+    apd_gate_max_median_reproj_increase_px: float = 1.0,
+    apd_gate_max_p90_reproj_increase_px: float = 3.0,
+    apd_gate_min_inlier_count_ratio: float = 0.90,
+    case_rows_by_image: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     _preload_render_backend()
     run_dir = candidate_root / scene
@@ -267,6 +391,16 @@ def evaluate_scene(
         apd_anchor_group_weight=float(apd_anchor_group_weight),
         apd_max_translation_delta_m=float(apd_max_translation_delta_m),
         apd_max_rotation_delta_deg=float(apd_max_rotation_delta_deg),
+        apd_anchor_monotonic=bool(apd_anchor_monotonic),
+        apd_anchor_monotonic_epsilon_px=float(apd_anchor_monotonic_epsilon_px),
+        apd_use_refined_pose=bool(apd_use_refined_pose),
+        apd_risk_weighted=bool(apd_risk_weighted),
+        apd_risk_max_beta=float(apd_risk_max_beta),
+        apd_no_regression_gate=bool(apd_no_regression_gate),
+        apd_gate_min_inlier_ratio_delta=float(apd_gate_min_inlier_ratio_delta),
+        apd_gate_max_median_reproj_increase_px=float(apd_gate_max_median_reproj_increase_px),
+        apd_gate_max_p90_reproj_increase_px=float(apd_gate_max_p90_reproj_increase_px),
+        apd_gate_min_inlier_count_ratio=float(apd_gate_min_inlier_count_ratio),
     )
     cameras = ctx["cameras"]
     total_selected = _selected_camera_count(
@@ -279,14 +413,19 @@ def evaluate_scene(
     resume_start_index = int(len(rows))
     start = time.time()
     selected_index = 0
+    case_rows_by_image = dict(case_rows_by_image or {})
+    use_case_filter = bool(case_rows_by_image)
     for raw_index, camera in enumerate(cameras):
         if int(query_stride) > 1 and raw_index % int(query_stride) != 0:
+            continue
+        image_name = str(getattr(camera, "image_name"))
+        if use_case_filter and image_name not in case_rows_by_image:
             continue
         if int(max_queries) > 0 and selected_index >= int(max_queries):
             break
         if selected_index < resume_start_index:
             expected_name = str(rows[selected_index].get("image_name"))
-            actual_name = str(getattr(camera, "image_name"))
+            actual_name = image_name
             if actual_name != expected_name:
                 raise ValueError(
                     f"Partial row {selected_index} image_name={expected_name!r} "
@@ -294,7 +433,8 @@ def evaluate_scene(
                 )
             selected_index += 1
             continue
-        index = selected_index
+        index = raw_index if use_case_filter else selected_index
+        case_row = case_rows_by_image.get(image_name, {})
         query_image = camera.original_image.to("cuda")
         gt_w2c = camera.world_view_transform.transpose(0, 1).detach().cpu().numpy()
         with torch.no_grad():
@@ -327,23 +467,52 @@ def evaluate_scene(
         clean_render_selection = (controlled_dense.get("slcdp_repair_search") or {}).get("clean_render_generation") or {}
         render_control = controlled_dense.get("slcdp_render_control") or {}
         dense_quality = controlled_dense.get("dense_pose_quality") or {}
+        base_dense_quality = base_dense.get("dense_pose_quality") or {}
         apd_info = controlled_dense.get("apd_dense") or {}
+        apd_monotonic = ((apd_info.get("diagnostics") or {}).get("anchor_monotonic") or {})
+        apd_switch = controlled_dense.get("apd_pose_switch") or {}
         selected_label = render_control.get("candidate_label")
         if selected_label is None:
             selected_label = clean_render_selection.get("selected_label", "base")
+        image_size = (int(sparse.get("width")), int(sparse.get("height")))
+        sparse_anchor_fields = _sparse_anchor_residual_fields(
+            "sparse_pose",
+            pose_w2c=sparse["pose_w2c"],
+            sparse_capture=sparse,
+            image_size=image_size,
+        )
+        base_anchor_fields = _sparse_anchor_residual_fields(
+            "base_dense_pose",
+            pose_w2c=base_dense["pose_w2c"],
+            sparse_capture=sparse,
+            image_size=image_size,
+        )
+        controlled_anchor_fields = _sparse_anchor_residual_fields(
+            "controlled_dense_pose",
+            pose_w2c=controlled_dense["pose_w2c"],
+            sparse_capture=sparse,
+            image_size=image_size,
+        )
         rows.append(
             {
                 "scene": scene,
                 "split": eval_split,
                 "candidate_method": "apd_dense" if bool(apd_dense) else str(candidate_render_control),
                 "query_index": int(index),
-                "image_name": str(camera.image_name),
+                "image_name": image_name,
+                "case_type": case_row.get("case_type"),
+                "phase0_split": case_row.get("phase0_split"),
                 "sparse_te_cm": sparse_te,
                 "sparse_re_deg": sparse_re,
                 "sparse_inlier_count": int(np.asarray(sparse.get("inliers", [])).reshape(-1).shape[0]),
                 "base_dense_te_cm": base_te,
                 "base_dense_re_deg": base_re,
                 "base_dense_inlier_count": int(np.asarray(base_dense.get("inliers", [])).reshape(-1).shape[0]),
+                "base_dense_pose_match_count": base_dense_quality.get("match_count"),
+                "base_dense_pose_solver_inlier_count": base_dense_quality.get("solver_inlier_count"),
+                "base_dense_pose_solver_inlier_ratio": base_dense_quality.get("solver_inlier_ratio"),
+                "base_dense_pose_median_reprojection_error_px": base_dense_quality.get("median_reprojection_error_px"),
+                "base_dense_pose_p90_reprojection_error_px": base_dense_quality.get("p90_reprojection_error_px"),
                 "sparse_conditioned_dense_te_cm": controlled_te,
                 "sparse_conditioned_dense_re_deg": controlled_re,
                 "sparse_conditioned_dense_inlier_count": int(np.asarray(controlled_dense.get("inliers", [])).reshape(-1).shape[0]),
@@ -363,11 +532,24 @@ def evaluate_scene(
                 "apd_num_clean_render_candidates": apd_info.get("num_clean_render_candidates"),
                 "apd_num_patch_candidates": apd_info.get("num_patch_candidates"),
                 "apd_num_anchor_residuals": apd_info.get("num_anchor_residuals"),
+                "apd_anchor_monotonic_selected_alpha": apd_monotonic.get("selected_alpha"),
+                "apd_anchor_monotonic_reason": apd_monotonic.get("reason"),
+                "apd_anchor_monotonic_sparse_anchor_median_px": apd_monotonic.get("sparse_anchor_median_px"),
+                "apd_anchor_monotonic_selected_anchor_median_px": apd_monotonic.get("selected_anchor_median_px"),
+                "apd_pose_switch_mode": apd_switch.get("mode"),
+                "apd_pose_switch_beta": apd_switch.get("beta"),
+                "apd_pose_switch_risk": apd_switch.get("risk"),
+                "apd_pose_switch_accept_apd_pose": apd_switch.get("accept_apd_pose"),
                 "dense_pose_match_count": dense_quality.get("match_count"),
                 "dense_pose_solver_inlier_count": dense_quality.get("solver_inlier_count"),
                 "dense_pose_solver_inlier_ratio": dense_quality.get("solver_inlier_ratio"),
                 "dense_pose_median_reprojection_error_px": dense_quality.get("median_reprojection_error_px"),
                 "dense_pose_p90_reprojection_error_px": dense_quality.get("p90_reprojection_error_px"),
+                **_pose_delta_fields("base_dense_vs_sparse", sparse["pose_w2c"], base_dense["pose_w2c"]),
+                **_pose_delta_fields("controlled_dense_vs_sparse", sparse["pose_w2c"], controlled_dense["pose_w2c"]),
+                **sparse_anchor_fields,
+                **base_anchor_fields,
+                **controlled_anchor_fields,
             }
         )
         if (index + 1) % max(1, int(progress_interval)) == 0 or index == 0:
@@ -421,6 +603,8 @@ def evaluate_scene(
             "resume_partial": bool(resume_partial),
             "resume_start_index": int(resume_start_index),
             "diagnostic_only": True,
+            "case_filter_enabled": bool(use_case_filter),
+            "case_filter_count": int(len(case_rows_by_image)),
         },
     )
     (scene_dir / "git_status.txt").write_text(_git_status(), encoding="utf-8")
@@ -488,14 +672,33 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--apd_anchor_group_weight", type=float, default=1.0)
     parser.add_argument("--apd_max_translation_delta_m", type=float, default=0.0)
     parser.add_argument("--apd_max_rotation_delta_deg", type=float, default=0.0)
+    parser.add_argument("--apd_anchor_monotonic", action="store_true")
+    parser.add_argument("--apd_anchor_monotonic_epsilon_px", type=float, default=1.0)
+    parser.add_argument("--apd_use_refined_pose", action="store_true")
+    parser.add_argument("--apd_risk_weighted", action="store_true")
+    parser.add_argument("--apd_risk_max_beta", type=float, default=1.0)
+    parser.add_argument("--apd_no_regression_gate", action="store_true", default=True)
+    parser.add_argument("--no_apd_no_regression_gate", action="store_false", dest="apd_no_regression_gate")
+    parser.add_argument("--apd_gate_min_inlier_ratio_delta", type=float, default=0.02)
+    parser.add_argument("--apd_gate_max_median_reproj_increase_px", type=float, default=1.0)
+    parser.add_argument("--apd_gate_max_p90_reproj_increase_px", type=float, default=3.0)
+    parser.add_argument("--apd_gate_min_inlier_count_ratio", type=float, default=0.90)
+    parser.add_argument("--case_csv", action="append", default=[])
+    parser.add_argument("--case_type", action="append", default=[])
+    parser.add_argument("--phase0_split", choices=["train", "val", "all"], default="all")
     return parser
 
 
 def main(args: argparse.Namespace | None = None) -> int:
     ns = build_argparser().parse_args() if args is None else args
-    scenes = tuple(ns.scene) if ns.scene else CAMBRIDGE_SCENES
     output_dir = Path(ns.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    case_rows = _read_case_rows(
+        list(ns.case_csv),
+        case_types=list(ns.case_type),
+        phase0_split=str(ns.phase0_split),
+    ) if ns.case_csv else {}
+    scenes = tuple(ns.scene) if ns.scene else tuple(sorted(case_rows.keys())) if case_rows else CAMBRIDGE_SCENES
     summaries = [
         evaluate_scene(
             candidate_root=Path(ns.candidate_root),
@@ -513,6 +716,17 @@ def main(args: argparse.Namespace | None = None) -> int:
             apd_anchor_group_weight=float(ns.apd_anchor_group_weight),
             apd_max_translation_delta_m=float(ns.apd_max_translation_delta_m),
             apd_max_rotation_delta_deg=float(ns.apd_max_rotation_delta_deg),
+            apd_anchor_monotonic=bool(ns.apd_anchor_monotonic),
+            apd_anchor_monotonic_epsilon_px=float(ns.apd_anchor_monotonic_epsilon_px),
+            apd_use_refined_pose=bool(ns.apd_use_refined_pose),
+            apd_risk_weighted=bool(ns.apd_risk_weighted),
+            apd_risk_max_beta=float(ns.apd_risk_max_beta),
+            apd_no_regression_gate=bool(ns.apd_no_regression_gate),
+            apd_gate_min_inlier_ratio_delta=float(ns.apd_gate_min_inlier_ratio_delta),
+            apd_gate_max_median_reproj_increase_px=float(ns.apd_gate_max_median_reproj_increase_px),
+            apd_gate_max_p90_reproj_increase_px=float(ns.apd_gate_max_p90_reproj_increase_px),
+            apd_gate_min_inlier_count_ratio=float(ns.apd_gate_min_inlier_count_ratio),
+            case_rows_by_image=case_rows.get(scene, {}),
         )
         for scene in scenes
     ]
