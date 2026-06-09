@@ -113,10 +113,12 @@ def test_solver_consensus_support_builds_expected_tensors_and_metadata(tmp_path)
         "hard_negative_risk",
         "dense_worsen_risk",
         "observed_count",
+        "positive_observed_count",
     ):
         assert artifact[name].shape == (4,)
 
     assert artifact["observed_count"].tolist() == [2, 2, 1, 0]
+    assert artifact["positive_observed_count"].tolist() == [2, 0, 1, 0]
     assert artifact["inlier_consensus"][0] == pytest.approx(1.0)
     assert artifact["inlier_consensus"][1] == pytest.approx(0.0)
     assert artifact["hard_negative_risk"][1] == pytest.approx(1.0)
@@ -146,9 +148,74 @@ def test_solver_consensus_support_is_deterministic(tmp_path):
         "hard_negative_risk",
         "dense_worsen_risk",
         "observed_count",
+        "positive_observed_count",
     ):
         assert torch.equal(first[name], second[name])
     assert first["metadata"] == second["metadata"]
+
+
+def test_solver_consensus_support_can_ignore_non_inlier_matches_for_ulfloc_feedback(tmp_path):
+    bank_path = tmp_path / "feedback_bank.jsonl"
+    records = [
+        _record(
+            0,
+            image_id="seq1/frame00001.png",
+            keypoint_id="kp_good",
+            descriptor_score=0.9,
+            pnp_inlier=True,
+            reprojection_error_px=1.0,
+        ),
+        *[
+            _record(
+                0,
+                image_id="seq1/frame00001.png",
+                keypoint_id=f"kp_bad_{idx}",
+                descriptor_score=0.95,
+                pnp_inlier=False,
+                reprojection_error_px=1200.0,
+                dense_transition="not_run_sparse_feedback",
+                dense_delta_te_cm=0.0,
+            )
+            for idx in range(4)
+        ],
+        _record(
+            1,
+            image_id="seq1/frame00001.png",
+            keypoint_id="kp_bad_only",
+            descriptor_score=0.95,
+            pnp_inlier=False,
+            reprojection_error_px=1200.0,
+            dense_transition="not_run_sparse_feedback",
+            dense_delta_te_cm=0.0,
+        ),
+    ]
+    save_feedback_bank(
+        bank_path,
+        records,
+        {
+            "scene": "ToyScene",
+            "split_name": "selfmap_train",
+            "schema_version": "feedback_bank_v2",
+            "query_id_source": "image_id",
+            "split_audit": {"audit_status": "passed"},
+        },
+    )
+
+    artifact = build_solver_consensus_support(
+        bank_path,
+        num_gaussians=3,
+        support_threshold=0.5,
+        evidence_mode="inlier_positive_only",
+    )
+
+    assert artifact["observed_count"].tolist() == [5, 1, 0]
+    assert artifact["positive_observed_count"].tolist() == [1, 0, 0]
+    assert artifact["support_score"][0] >= 0.5
+    assert artifact["support_score"][1] == pytest.approx(0.0)
+    assert artifact["hard_negative_risk"][0] == pytest.approx(0.0)
+    assert artifact["hard_negative_risk"][1] == pytest.approx(0.0)
+    assert artifact["metadata"]["selected_count"] == 1
+    assert artifact["metadata"]["hyperparameters"]["evidence_mode"] == "inlier_positive_only"
 
 
 def test_build_solver_consensus_support_cli_writes_artifact_and_manifest(tmp_path):

@@ -53,6 +53,27 @@ def test_calibration_parser_defaults_to_baseline_preserving_descriptor_and_rende
     assert args.scene_match_pair_train_fraction == 1.0
     assert args.scene_match_pair_format == "pair"
     assert args.scene_match_pair_max_per_image == 0
+    assert args.landmark_candidate_source == "sampled"
+
+
+def test_calibration_parser_can_build_all_gaussian_pair_cache():
+    args = build_argparser().parse_args(
+        [
+            "--checkpoint",
+            "output/stdloc_hybrid/KingsCollege/latest.pth",
+            "--landmark_candidate_source",
+            "all_gaussians",
+            "--max_landmarks",
+            "200000",
+            "--scene_match_pair_output_path",
+            "output/pairs/KingsCollege/listwise.pt",
+            "--scene_match_pair_format",
+            "listwise",
+        ]
+    )
+
+    assert args.landmark_candidate_source == "all_gaussians"
+    assert args.max_landmarks == 200000
 
 
 def test_select_scene_match_group_indices_can_cap_one_image_contribution():
@@ -110,12 +131,16 @@ def test_query_like_calibration_launcher_can_emit_listwise_pairs():
         scene="KingsCollege",
         checkpoint="output/stdloc_hybrid/KingsCollege/latest.pth",
         output_path="output/calib/KingsCollege/stdloc_bank.pt",
+        landmark_candidate_source="all_gaussians",
+        max_landmarks=200000,
         scene_match_pair_output_path="output/scenematch_pairs/KingsCollege/listwise.pt",
         scene_match_pair_format="listwise",
         scene_match_pair_max_per_image=512,
     )
 
     assert env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert cmd[cmd.index("--landmark_candidate_source") + 1] == "all_gaussians"
+    assert cmd[cmd.index("--max_landmarks") + 1] == "200000"
     assert cmd[cmd.index("--scene_match_pair_output_path") + 1] == "output/scenematch_pairs/KingsCollege/listwise.pt"
     assert cmd[cmd.index("--scene_match_pair_format") + 1] == "listwise"
     assert cmd[cmd.index("--scene_match_pair_max_per_image") + 1] == "512"

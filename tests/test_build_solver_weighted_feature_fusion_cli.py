@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import json
 
 import torch
 import torch.nn.functional as F
@@ -54,6 +55,14 @@ def test_build_solver_weighted_feature_fusion_cli_writes_artifact(tmp_path):
     assert artifact["metadata"]["positive_pair_count"] == 1
     assert artifact["metadata"]["descriptor_mode"] == "solver_weighted_pair_cache_fusion"
     assert artifact["metadata"]["min_observations_per_landmark"] == 1
+    assert (tmp_path / "manifest.json").exists()
+    assert (tmp_path / "metrics_summary.json").exists()
+    assert (tmp_path / "split_audit.json").exists()
+    assert (tmp_path / "command.txt").exists()
+    assert (tmp_path / "git_status.txt").exists()
+    split_audit = json.loads((tmp_path / "split_audit.json").read_text())
+    assert split_audit["test_split_used"] is False
+    assert split_audit["official_test_used"] is False
 
 
 def test_build_solver_weighted_feature_fusion_cli_defaults_to_v9_trust_region(tmp_path):

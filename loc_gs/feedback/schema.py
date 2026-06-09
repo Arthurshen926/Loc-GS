@@ -34,13 +34,36 @@ def _xy_value(value: Any) -> tuple[float | None, float | None]:
     return None, None
 
 
+def _int_pair_value(value: Any) -> tuple[int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        return int(value[0]), int(value[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _vector_value(value: Any, *, length: int) -> tuple[float, ...] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < int(length):
+        return None
+    out: list[float] = []
+    for idx in range(int(length)):
+        item = _float_or_none(value[idx])
+        if item is None:
+            return None
+        out.append(float(item))
+    return tuple(out)
+
+
 @dataclass
 class FeedbackMatchRecord:
     scene: str = ""
+    split_name: str = ""
     query_id: str = ""
     image_id: str = ""
     source_view_id: str = ""
     pose_source: str = ""
+    source_role: str = ""
     keypoint_id: str = ""
     keypoint_xy: tuple[float | None, float | None] = (None, None)
     matched_landmark_id: str = ""
@@ -53,25 +76,43 @@ class FeedbackMatchRecord:
     depth_consistency: float | None = None
     visibility_score: float | None = None
     pose_error_t_cm: float | None = None
+    query_sparse_te_cm: float | None = None
     pose_error_r_deg: float | None = None
     pnp_success: bool = False
+    pose_success: bool = False
     dense_refine_success: bool = False
     dense_transition: str = ""
     dense_delta_te_cm: float | None = None
     jacobian_info_trace: float | None = None
     jacobian_info_logdet_proxy: float | None = None
+    query_xy_norm: tuple[float, float] | None = None
+    bearing: tuple[float, float, float] | None = None
+    camera_xyz: tuple[float, float, float] | None = None
+    depth_m: float | None = None
+    descriptor_margin: float | None = None
+    local_geometry_score: float | None = None
+    ray_artifact_score: float | None = None
+    ray_entropy: float | None = None
+    image_cell: tuple[int, int] | None = None
+    depth_bin: int | None = None
 
     @classmethod
     def from_mapping(cls, item: dict[str, Any] | "FeedbackMatchRecord") -> "FeedbackMatchRecord":
         if isinstance(item, FeedbackMatchRecord):
             return item
         keypoint_xy = _xy_value(item.get("keypoint_xy", item.get("keypoint")))
+        pnp_success = _bool_value(item.get("pnp_success"), default=False)
+        pose_success = _bool_value(item.get("pose_success"), default=pnp_success)
+        pose_error_t_cm = _float_or_none(item.get("pose_error_t_cm"))
+        query_sparse_te_cm = _float_or_none(item.get("query_sparse_te_cm", pose_error_t_cm))
         return cls(
             scene=str(item.get("scene", "")),
+            split_name=str(item.get("split_name", "")),
             query_id=str(item.get("query_id", "")),
             image_id=str(item.get("image_id", "")),
             source_view_id=str(item.get("source_view_id", "")),
             pose_source=str(item.get("pose_source", "")),
+            source_role=str(item.get("source_role", item.get("pose_source", ""))),
             keypoint_id=str(item.get("keypoint_id", "")),
             keypoint_xy=keypoint_xy,
             matched_landmark_id=str(item.get("matched_landmark_id", item.get("landmark_id", ""))),
@@ -83,19 +124,41 @@ class FeedbackMatchRecord:
             reprojection_error_px=_float_or_none(item.get("reprojection_error_px")),
             depth_consistency=_float_or_none(item.get("depth_consistency")),
             visibility_score=_float_or_none(item.get("visibility_score")),
-            pose_error_t_cm=_float_or_none(item.get("pose_error_t_cm")),
+            pose_error_t_cm=pose_error_t_cm,
+            query_sparse_te_cm=query_sparse_te_cm,
             pose_error_r_deg=_float_or_none(item.get("pose_error_r_deg")),
-            pnp_success=_bool_value(item.get("pnp_success"), default=False),
+            pnp_success=pnp_success,
+            pose_success=pose_success,
             dense_refine_success=_bool_value(item.get("dense_refine_success"), default=False),
             dense_transition=str(item.get("dense_transition", "")),
             dense_delta_te_cm=_float_or_none(item.get("dense_delta_te_cm")),
             jacobian_info_trace=_float_or_none(item.get("jacobian_info_trace")),
             jacobian_info_logdet_proxy=_float_or_none(item.get("jacobian_info_logdet_proxy")),
+            query_xy_norm=_vector_value(item.get("query_xy_norm"), length=2),  # type: ignore[arg-type]
+            bearing=_vector_value(item.get("bearing"), length=3),  # type: ignore[arg-type]
+            camera_xyz=_vector_value(item.get("camera_xyz"), length=3),  # type: ignore[arg-type]
+            depth_m=_float_or_none(item.get("depth_m")),
+            descriptor_margin=_float_or_none(item.get("descriptor_margin")),
+            local_geometry_score=_float_or_none(item.get("local_geometry_score")),
+            ray_artifact_score=_float_or_none(item.get("ray_artifact_score")),
+            ray_entropy=_float_or_none(item.get("ray_entropy")),
+            image_cell=_int_pair_value(item.get("image_cell")),
+            depth_bin=None if item.get("depth_bin") is None else _int_value(item.get("depth_bin"), default=-1),
         )
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
         out["keypoint_xy"] = list(self.keypoint_xy)
+        out["landmark_id"] = self.matched_landmark_id
+        out["gaussian_id"] = self.matched_gaussian_id
+        if self.query_xy_norm is not None:
+            out["query_xy_norm"] = list(self.query_xy_norm)
+        if self.bearing is not None:
+            out["bearing"] = list(self.bearing)
+        if self.camera_xyz is not None:
+            out["camera_xyz"] = list(self.camera_xyz)
+        if self.image_cell is not None:
+            out["image_cell"] = list(self.image_cell)
         return out
 
 

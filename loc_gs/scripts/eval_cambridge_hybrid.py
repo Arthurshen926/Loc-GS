@@ -1047,6 +1047,36 @@ def sparse_matchability_metrics(
     return out
 
 
+def sparse_pose_confidence_metrics(
+    query_yx: np.ndarray,
+    points_world: np.ndarray,
+    pose_w2c: np.ndarray,
+    K: np.ndarray,
+    scores: np.ndarray | None = None,
+    margins: np.ndarray | None = None,
+) -> dict[str, float]:
+    """Report query-observable sparse confidence metrics under the estimated pose.
+
+    This intentionally uses the sparse PnP pose, not ground truth. The values are
+    therefore valid inputs for train-only confidence gates or test-time logging.
+    """
+    raw = sparse_matchability_metrics(
+        query_yx,
+        points_world,
+        pose_w2c,
+        K,
+        scores=scores,
+        margins=margins,
+    )
+    out: dict[str, float] = {}
+    for key, value in raw.items():
+        if key.startswith("sparse_"):
+            out[f"sparse_pose_{key[len('sparse_'):]}"] = value
+        else:
+            out[f"sparse_pose_{key}"] = value
+    return out
+
+
 def oracle_reprojection_match_scores_np(
     query_yx: np.ndarray,
     points_world: np.ndarray,
@@ -1549,6 +1579,67 @@ def select_pnp_match_indices(
             max_per_xyz_cell=max_per_xyz_cell,
             min_matches=min_matches,
         )
+    if mode == "ambiguity_aware":
+        eligible = torch.where(valid)[0]
+        candidate_limit = min(
+            int(eligible.numel()),
+            max(min(keep * 8, 8192), min(keep, 8192), 64),
+        )
+        pre_score_all = normalize_score01(score[eligible])
+        candidate_rel = torch.topk(pre_score_all, k=candidate_limit).indices
+        candidate_idx = eligible[candidate_rel]
+        candidate_score = pre_score_all[candidate_rel]
+        geometry = local_geometric_consistency_scores(query[candidate_idx], xyz[candidate_idx], k=6)
+        patch = patch_consensus_scores(
+            query[candidate_idx],
+            xyz[candidate_idx],
+            scores=candidate_score,
+            image_grid_size=image_grid_size,
+            min_patch_matches=max(3, int(min_matches)),
+        )
+        # First-principles sparse ordering: prefer high-confidence pairs that
+        # also preserve local 2D/3D geometry, then enforce image/3D coverage so
+        # one repeated structure cannot dominate a PROSAC prefix.
+        combined = candidate_score + 0.75 * geometry + 0.50 * patch
+        if keep >= 64:
+            # PROSAC/MAGSAC still depends on a strong score prefix.  Coverage
+            # constraints are useful for repeated structures, but making them a
+            # hard global filter can discard most true correspondences in easy
+            # scenes.  Use diversity as a supplement for large match pools.
+            protected_count = min(candidate_limit, max(int(min_matches), int(round(float(keep) * 0.75))))
+            protected_rel = torch.topk(candidate_score, k=protected_count).indices
+            protected_mask = torch.zeros(candidate_limit, dtype=torch.bool, device=device)
+            protected_mask[protected_rel] = True
+            diverse_budget = max(0, min(keep, candidate_limit) - protected_count)
+            if diverse_budget <= 0:
+                return candidate_idx[protected_rel]
+            diverse_rel = _coverage_aware_topk(
+                combined,
+                query[candidate_idx],
+                xyz[candidate_idx],
+                diverse_budget,
+                ~protected_mask,
+                image_grid_size=image_grid_size,
+                xyz_grid_size=xyz_grid_size,
+                max_per_image_cell=max_per_image_cell,
+                max_per_xyz_cell=max_per_xyz_cell,
+                min_matches=0,
+            )
+            merged = _unique_keep_order([protected_rel, diverse_rel], combined, min(keep, candidate_limit))
+            return candidate_idx[merged]
+        local_keep = _coverage_aware_topk(
+            combined,
+            query[candidate_idx],
+            xyz[candidate_idx],
+            min(keep, candidate_limit),
+            torch.ones(candidate_limit, dtype=torch.bool, device=device),
+            image_grid_size=image_grid_size,
+            xyz_grid_size=xyz_grid_size,
+            max_per_image_cell=max_per_image_cell,
+            max_per_xyz_cell=max_per_xyz_cell,
+            min_matches=min_matches,
+        )
+        return candidate_idx[local_keep]
     if mode == "local_geometry":
         eligible = torch.where(valid)[0]
         candidate_limit = min(
@@ -1595,6 +1686,103 @@ def select_pnp_match_indices(
         combined = pre_score[candidate_rel] * geometry
         return candidate_idx[torch.topk(combined, k=min(keep, candidate_limit)).indices]
     raise ValueError(f"Unsupported PnP prefilter mode: {mode}")
+
+
+def bootstrap_consensus_match_filter(
+    query_yx: torch.Tensor,
+    points3d: torch.Tensor,
+    K: torch.Tensor,
+    *,
+    scores: torch.Tensor | None = None,
+    max_matches: int = 0,
+    min_matches: int = 0,
+    reprojection_error: float = 4.0,
+    confidence: float = 0.9999,
+    iterations: int = 10000,
+    min_iterations: int = 0,
+    solver: str = "opencv_prosac_magsac",
+    refine_reprojection_error: float = 0.0,
+    refine_poselib: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Filter sparse matches by a single bootstrap PnP consensus.
+
+    This is not a multi-hypothesis or oracle selector. It uses one fixed
+    high-score bootstrap PnP, then reorders the same query-observable candidate
+    correspondences by how tightly they agree with that bootstrap pose.
+    """
+
+    count = min(int(query_yx.shape[0]), int(points3d.shape[0]))
+    device = query_yx.device
+    if count <= 0:
+        return (
+            torch.empty(0, dtype=torch.long, device=device),
+            torch.empty(0, dtype=torch.float32, device=device),
+        )
+    keep = int(max_matches)
+    if keep <= 0 or keep >= count:
+        keep = count
+    query = query_yx[:count].to(device=device, dtype=torch.float32)
+    xyz = points3d[:count].to(device=device, dtype=torch.float32)
+    if scores is None:
+        score = torch.zeros(count, device=device, dtype=torch.float32)
+    else:
+        score = scores[:count].to(device=device, dtype=torch.float32).reshape(-1)
+        if score.numel() != count:
+            score = torch.zeros(count, device=device, dtype=torch.float32)
+    valid = torch.isfinite(query).all(dim=-1) & torch.isfinite(xyz).all(dim=-1) & torch.isfinite(score)
+    eligible = torch.where(valid)[0]
+    if eligible.numel() < 4:
+        return eligible[torch.argsort(score[eligible], descending=True)[:keep]], score[eligible][:keep]
+
+    base = normalize_score01(score[eligible])
+    candidate_limit = min(int(eligible.numel()), max(keep, min(8192, max(128, keep * 2))))
+    candidate_rel = torch.topk(base, k=candidate_limit).indices
+    candidate_idx = eligible[candidate_rel]
+    candidate_score = base[candidate_rel]
+    bootstrap_limit = min(candidate_limit, max(64, min(2048, max(keep // 2, int(min_matches)))))
+    bootstrap_rel = torch.topk(candidate_score, k=bootstrap_limit).indices
+    bootstrap_idx = candidate_idx[bootstrap_rel]
+    bootstrap_score = candidate_score[bootstrap_rel]
+
+    pose, bootstrap_inliers = solve_pnp_ransac(
+        xyz[bootstrap_idx].detach().cpu().numpy(),
+        query[bootstrap_idx].detach().cpu().numpy(),
+        K.detach().cpu().numpy(),
+        reprojection_error=float(reprojection_error),
+        refine_reprojection_error=float(refine_reprojection_error),
+        confidence=float(confidence),
+        iterations=min(int(iterations), 10000),
+        min_iterations=int(min_iterations),
+        solver=str(solver),
+        refine_poselib=bool(refine_poselib),
+        match_scores=bootstrap_score.detach().cpu().numpy(),
+    )
+    min_inliers = max(12, min(int(min_matches), bootstrap_limit // 2))
+    if pose is None or int(bootstrap_inliers) < min_inliers:
+        fallback = eligible[torch.topk(base, k=min(keep, int(eligible.numel()))).indices]
+        return fallback, score[fallback]
+
+    pose_t = torch.as_tensor(pose, device=device, dtype=torch.float32).unsqueeze(0)
+    proj, valid_z = project_world_to_image_yx(
+        xyz[eligible].unsqueeze(0),
+        pose_t,
+        K.to(device=device, dtype=torch.float32),
+    )
+    err = torch.linalg.norm(proj[0] - query[eligible], dim=-1)
+    valid_proj = valid_z[0] & torch.isfinite(err)
+    threshold = max(float(reprojection_error), 1e-6)
+    clipped_err = torch.where(valid_proj, err.clamp_max(threshold * 8.0), torch.full_like(err, threshold * 8.0))
+    residual_score = torch.exp(-clipped_err / threshold)
+    inlier_bonus = (valid_proj & (err <= threshold)).float()
+    tight_bonus = (valid_proj & (err <= max(1.5, threshold * 0.5))).float()
+
+    consensus_score = 0.25 * base + 1.50 * residual_score + 0.50 * inlier_bonus + 0.25 * tight_bonus
+    consensus_score = torch.where(valid_proj, consensus_score, base * 0.05)
+    keep_rel = torch.topk(consensus_score, k=min(keep, int(eligible.numel()))).indices
+    keep_idx = eligible[keep_rel]
+    # Preserve the consensus ranking for OpenCV PROSAC, which sorts by scores.
+    ordered_score = consensus_score[keep_rel]
+    return keep_idx, ordered_score
 
 
 def _pose_verification_score(
@@ -3014,25 +3202,53 @@ def localize_one(
         "sparse",
         getattr(args, "sparse_pnp_max_matches", 0),
     )
-    sparse_keep = select_pnp_match_indices(
-        keypoints[q_ids] + sparse_query_offset,
-        landmark_xyz[lm_ids],
-        scores=sparse_filter_scores,
-        max_matches=sparse_filter_max_matches,
-        mode=sparse_filter_mode,
-        image_grid_size=_match_filter_image_grid_size(args),
-        xyz_grid_size=_match_filter_xyz_grid_size(args),
-        max_per_image_cell=getattr(args, "match_filter_max_per_image_cell", 8),
-        max_per_xyz_cell=getattr(args, "match_filter_max_per_xyz_cell", 8),
-        min_matches=getattr(args, "match_filter_min_matches", 0),
-    )
+    sparse_consensus_scores = None
+    if sparse_filter_mode == "bootstrap_consensus":
+        sparse_keep, sparse_consensus_scores = bootstrap_consensus_match_filter(
+            keypoints[q_ids] + sparse_query_offset,
+            landmark_xyz[lm_ids],
+            sparse_K,
+            scores=sparse_filter_scores,
+            max_matches=sparse_filter_max_matches,
+            min_matches=getattr(args, "match_filter_min_matches", 0),
+            reprojection_error=float(sparse_reprojection_error),
+            confidence=float(args.pnp_confidence),
+            iterations=int(sparse_pnp_iterations),
+            min_iterations=int(sparse_pnp_min_iterations),
+            solver=str(args.solver),
+            refine_reprojection_error=float(args.refine_reprojection_error),
+            refine_poselib=bool(refine_poselib),
+        )
+    else:
+        sparse_keep = select_pnp_match_indices(
+            keypoints[q_ids] + sparse_query_offset,
+            landmark_xyz[lm_ids],
+            scores=sparse_filter_scores,
+            max_matches=sparse_filter_max_matches,
+            mode=sparse_filter_mode,
+            image_grid_size=_match_filter_image_grid_size(args),
+            xyz_grid_size=_match_filter_xyz_grid_size(args),
+            max_per_image_cell=getattr(args, "match_filter_max_per_image_cell", 8),
+            max_per_xyz_cell=getattr(args, "match_filter_max_per_xyz_cell", 8),
+            min_matches=getattr(args, "match_filter_min_matches", 0),
+        )
     if sparse_keep.numel() < q_ids.numel():
         q_ids = q_ids[sparse_keep]
         lm_ids = lm_ids[sparse_keep]
         _scores = _scores[sparse_keep]
         sparse_filter_scores = sparse_filter_scores[sparse_keep]
+        if sparse_consensus_scores is not None and sparse_consensus_scores.numel() == sparse_filter_scores.numel():
+            sparse_filter_scores = sparse_consensus_scores.to(
+                device=sparse_filter_scores.device,
+                dtype=sparse_filter_scores.dtype,
+            )
         if sparse_margin_by_query is not None:
             sparse_margin_by_query = sparse_margin_by_query[sparse_keep]
+    elif sparse_consensus_scores is not None and sparse_consensus_scores.numel() == sparse_filter_scores.numel():
+        sparse_filter_scores = sparse_consensus_scores.to(
+            device=sparse_filter_scores.device,
+            dtype=sparse_filter_scores.dtype,
+        )
     if candidate_oracle_stats is not None:
         candidate_oracle_stats["candidate_oracle_pnp_match_count"] = float(q_ids.numel())
     sparse_query_for_pnp = keypoints[q_ids] + sparse_query_offset
@@ -3606,6 +3822,17 @@ def localize_one(
                 break
         pose = candidate_pose
 
+    sparse_confidence_stats = sparse_pose_confidence_metrics(
+        sparse_query_for_pnp.detach().cpu().numpy(),
+        landmark_xyz[lm_ids].detach().cpu().numpy(),
+        np.asarray(sparse_pose, dtype=np.float64),
+        sparse_K.detach().cpu().numpy(),
+        scores=sparse_pnp_scores.detach().cpu().numpy(),
+        margins=None
+        if sparse_margin_by_query is None
+        else sparse_margin_by_query.detach().cpu().numpy(),
+    )
+
     out = {
         "pose_w2c": pose[0].detach().cpu().numpy(),
         "sparse_pose_w2c": sparse_pose,
@@ -3613,6 +3840,7 @@ def localize_one(
         "dense_inliers": dense_inliers,
         "dense_rejections": dense_rejections,
         "dense_rejection_stats": dense_rejection_stats,
+        "sparse_confidence_stats": sparse_confidence_stats,
         "sparse_filter_stats": build_match_filter_stats(
             before_count=sparse_filter_before_count,
             after_count=int(q_ids.numel()),
@@ -3800,7 +4028,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dense_pnp_min_iterations", type=int, default=None)
     parser.add_argument(
         "--pnp_prefilter",
-        choices=["none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "patch_consensus_coverage"],
+        choices=["none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "patch_consensus_coverage", "ambiguity_aware"],
         default="none",
     )
     parser.add_argument("--sparse_pnp_max_matches", type=int, default=0)
@@ -3809,7 +4037,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--pnp_prefilter_xyz_grid_size", type=int, default=4)
     parser.add_argument(
         "--match_filter_mode",
-        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage", "patch_consensus_coverage"],
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage", "patch_consensus_coverage", "ambiguity_aware"],
         default="",
     )
     parser.add_argument("--match_filter_calibrated_score_weight", type=float, default=0.0)
@@ -3820,12 +4048,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--match_filter_xyz_grid_size", type=int, default=8)
     parser.add_argument(
         "--sparse_match_filter_mode",
-        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage", "patch_consensus_coverage"],
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage", "patch_consensus_coverage", "ambiguity_aware", "bootstrap_consensus"],
         default="",
     )
     parser.add_argument(
         "--dense_match_filter_mode",
-        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage", "patch_consensus_coverage"],
+        choices=["", "none", "score", "image_grid", "xyz_grid", "image_xyz_grid", "local_geometry", "image_pair_geometry", "calibrated_coverage", "patch_consensus_coverage", "ambiguity_aware"],
         default="",
     )
     parser.add_argument("--sparse_match_filter_top_m", type=int, default=0)
@@ -4302,6 +4530,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 "dense_inliers": int(result["dense_inliers"]),
                 "dense_rejections": int(result.get("dense_rejections", 0)),
                 "dense_rejection_stats": result.get("dense_rejection_stats", {}),
+                "sparse_confidence": result.get("sparse_confidence_stats"),
                 "sparse_filter_stats": sparse_filter_i,
                 "localized": result["pose_w2c"] is not None,
                 "matchability": matchability_i,

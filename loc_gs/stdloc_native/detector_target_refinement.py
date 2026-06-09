@@ -15,6 +15,8 @@ def build_lsf_detector_target(
     sigma_px: float = 1.0,
     hard_negative_risk: torch.Tensor | Any | None = None,
     dense_worsen_risk: torch.Tensor | Any | None = None,
+    solver_validity_weights: torch.Tensor | Any | None = None,
+    solver_validity_power: float = 0.0,
     native_prior: torch.Tensor | Any | None = None,
     native_prior_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
@@ -33,17 +35,22 @@ def build_lsf_detector_target(
     dense = torch.zeros(count, dtype=torch.float32) if dense_worsen_risk is None else torch.as_tensor(dense_worsen_risk, dtype=torch.float32).reshape(-1).cpu().clamp(0.0, 1.0)
     if hn.numel() != count or dense.numel() != count:
         raise ValueError("risk tensors must match projected_yx rows")
+    solver_validity = (
+        torch.ones(count, dtype=torch.float32)
+        if solver_validity_weights is None
+        else torch.as_tensor(solver_validity_weights, dtype=torch.float32).reshape(-1).cpu().clamp(0.0, 1.0)
+    )
+    if solver_validity.numel() != count:
+        raise ValueError("solver_validity_weights must match projected_yx rows")
     risk = (0.6 * hn + 0.4 * dense).clamp(0.0, 1.0)
-    effective = support * (1.0 - risk)
+    solver_power = max(0.0, float(solver_validity_power))
+    solver_scale = solver_validity.pow(solver_power) if solver_power > 0.0 else torch.ones_like(solver_validity)
+    effective = support * solver_scale * (1.0 - risk)
     if effective.numel() and float(effective.max().item()) > 0.0:
         effective = effective / effective.max().clamp_min(1e-12)
 
-    y_grid, x_grid = torch.meshgrid(
-        torch.arange(h, dtype=torch.float32),
-        torch.arange(w, dtype=torch.float32),
-        indexing="ij",
-    )
     sigma = max(float(sigma_px), 1e-4)
+    radius = max(1, int(torch.ceil(torch.tensor(3.0 * sigma)).item()))
     heatmap = torch.zeros(1, 1, h, w, dtype=torch.float32)
     weight = torch.zeros_like(heatmap)
     for idx in range(count):
@@ -51,10 +58,19 @@ def build_lsf_detector_target(
             continue
         y = points[idx, 0].clamp(0.0, float(h - 1))
         x = points[idx, 1].clamp(0.0, float(w - 1))
-        kernel = torch.exp(-0.5 * ((y_grid - y).square() + (x_grid - x).square()) / (sigma * sigma))
         value = effective[idx].clamp(0.0, 1.0)
-        heatmap[0, 0] = torch.maximum(heatmap[0, 0], kernel * value)
-        weight[0, 0] = torch.maximum(weight[0, 0], kernel * (0.25 + 0.75 * value))
+        y0 = max(0, int(torch.floor(y).item()) - radius)
+        y1 = min(h, int(torch.floor(y).item()) + radius + 1)
+        x0 = max(0, int(torch.floor(x).item()) - radius)
+        x1 = min(w, int(torch.floor(x).item()) + radius + 1)
+        ys = torch.arange(y0, y1, dtype=torch.float32)
+        xs = torch.arange(x0, x1, dtype=torch.float32)
+        y_grid, x_grid = torch.meshgrid(ys, xs, indexing="ij")
+        kernel = torch.exp(-0.5 * ((y_grid - y).square() + (x_grid - x).square()) / (sigma * sigma))
+        heat_region = heatmap[0, 0, y0:y1, x0:x1]
+        weight_region = weight[0, 0, y0:y1, x0:x1]
+        heatmap[0, 0, y0:y1, x0:x1] = torch.maximum(heat_region, kernel * value)
+        weight[0, 0, y0:y1, x0:x1] = torch.maximum(weight_region, kernel * (0.25 + 0.75 * value))
 
     if native_prior is not None and float(native_prior_weight) > 0.0:
         prior = torch.as_tensor(native_prior, dtype=torch.float32).cpu()
@@ -71,6 +87,9 @@ def build_lsf_detector_target(
         "target_mode": "lsf_detector_refinement",
         "point_count": int(count),
         "risk_suppressed_count": int((risk > 0.5).sum().item()),
+        "solver_validity_enabled": bool(solver_power > 0.0),
+        "solver_validity_power": float(solver_power),
+        "low_solver_validity_count": int((solver_validity < 0.5).sum().item()),
         "sigma_px": float(sigma_px),
         "native_prior_weight": float(native_prior_weight),
     }

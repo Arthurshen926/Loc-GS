@@ -71,6 +71,7 @@ def build_solver_consensus_support(
     *,
     num_gaussians: int | None = None,
     support_threshold: float = 0.5,
+    evidence_mode: str = "all",
     reprojection_quality_threshold_px: float = 8.0,
     hard_negative_descriptor_score_min: float = 0.5,
     hard_negative_reprojection_error_px_min: float = 8.0,
@@ -79,6 +80,8 @@ def build_solver_consensus_support(
     dense_delta_bad_cm: float = 5.0,
 ) -> dict[str, Any]:
     """Build compact per-Gaussian solver-consensus support from feedback_bank_v2."""
+    if evidence_mode not in {"all", "inlier_positive_only"}:
+        raise ValueError(f"unsupported evidence_mode: {evidence_mode}")
 
     source_path = Path(feedback_bank)
     audit = audit_feedback_bank_v2(source_path)
@@ -97,6 +100,7 @@ def build_solver_consensus_support(
         )
 
     observed_count = torch.zeros((gaussian_count,), dtype=torch.long)
+    positive_observed_count = torch.zeros((gaussian_count,), dtype=torch.long)
     inlier_sum = torch.zeros((gaussian_count,), dtype=torch.float32)
     weighted_support = torch.zeros((gaussian_count,), dtype=torch.float32)
     hard_negative_sum = torch.zeros((gaussian_count,), dtype=torch.float32)
@@ -108,24 +112,41 @@ def build_solver_consensus_support(
         reprojection_error_px_min=float(hard_negative_reprojection_error_px_min),
     )
     for row, (record, gaussian_id) in enumerate(zip(records, gaussian_ids)):
+        pnp_inlier = bool(record.get("pnp_inlier", False))
         hard_negative = float(hard_negative_labels[row])
         dense_risk = _dense_worsen_risk(record, float(dense_delta_bad_cm))
         base_support = _base_support(record, float(reprojection_quality_threshold_px))
-        penalty = _clamp01((float(hard_negative_penalty) * hard_negative) + (float(dense_worsen_penalty) * dense_risk))
-        support_vote = base_support * (1.0 - penalty)
+        if evidence_mode == "inlier_positive_only":
+            support_vote = base_support if pnp_inlier else 0.0
+            hard_negative = 0.0
+            dense_risk = dense_risk if pnp_inlier else 0.0
+        else:
+            penalty = _clamp01(
+                (float(hard_negative_penalty) * hard_negative)
+                + (float(dense_worsen_penalty) * dense_risk)
+            )
+            support_vote = base_support * (1.0 - penalty)
 
         observed_count[gaussian_id] += 1
-        inlier_sum[gaussian_id] += 1.0 if bool(record.get("pnp_inlier", False)) else 0.0
+        if pnp_inlier:
+            positive_observed_count[gaussian_id] += 1
+        inlier_sum[gaussian_id] += 1.0 if pnp_inlier else 0.0
         weighted_support[gaussian_id] += float(support_vote)
         hard_negative_sum[gaussian_id] += hard_negative
         dense_worsen_sum[gaussian_id] += dense_risk
 
-    denom = observed_count.clamp_min(1).to(torch.float32)
-    support_score = weighted_support / denom
-    inlier_consensus = inlier_sum / denom
-    hard_negative_risk = hard_negative_sum / denom
-    dense_worsen_risk = dense_worsen_sum / denom
-    selected_mask = (observed_count > 0) & (support_score >= float(support_threshold))
+    observed_denom = observed_count.clamp_min(1).to(torch.float32)
+    support_denom = (
+        positive_observed_count.clamp_min(1).to(torch.float32)
+        if evidence_mode == "inlier_positive_only"
+        else observed_denom
+    )
+    support_score = weighted_support / support_denom
+    inlier_consensus = inlier_sum / observed_denom
+    hard_negative_risk = hard_negative_sum / observed_denom
+    dense_worsen_risk = dense_worsen_sum / observed_denom
+    selected_base = positive_observed_count > 0 if evidence_mode == "inlier_positive_only" else observed_count > 0
+    selected_mask = selected_base & (support_score >= float(support_threshold))
 
     metadata = {
         "schema": SCHEMA,
@@ -141,6 +162,7 @@ def build_solver_consensus_support(
         "query_id_source": str(audit.get("query_id_source", manifest.get("query_id_source", ""))),
         "hyperparameters": {
             "reprojection_quality_threshold_px": float(reprojection_quality_threshold_px),
+            "evidence_mode": str(evidence_mode),
             "hard_negative_descriptor_score_min": float(hard_negative_descriptor_score_min),
             "hard_negative_reprojection_error_px_min": float(hard_negative_reprojection_error_px_min),
             "hard_negative_penalty": float(hard_negative_penalty),
@@ -156,5 +178,6 @@ def build_solver_consensus_support(
         "hard_negative_risk": hard_negative_risk.to(torch.float32),
         "dense_worsen_risk": dense_worsen_risk.to(torch.float32),
         "observed_count": observed_count,
+        "positive_observed_count": positive_observed_count,
         "metadata": metadata,
     }

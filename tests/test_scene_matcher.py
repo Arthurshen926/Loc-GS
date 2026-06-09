@@ -122,6 +122,49 @@ def test_scene_match_listwise_rank_gap_extra_features_are_deterministic():
     assert torch.allclose(extra[1, :, 2], torch.tensor([0.2, 0.0, 0.0]))
 
 
+def test_scene_match_listwise_query_context_extra_features_use_candidate_competition():
+    cosine = torch.tensor(
+        [
+            [0.9, 0.5, 0.7],
+            [0.1, 0.3, -1.0],
+        ],
+        dtype=torch.float32,
+    )
+    prior = torch.tensor(
+        [
+            [0.2, 0.8, 0.5],
+            [0.4, 0.1, 0.9],
+        ],
+        dtype=torch.float32,
+    )
+    query_score = torch.tensor([0.6, 0.2], dtype=torch.float32)
+    candidate_mask = torch.tensor(
+        [
+            [True, True, True],
+            [True, True, False],
+        ]
+    )
+
+    extra = build_scene_match_listwise_extra_features(
+        "query_context",
+        query_score=query_score,
+        cosine=cosine,
+        landmark_prior=prior,
+        candidate_mask=candidate_mask,
+    )
+
+    assert extra.shape == (2, 3, 8)
+    assert torch.allclose(extra[:, :, 0], query_score[:, None].expand_as(cosine))
+    assert torch.allclose(extra[0, :, 1], torch.tensor([0.0, 0.5, 1.0]))
+    assert torch.allclose(extra[0, :, 2], torch.tensor([0.0, 0.4, 0.2]))
+    assert torch.allclose(extra[0, :, 3], torch.tensor([0.2, -0.2, 0.0]), atol=1e-6)
+    assert torch.allclose(extra[1, :, 3], torch.tensor([-0.1, 0.1, 0.0]), atol=1e-6)
+    assert torch.allclose(extra[0, :, 5], torch.tensor([-0.3, 0.3, 0.0]), atol=1e-6)
+    assert torch.allclose(extra[1, :, 5], torch.tensor([0.15, -0.15, 0.0]), atol=1e-6)
+    assert extra[1, 2, 4].item() == 0.0
+    assert extra[1, 2, 7].item() == 0.0
+
+
 def test_scene_match_listwise_net_can_use_rank_gap_extra_features(tmp_path):
     matcher = SceneMatchListwiseNet(
         descriptor_dim=4,
@@ -155,6 +198,49 @@ def test_scene_match_listwise_net_can_use_rank_gap_extra_features(tmp_path):
         query,
         landmark,
         cosine=cosine,
+        query_score=query_score,
+        candidate_mask=candidate_mask,
+    )
+
+    assert torch.allclose(reloaded, logits)
+
+
+def test_scene_match_listwise_net_can_use_query_context_extra_features(tmp_path):
+    matcher = SceneMatchListwiseNet(
+        descriptor_dim=4,
+        hidden_dim=8,
+        num_layers=2,
+        listwise_extra_features="query_context",
+    )
+    query = torch.randn(3, 4)
+    landmark = torch.randn(3, 5, 4)
+    cosine = torch.randn(3, 5)
+    prior = torch.rand(3, 5)
+    query_score = torch.rand(3)
+    candidate_mask = torch.ones(3, 5, dtype=torch.bool)
+
+    logits = score_scene_match_candidates(
+        matcher,
+        query,
+        landmark,
+        cosine=cosine,
+        landmark_prior=prior,
+        query_score=query_score,
+        candidate_mask=candidate_mask,
+    )
+
+    assert matcher.config["scalar_dim"] == 12
+    assert logits.shape == (3, 6)
+
+    ckpt = tmp_path / "scene_matcher_listwise_query_context.pt"
+    torch.save({"config": matcher.config, "state_dict": matcher.state_dict()}, ckpt)
+    loaded = load_scene_matcher(ckpt)
+    reloaded = score_scene_match_candidates(
+        loaded,
+        query,
+        landmark,
+        cosine=cosine,
+        landmark_prior=prior,
         query_score=query_score,
         candidate_mask=candidate_mask,
     )

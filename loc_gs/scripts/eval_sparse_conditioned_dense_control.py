@@ -226,6 +226,22 @@ def _fixed_options(
     apd_gate_max_median_reproj_increase_px: float = 1.0,
     apd_gate_max_p90_reproj_increase_px: float = 3.0,
     apd_gate_min_inlier_count_ratio: float = 0.90,
+    sadc_dense: bool = False,
+    sadc_include_patch_candidates: bool = False,
+    sadc_mode: str = "conflict_filter_patch_append",
+    sadc_max_candidates: int = 4096,
+    sadc_anchor_flow_scale_px: float = 8.0,
+    sadc_native_drop_percentile: float = 95.0,
+    sadc_min_native_keep_ratio: float = 0.90,
+    sadc_min_native_conflict_score: float = 0.75,
+    sadc_patch_add_percentile: float = 90.0,
+    sadc_max_patch_fraction: float = 0.15,
+    sadc_min_patch_anchor_consistency: float = 0.75,
+    sadc_anchor_monotonic: bool = False,
+    sadc_anchor_monotonic_epsilon_px: float = 1.0,
+    sadc_activation_mode: str = "always",
+    sadc_activation_min_risk: float = 0.5,
+    sadc_activation_min_sparse_confidence: float = 0.0,
 ) -> dict[str, Any]:
     parser = argparse.ArgumentParser(add_help=False)
     from loc_gs.scripts.visualize_stdloc_hard_matches import build_argparser as build_visualizer_argparser
@@ -242,6 +258,12 @@ def _fixed_options(
         argv.append("--apd_use_refined_pose")
     if bool(apd_risk_weighted):
         argv.append("--apd_risk_weighted")
+    if bool(sadc_dense):
+        argv.append("--sadc_dense")
+    if bool(sadc_include_patch_candidates):
+        argv.append("--sadc_include_patch_candidates")
+    if bool(sadc_anchor_monotonic):
+        argv.append("--sadc_anchor_monotonic")
     if not bool(apd_no_regression_gate):
         argv.append("--no_apd_no_regression_gate")
     argv.extend(
@@ -266,6 +288,32 @@ def _fixed_options(
             str(float(apd_gate_max_p90_reproj_increase_px)),
             "--apd_gate_min_inlier_count_ratio",
             str(float(apd_gate_min_inlier_count_ratio)),
+            "--sadc_max_candidates",
+            str(int(sadc_max_candidates)),
+            "--sadc_anchor_flow_scale_px",
+            str(float(sadc_anchor_flow_scale_px)),
+            "--sadc_mode",
+            str(sadc_mode),
+            "--sadc_native_drop_percentile",
+            str(float(sadc_native_drop_percentile)),
+            "--sadc_min_native_keep_ratio",
+            str(float(sadc_min_native_keep_ratio)),
+            "--sadc_min_native_conflict_score",
+            str(float(sadc_min_native_conflict_score)),
+            "--sadc_patch_add_percentile",
+            str(float(sadc_patch_add_percentile)),
+            "--sadc_max_patch_fraction",
+            str(float(sadc_max_patch_fraction)),
+            "--sadc_min_patch_anchor_consistency",
+            str(float(sadc_min_patch_anchor_consistency)),
+            "--sadc_anchor_monotonic_epsilon_px",
+            str(float(sadc_anchor_monotonic_epsilon_px)),
+            "--sadc_activation_mode",
+            str(sadc_activation_mode),
+            "--sadc_activation_min_risk",
+            str(float(sadc_activation_min_risk)),
+            "--sadc_activation_min_sparse_confidence",
+            str(float(sadc_activation_min_sparse_confidence)),
         ]
     )
     args = parser.parse_args(argv)
@@ -377,6 +425,22 @@ def evaluate_scene(
     apd_gate_max_median_reproj_increase_px: float = 1.0,
     apd_gate_max_p90_reproj_increase_px: float = 3.0,
     apd_gate_min_inlier_count_ratio: float = 0.90,
+    sadc_dense: bool = False,
+    sadc_include_patch_candidates: bool = False,
+    sadc_mode: str = "conflict_filter_patch_append",
+    sadc_max_candidates: int = 4096,
+    sadc_anchor_flow_scale_px: float = 8.0,
+    sadc_native_drop_percentile: float = 95.0,
+    sadc_min_native_keep_ratio: float = 0.90,
+    sadc_min_native_conflict_score: float = 0.75,
+    sadc_patch_add_percentile: float = 90.0,
+    sadc_max_patch_fraction: float = 0.15,
+    sadc_min_patch_anchor_consistency: float = 0.75,
+    sadc_anchor_monotonic: bool = False,
+    sadc_anchor_monotonic_epsilon_px: float = 1.0,
+    sadc_activation_mode: str = "always",
+    sadc_activation_min_risk: float = 0.5,
+    sadc_activation_min_sparse_confidence: float = 0.0,
     case_rows_by_image: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     _preload_render_backend()
@@ -401,6 +465,22 @@ def evaluate_scene(
         apd_gate_max_median_reproj_increase_px=float(apd_gate_max_median_reproj_increase_px),
         apd_gate_max_p90_reproj_increase_px=float(apd_gate_max_p90_reproj_increase_px),
         apd_gate_min_inlier_count_ratio=float(apd_gate_min_inlier_count_ratio),
+        sadc_dense=bool(sadc_dense),
+        sadc_include_patch_candidates=bool(sadc_include_patch_candidates),
+        sadc_mode=str(sadc_mode),
+        sadc_max_candidates=int(sadc_max_candidates),
+        sadc_anchor_flow_scale_px=float(sadc_anchor_flow_scale_px),
+        sadc_native_drop_percentile=float(sadc_native_drop_percentile),
+        sadc_min_native_keep_ratio=float(sadc_min_native_keep_ratio),
+        sadc_min_native_conflict_score=float(sadc_min_native_conflict_score),
+        sadc_patch_add_percentile=float(sadc_patch_add_percentile),
+        sadc_max_patch_fraction=float(sadc_max_patch_fraction),
+        sadc_min_patch_anchor_consistency=float(sadc_min_patch_anchor_consistency),
+        sadc_anchor_monotonic=bool(sadc_anchor_monotonic),
+        sadc_anchor_monotonic_epsilon_px=float(sadc_anchor_monotonic_epsilon_px),
+        sadc_activation_mode=str(sadc_activation_mode),
+        sadc_activation_min_risk=float(sadc_activation_min_risk),
+        sadc_activation_min_sparse_confidence=float(sadc_activation_min_sparse_confidence),
     )
     cameras = ctx["cameras"]
     total_selected = _selected_camera_count(
@@ -471,6 +551,10 @@ def evaluate_scene(
         apd_info = controlled_dense.get("apd_dense") or {}
         apd_monotonic = ((apd_info.get("diagnostics") or {}).get("anchor_monotonic") or {})
         apd_switch = controlled_dense.get("apd_pose_switch") or {}
+        sadc_info = controlled_dense.get("sadc_dense") or {}
+        sadc_activation = controlled_dense.get("sadc_activation") or {}
+        sadc_anchor_monotonic_diag = controlled_dense.get("sadc_anchor_monotonic") or {}
+        sadc_score_summary = sadc_info.get("score_summary") or {}
         selected_label = render_control.get("candidate_label")
         if selected_label is None:
             selected_label = clean_render_selection.get("selected_label", "base")
@@ -497,7 +581,7 @@ def evaluate_scene(
             {
                 "scene": scene,
                 "split": eval_split,
-                "candidate_method": "apd_dense" if bool(apd_dense) else str(candidate_render_control),
+                "candidate_method": "sadc_dense" if bool(sadc_dense) else "apd_dense" if bool(apd_dense) else str(candidate_render_control),
                 "query_index": int(index),
                 "image_name": image_name,
                 "case_type": case_row.get("case_type"),
@@ -540,6 +624,30 @@ def evaluate_scene(
                 "apd_pose_switch_beta": apd_switch.get("beta"),
                 "apd_pose_switch_risk": apd_switch.get("risk"),
                 "apd_pose_switch_accept_apd_pose": apd_switch.get("accept_apd_pose"),
+                "sadc_mode": sadc_info.get("mode"),
+                "sadc_candidate_count": sadc_info.get("candidate_count"),
+                "sadc_kept_count": sadc_info.get("kept_count"),
+                "sadc_dropped_count": sadc_info.get("dropped_count"),
+                "sadc_native_candidate_count": sadc_info.get("native_candidate_count"),
+                "sadc_native_kept_count": sadc_info.get("native_kept_count"),
+                "sadc_patch_candidate_count": sadc_info.get("patch_candidate_count"),
+                "sadc_patch_kept_count": sadc_info.get("patch_kept_count"),
+                "sadc_conflict_score_mean": sadc_info.get("conflict_score_mean"),
+                "sadc_conflict_score_p95": sadc_info.get("conflict_score_p95"),
+                "sadc_weight_median": sadc_info.get("weight_median"),
+                "sadc_weight_mean": sadc_info.get("weight_mean"),
+                "sadc_anchor_flow_median": sadc_score_summary.get("anchor_flow_median"),
+                "sadc_match_quality_median": sadc_score_summary.get("match_quality_median"),
+                "sadc_geometry_score": sadc_score_summary.get("geometry_score"),
+                "sadc_activation_mode": sadc_activation.get("mode"),
+                "sadc_activation_active": sadc_activation.get("active"),
+                "sadc_activation_reason": sadc_activation.get("reason"),
+                "sadc_activation_risk": sadc_activation.get("risk"),
+                "sadc_activation_sparse_confidence": sadc_activation.get("sparse_confidence"),
+                "sadc_anchor_monotonic_selected_alpha": sadc_anchor_monotonic_diag.get("selected_alpha"),
+                "sadc_anchor_monotonic_reason": sadc_anchor_monotonic_diag.get("reason"),
+                "sadc_anchor_monotonic_sparse_anchor_median_px": sadc_anchor_monotonic_diag.get("sparse_anchor_median_px"),
+                "sadc_anchor_monotonic_selected_anchor_median_px": sadc_anchor_monotonic_diag.get("selected_anchor_median_px"),
                 "dense_pose_match_count": dense_quality.get("match_count"),
                 "dense_pose_solver_inlier_count": dense_quality.get("solver_inlier_count"),
                 "dense_pose_solver_inlier_ratio": dense_quality.get("solver_inlier_ratio"),
@@ -598,6 +706,13 @@ def evaluate_scene(
             "base_render_control": "none",
             "apd_dense": bool(apd_dense),
             "apd_include_patch_candidates": bool(apd_include_patch_candidates),
+            "sadc_dense": bool(sadc_dense),
+            "sadc_include_patch_candidates": bool(sadc_include_patch_candidates),
+            "sadc_anchor_monotonic": bool(sadc_anchor_monotonic),
+            "sadc_anchor_monotonic_epsilon_px": float(sadc_anchor_monotonic_epsilon_px),
+            "sadc_activation_mode": str(sadc_activation_mode),
+            "sadc_activation_min_risk": float(sadc_activation_min_risk),
+            "sadc_activation_min_sparse_confidence": float(sadc_activation_min_sparse_confidence),
             "selection_policy": candidate_options,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "resume_partial": bool(resume_partial),
@@ -683,6 +798,33 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--apd_gate_max_median_reproj_increase_px", type=float, default=1.0)
     parser.add_argument("--apd_gate_max_p90_reproj_increase_px", type=float, default=3.0)
     parser.add_argument("--apd_gate_min_inlier_count_ratio", type=float, default=0.90)
+    parser.add_argument("--sadc_dense", action="store_true")
+    parser.add_argument("--sadc_include_patch_candidates", action="store_true")
+    parser.add_argument(
+        "--sadc_mode",
+        choices=[
+            "topk",
+            "passthrough",
+            "score_only",
+            "conflict_filter",
+            "patch_append",
+            "conflict_filter_patch_append",
+        ],
+        default="conflict_filter_patch_append",
+    )
+    parser.add_argument("--sadc_max_candidates", type=int, default=4096)
+    parser.add_argument("--sadc_anchor_flow_scale_px", type=float, default=8.0)
+    parser.add_argument("--sadc_native_drop_percentile", type=float, default=95.0)
+    parser.add_argument("--sadc_min_native_keep_ratio", type=float, default=0.90)
+    parser.add_argument("--sadc_min_native_conflict_score", type=float, default=0.75)
+    parser.add_argument("--sadc_patch_add_percentile", type=float, default=90.0)
+    parser.add_argument("--sadc_max_patch_fraction", type=float, default=0.15)
+    parser.add_argument("--sadc_min_patch_anchor_consistency", type=float, default=0.75)
+    parser.add_argument("--sadc_anchor_monotonic", action="store_true")
+    parser.add_argument("--sadc_anchor_monotonic_epsilon_px", type=float, default=1.0)
+    parser.add_argument("--sadc_activation_mode", choices=["always", "dense_damage_risk"], default="always")
+    parser.add_argument("--sadc_activation_min_risk", type=float, default=0.5)
+    parser.add_argument("--sadc_activation_min_sparse_confidence", type=float, default=0.0)
     parser.add_argument("--case_csv", action="append", default=[])
     parser.add_argument("--case_type", action="append", default=[])
     parser.add_argument("--phase0_split", choices=["train", "val", "all"], default="all")
@@ -726,6 +868,22 @@ def main(args: argparse.Namespace | None = None) -> int:
             apd_gate_max_median_reproj_increase_px=float(ns.apd_gate_max_median_reproj_increase_px),
             apd_gate_max_p90_reproj_increase_px=float(ns.apd_gate_max_p90_reproj_increase_px),
             apd_gate_min_inlier_count_ratio=float(ns.apd_gate_min_inlier_count_ratio),
+            sadc_dense=bool(ns.sadc_dense),
+            sadc_include_patch_candidates=bool(ns.sadc_include_patch_candidates),
+            sadc_mode=str(ns.sadc_mode),
+            sadc_max_candidates=int(ns.sadc_max_candidates),
+            sadc_anchor_flow_scale_px=float(ns.sadc_anchor_flow_scale_px),
+            sadc_native_drop_percentile=float(ns.sadc_native_drop_percentile),
+            sadc_min_native_keep_ratio=float(ns.sadc_min_native_keep_ratio),
+            sadc_min_native_conflict_score=float(ns.sadc_min_native_conflict_score),
+            sadc_patch_add_percentile=float(ns.sadc_patch_add_percentile),
+            sadc_max_patch_fraction=float(ns.sadc_max_patch_fraction),
+            sadc_min_patch_anchor_consistency=float(ns.sadc_min_patch_anchor_consistency),
+            sadc_anchor_monotonic=bool(ns.sadc_anchor_monotonic),
+            sadc_anchor_monotonic_epsilon_px=float(ns.sadc_anchor_monotonic_epsilon_px),
+            sadc_activation_mode=str(ns.sadc_activation_mode),
+            sadc_activation_min_risk=float(ns.sadc_activation_min_risk),
+            sadc_activation_min_sparse_confidence=float(ns.sadc_activation_min_sparse_confidence),
             case_rows_by_image=case_rows.get(scene, {}),
         )
         for scene in scenes

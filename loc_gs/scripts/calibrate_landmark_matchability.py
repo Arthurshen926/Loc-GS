@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ from loc_gs.localization.stdloc_parity import apply_match_prior
 from loc_gs.losses.cross_view import projective_view_overlap
 from loc_gs.losses.localization_loss import project_world_to_image_yx
 from loc_gs.models.hybrid_gaussian import HybridFeatureGaussian, SuperPointOutputHead
+from loc_gs.reporting.artifact_audit import artifact_split_audit, write_artifact_audit_bundle
 from loc_gs.scripts.eval_cambridge_hybrid import (
     build_stdloc_detector_landmark_bank,
     extract_keypoints_from_detector_logits,
@@ -32,6 +35,10 @@ from loc_gs.scripts.train_cambridge_hybrid import (
     render_hybrid_superpoint,
     sample_rehearsal_pose_batch,
 )
+
+
+def _command() -> str:
+    return " ".join(shlex.quote(part) for part in sys.argv)
 
 
 def matchability_from_counts(
@@ -326,6 +333,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max_views", type=int, default=128)
     parser.add_argument("--view_stride", type=int, default=1)
     parser.add_argument("--max_landmarks", type=int, default=16384)
+    parser.add_argument(
+        "--landmark_candidate_source",
+        choices=["sampled", "all_gaussians"],
+        default="sampled",
+        help="Landmark universe for calibration/pair-cache labels; all_gaussians is the sparse-SOTA large-pool route.",
+    )
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--reprojection_threshold_px", type=float, default=8.0)
     parser.add_argument("--smoothing_alpha", type=float, default=1.0)
@@ -464,7 +477,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         ply_loc_feature_weight=args.ply_loc_feature_weight,
         hybrid_residual_alpha_max=args.hybrid_residual_alpha_max,
         device=device,
-        candidate_source="sampled",
+        candidate_source=args.landmark_candidate_source,
         return_aux=True,
     )
     landmark_gaussian_ids = bank_aux.get("gaussian_ids") if isinstance(bank_aux, dict) else None
@@ -1070,6 +1083,7 @@ def main(args: argparse.Namespace | None = None) -> None:
             "topk": int(args.topk),
             "reprojection_threshold_px": float(args.reprojection_threshold_px),
             "max_landmarks": int(args.max_landmarks),
+            "landmark_candidate_source": str(args.landmark_candidate_source),
             "query_detector": args.query_detector,
             "feedback_detector_path": args.feedback_detector_path,
             "query_feature_source": args.query_feature_source,
@@ -1081,6 +1095,27 @@ def main(args: argparse.Namespace | None = None) -> None:
         },
     }
     write_matchability_calibration(payload, output_path)
+    artifact_manifest: dict[str, Any] = {
+        "artifact": str(output_path),
+        "checkpoint": str(args.checkpoint),
+        "scene": scene,
+        "split": "train",
+        "max_landmarks": int(args.max_landmarks),
+        "landmark_candidate_source": str(args.landmark_candidate_source),
+        "topk": int(args.topk),
+        "reprojection_threshold_px": float(args.reprojection_threshold_px),
+        "query_detector": str(args.query_detector),
+        "visibility_check": str(args.visibility_check),
+    }
+    artifact_metrics: dict[str, Any] = {
+        "scene": scene,
+        "views": int(len(ids)),
+        "max_landmarks": int(args.max_landmarks),
+        "landmark_candidate_source": str(args.landmark_candidate_source),
+        "topk": int(args.topk),
+        "reprojection_threshold_px": float(args.reprojection_threshold_px),
+    }
+    split_audit = artifact_split_audit({"split_name": "train"}, branch_selection=False)
     if collect_scene_pairs:
         pair_output_path = Path(args.scene_match_pair_output_path)
         pair_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1106,6 +1141,7 @@ def main(args: argparse.Namespace | None = None) -> None:
             "phase_limits": {key: int(value) for key, value in pair_phase_limits.items()},
             "phase_counts": {key: int(value) for key, value in pair_phase_counts.items()},
             "topk": int(args.topk),
+            "landmark_candidate_source": str(args.landmark_candidate_source),
             "reprojection_threshold_px": float(args.reprojection_threshold_px),
             "source": "calibrate_landmark_matchability",
             "fields": sorted(pair_payload.keys()),
@@ -1139,8 +1175,23 @@ def main(args: argparse.Namespace | None = None) -> None:
             ),
             encoding="utf-8",
         )
+        artifact_manifest["scene_match_pair_output_path"] = str(pair_output_path)
+        artifact_manifest["scene_match_pair_format"] = pair_format
+        artifact_metrics["scene_match_pair_output_path"] = str(pair_output_path)
+        artifact_metrics["scene_match_pair_format"] = pair_format
+        artifact_metrics["scene_match_pair_samples"] = int(pair_sample_count)
+        artifact_metrics["scene_match_pair_positives"] = float(positives.item())
+        artifact_metrics["scene_match_pair_positive_ratio"] = float(positives.item() / max(1, int(pair_sample_count)))
+        split_audit = artifact_split_audit(pair_payload.get("metadata", {}), branch_selection=False)
         print(f"[calibrate] wrote {pair_output_path}")
     sidecar = output_path.with_suffix(".json")
+    write_artifact_audit_bundle(
+        output_path.parent,
+        manifest=artifact_manifest,
+        command=_command(),
+        metrics_summary=artifact_metrics,
+        split_audit=split_audit,
+    )
     print(f"[calibrate] wrote {output_path}")
     print(f"[calibrate] wrote {sidecar}")
 

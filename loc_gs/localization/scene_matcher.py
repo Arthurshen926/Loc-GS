@@ -18,6 +18,7 @@ LISTWISE_EXTRA_FEATURE_DIMS = {
     "none": 0,
     "query_score": 1,
     "query_score_rank_gap": 3,
+    "query_context": 8,
 }
 DEFAULT_LISTWISE_SCALAR_DIM = DEFAULT_LISTWISE_BASE_SCALAR_DIM + LISTWISE_EXTRA_FEATURE_DIMS[
     DEFAULT_LISTWISE_EXTRA_FEATURES
@@ -102,6 +103,7 @@ def build_scene_match_listwise_extra_features(
     *,
     query_score: torch.Tensor | None = None,
     cosine: torch.Tensor | None = None,
+    landmark_prior: torch.Tensor | None = None,
     candidate_mask: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Build derived per-candidate scalar context for listwise SceneMatchNet."""
@@ -150,7 +152,50 @@ def build_scene_match_listwise_extra_features(
     best = masked_cosine.amax(dim=1)
     best = torch.where(torch.isfinite(best), best, torch.zeros_like(best))
     gap = (best[:, None] - cosine_tensor).masked_fill(~mask, 0.0).unsqueeze(-1)
-    return torch.cat([score_feature, rank, gap], dim=-1)
+    if mode == "query_score_rank_gap":
+        return torch.cat([score_feature, rank, gap], dim=-1)
+    if mode != "query_context":
+        raise ValueError(f"unsupported listwise extra feature mode: {mode}")
+
+    valid_count = mask.sum(dim=1, keepdim=True).clamp_min(1).to(device=device, dtype=dtype)
+    cosine_sum = cosine_tensor.masked_fill(~mask, 0.0).sum(dim=1, keepdim=True)
+    cosine_mean = cosine_sum / valid_count
+    cosine_centered = (cosine_tensor - cosine_mean).masked_fill(~mask, 0.0).unsqueeze(-1)
+    cosine_prob = torch.softmax(cosine_tensor.masked_fill(~mask, -1.0e9), dim=1)
+    cosine_prob = cosine_prob.masked_fill(~mask, 0.0).unsqueeze(-1)
+
+    if landmark_prior is None:
+        prior_tensor = torch.zeros(batch, topk, device=device, dtype=dtype)
+    else:
+        prior_tensor = _as_listwise_scalar(
+            landmark_prior,
+            batch,
+            topk,
+            device=device,
+            dtype=dtype,
+        ).squeeze(-1)
+    prior_sum = prior_tensor.masked_fill(~mask, 0.0).sum(dim=1, keepdim=True)
+    prior_mean = prior_sum / valid_count
+    prior_centered = (prior_tensor - prior_mean).masked_fill(~mask, 0.0).unsqueeze(-1)
+    masked_prior = prior_tensor.masked_fill(~mask, float("-inf"))
+    best_prior = masked_prior.amax(dim=1)
+    best_prior = torch.where(torch.isfinite(best_prior), best_prior, torch.zeros_like(best_prior))
+    prior_gap = (best_prior[:, None] - prior_tensor).masked_fill(~mask, 0.0).unsqueeze(-1)
+    prior_prob = torch.softmax(prior_tensor.masked_fill(~mask, -1.0e9), dim=1)
+    prior_prob = prior_prob.masked_fill(~mask, 0.0).unsqueeze(-1)
+    return torch.cat(
+        [
+            score_feature,
+            rank,
+            gap,
+            cosine_centered,
+            cosine_prob,
+            prior_centered,
+            prior_gap,
+            prior_prob,
+        ],
+        dim=-1,
+    )
 
 
 def build_scene_match_pair_features(
@@ -388,6 +433,7 @@ class SceneMatchListwiseNet(nn.Module):
                 str(self.config.get("listwise_extra_features", DEFAULT_LISTWISE_EXTRA_FEATURES)),
                 query_score=query_score,
                 cosine=cosine_for_extra,
+                landmark_prior=landmark_prior,
                 candidate_mask=candidate_mask,
             )
         features = build_scene_match_listwise_features(

@@ -690,12 +690,8 @@ def pnp_feedback_detector_target(
     if Kp == 0 or h <= 0 or w <= 0:
         return target, weight
 
-    y_grid, x_grid = torch.meshgrid(
-        torch.arange(h, device=device, dtype=dtype),
-        torch.arange(w, device=device, dtype=dtype),
-        indexing="ij",
-    )
     sigma = max(float(sigma_px), 1e-4)
+    radius = max(1, int(math.ceil(3.0 * sigma)))
     scores = inlier_score.detach().to(device=device, dtype=dtype).reshape(B, Kp).clamp(0.0, 1.0)
     valid = query_mask.to(device=device, dtype=torch.bool).reshape(B, Kp)
     coords = keypoints_yx.detach().to(device=device, dtype=dtype)
@@ -709,11 +705,22 @@ def pnp_feedback_detector_target(
                 continue
             y = yx[0].clamp(0.0, float(h - 1))
             x = yx[1].clamp(0.0, float(w - 1))
-            kernel = torch.exp(-0.5 * ((y_grid - y).square() + (x_grid - x).square()) / (sigma * sigma))
             score = scores[b, idx]
-            target[b, 0] = torch.maximum(target[b, 0], kernel * score)
+            y_floor = int(torch.floor(y).item())
+            x_floor = int(torch.floor(x).item())
+            y0 = max(0, y_floor - radius)
+            y1 = min(h, y_floor + radius + 1)
+            x0 = max(0, x_floor - radius)
+            x1 = min(w, x_floor + radius + 1)
+            ys = torch.arange(y0, y1, device=device, dtype=dtype)
+            xs = torch.arange(x0, x1, device=device, dtype=dtype)
+            y_grid, x_grid = torch.meshgrid(ys, xs, indexing="ij")
+            kernel = torch.exp(-0.5 * ((y_grid - y).square() + (x_grid - x).square()) / (sigma * sigma))
+            target_region = target[b, 0, y0:y1, x0:x1]
+            weight_region = weight[b, 0, y0:y1, x0:x1]
+            target[b, 0, y0:y1, x0:x1] = torch.maximum(target_region, kernel * score)
             # Hard negatives still receive supervision near the queried point.
-            weight[b, 0] = torch.maximum(weight[b, 0], kernel * (0.25 + 0.75 * score))
+            weight[b, 0, y0:y1, x0:x1] = torch.maximum(weight_region, kernel * (0.25 + 0.75 * score))
     if prior_target_map is not None and float(prior_weight) > 0.0:
         prior = prior_target_map.detach().to(device=device, dtype=dtype)
         if prior.dim() == 3:

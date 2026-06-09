@@ -44,6 +44,14 @@ from loc_gs.dense_support.sparse_conditioned_dense_preflight import (
 from loc_gs.dense_support.clean_render_generator import select_clean_render_candidate
 from loc_gs.dense_support.apd_dense import APDDensePolicy, run_anchor_patch_dense_refinement
 from loc_gs.dense_support.patch_dense_candidates import PatchDenseCandidatePolicy, generate_patch_dense_candidates
+from loc_gs.dense_support.sadc import (
+    SADCCorrespondencePolicy,
+    apply_sadc_anchor_monotonic_update,
+    decide_sadc_activation,
+    filter_sadc_correspondences,
+    merge_sadc_candidate_sources,
+    sanitize_sadc_correspondences,
+)
 from loc_gs.dense_support.sparse_anchor_residual import SparseAnchorResidualPolicy, compute_sparse_anchor_residual_group
 from loc_gs.diagnostics.apd_dense_damage_risk import compute_dense_damage_risk
 from loc_gs.reporting.artifact_audit import write_artifact_audit_bundle
@@ -810,6 +818,22 @@ def _resolve_slcdp_effective_options(args: argparse.Namespace) -> dict[str, Any]
         "apd_gate_max_median_reproj_increase_px": float(getattr(args, "apd_gate_max_median_reproj_increase_px", 1.0)),
         "apd_gate_max_p90_reproj_increase_px": float(getattr(args, "apd_gate_max_p90_reproj_increase_px", 3.0)),
         "apd_gate_min_inlier_count_ratio": float(getattr(args, "apd_gate_min_inlier_count_ratio", 0.90)),
+        "sadc_dense": bool(getattr(args, "sadc_dense", False)),
+        "sadc_include_patch_candidates": bool(getattr(args, "sadc_include_patch_candidates", False)),
+        "sadc_mode": str(getattr(args, "sadc_mode", "conflict_filter_patch_append")),
+        "sadc_max_candidates": int(getattr(args, "sadc_max_candidates", 4096)),
+        "sadc_anchor_flow_scale_px": float(getattr(args, "sadc_anchor_flow_scale_px", 8.0)),
+        "sadc_native_drop_percentile": float(getattr(args, "sadc_native_drop_percentile", 95.0)),
+        "sadc_min_native_keep_ratio": float(getattr(args, "sadc_min_native_keep_ratio", 0.90)),
+        "sadc_min_native_conflict_score": float(getattr(args, "sadc_min_native_conflict_score", 0.75)),
+        "sadc_patch_add_percentile": float(getattr(args, "sadc_patch_add_percentile", 90.0)),
+        "sadc_max_patch_fraction": float(getattr(args, "sadc_max_patch_fraction", 0.15)),
+        "sadc_min_patch_anchor_consistency": float(getattr(args, "sadc_min_patch_anchor_consistency", 0.75)),
+        "sadc_anchor_monotonic": bool(getattr(args, "sadc_anchor_monotonic", False)),
+        "sadc_anchor_monotonic_epsilon_px": float(getattr(args, "sadc_anchor_monotonic_epsilon_px", 1.0)),
+        "sadc_activation_mode": str(getattr(args, "sadc_activation_mode", "always")),
+        "sadc_activation_min_risk": float(getattr(args, "sadc_activation_min_risk", 0.5)),
+        "sadc_activation_min_sparse_confidence": float(getattr(args, "sadc_activation_min_sparse_confidence", 0.0)),
     }
     if str(args.slcdp_render_control) == SPARSE_CONDITIONED_RENDER_CONTROL:
         options.update(
@@ -844,7 +868,7 @@ def _resolve_slcdp_effective_options(args: argparse.Namespace) -> dict[str, Any]
                 "slcdp_transition_line_search_fractions": (1.0, 0.75, 0.5, 0.25, 0.0),
             }
         )
-    if bool(getattr(args, "apd_dense", False)):
+    if bool(getattr(args, "apd_dense", False)) or bool(getattr(args, "sadc_dense", False)):
         options["slcdp_transition_control"] = False
         options["slcdp_soft_transition_control"] = False
     return options
@@ -1103,6 +1127,45 @@ def _compact_apd_result(result: Mapping[str, Any] | None) -> dict[str, Any] | No
     }
 
 
+def _compact_sadc_result(result: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(result, Mapping):
+        return None
+    scores = result.get("scores") if isinstance(result.get("scores"), Mapping) else {}
+    sources = np.asarray(result.get("sources", np.empty((0,), dtype=object)), dtype=object).reshape(-1)
+    source_counts = {
+        str(source): int(np.sum(sources == source))
+        for source in sorted(set(str(item) for item in sources.tolist()))
+    }
+    weights = np.asarray(result.get("weights", np.empty((0,), dtype=np.float32)), dtype=np.float64).reshape(-1)
+    return {
+        "schema": result.get("schema"),
+        "uses_gt": bool(result.get("uses_gt", False)),
+        "does_not_select_final_pose": bool(result.get("does_not_select_final_pose", True)),
+        "candidate_count": result.get("candidate_count"),
+        "kept_count": result.get("kept_count"),
+        "dropped_count": result.get("dropped_count"),
+        "mode": result.get("mode"),
+        "native_candidate_count": result.get("native_candidate_count"),
+        "native_kept_count": result.get("native_kept_count"),
+        "patch_candidate_count": result.get("patch_candidate_count"),
+        "patch_kept_count": result.get("patch_kept_count"),
+        "conflict_score_mean": result.get("conflict_score_mean"),
+        "conflict_score_p95": result.get("conflict_score_p95"),
+        "source_counts": source_counts,
+        "weight_median": float(np.median(weights)) if weights.size else 0.0,
+        "weight_mean": float(np.mean(weights)) if weights.size else 0.0,
+        "score_summary": {
+            "weight_mean": scores.get("weight_mean"),
+            "weight_median": scores.get("weight_median"),
+            "anchor_flow_median": scores.get("anchor_flow_median"),
+            "match_quality_median": scores.get("match_quality_median"),
+            "geometry_score": scores.get("geometry_score"),
+            "core_signals": scores.get("core_signals"),
+        },
+        "policy": result.get("policy"),
+    }
+
+
 def _select_render_label_for_dense(
     *,
     clean_render_selection: Mapping[str, Any],
@@ -1271,6 +1334,22 @@ def _capture_dense(
     apd_gate_max_median_reproj_increase_px: float = 1.0,
     apd_gate_max_p90_reproj_increase_px: float = 3.0,
     apd_gate_min_inlier_count_ratio: float = 0.90,
+    sadc_dense: bool = False,
+    sadc_include_patch_candidates: bool = False,
+    sadc_mode: str = "conflict_filter_patch_append",
+    sadc_max_candidates: int = 4096,
+    sadc_anchor_flow_scale_px: float = 8.0,
+    sadc_native_drop_percentile: float = 95.0,
+    sadc_min_native_keep_ratio: float = 0.90,
+    sadc_min_native_conflict_score: float = 0.75,
+    sadc_patch_add_percentile: float = 90.0,
+    sadc_max_patch_fraction: float = 0.15,
+    sadc_min_patch_anchor_consistency: float = 0.75,
+    sadc_anchor_monotonic: bool = False,
+    sadc_anchor_monotonic_epsilon_px: float = 1.0,
+    sadc_activation_mode: str = "always",
+    sadc_activation_min_risk: float = 0.5,
+    sadc_activation_min_sparse_confidence: float = 0.0,
 ) -> dict[str, Any]:
     stdloc = ctx["stdloc"]
     loc = ctx["localizer"]
@@ -1734,7 +1813,104 @@ def _capture_dense(
     )
     p2d_np = query_xy.detach().cpu().numpy().astype(np.float32)
     p3d_np = p3d.detach().cpu().numpy().astype(np.float32)
+    rendered_xy_np = rendered_xy.detach().cpu().numpy().astype(np.float32)
     fine_scores_np = fine_corr[f_b, f_i, f_j].detach().cpu().numpy().astype(np.float32) if f_i.numel() else np.empty((0,), dtype=np.float32)
+    sadc_result = None
+    sadc_policy = None
+    sadc_activation = None
+    if bool(sadc_dense) and sparse_capture is not None:
+        sadc_policy = SADCCorrespondencePolicy(
+            mode=str(sadc_mode),
+            max_candidates=int(sadc_max_candidates),
+            anchor_flow_scale_px=float(sadc_anchor_flow_scale_px),
+            native_drop_percentile=float(sadc_native_drop_percentile),
+            min_native_keep_ratio=float(sadc_min_native_keep_ratio),
+            min_native_conflict_score=float(sadc_min_native_conflict_score),
+            patch_add_percentile=float(sadc_patch_add_percentile),
+            max_patch_fraction=float(sadc_max_patch_fraction),
+            min_patch_anchor_consistency=float(sadc_min_patch_anchor_consistency),
+            anchor_monotonic=bool(sadc_anchor_monotonic),
+            anchor_monotonic_epsilon_px=float(sadc_anchor_monotonic_epsilon_px),
+            activation_mode=str(sadc_activation_mode),
+            activation_min_risk=float(sadc_activation_min_risk),
+            activation_min_sparse_confidence=float(sadc_activation_min_sparse_confidence),
+        )
+        dense_damage_report = None
+        if str(sadc_activation_mode) == "dense_damage_risk" and slcdp_base_dense_capture is not None:
+            risk_observation = _dense_damage_risk_observation(
+                sparse_capture=sparse_capture,
+                dense_capture=slcdp_base_dense_capture,
+                intrinsic=K,
+                image_size=(int(Wf), int(Hf)),
+            )
+            dense_damage_report = compute_dense_damage_risk(risk_observation)
+            dense_damage_report = {**dense_damage_report, "observation": risk_observation}
+        sadc_activation = decide_sadc_activation(dense_damage_report, sadc_policy)
+    if bool(sadc_dense) and sparse_capture is not None and bool((sadc_activation or {}).get("active", True)):
+        sparse_ref_xy, _sparse_ref_valid = project_points(
+            sparse_capture["p3d"],
+            render_pose,
+            K,
+            width=int(Wf),
+            height=int(Hf),
+        )
+        sadc_anchors = {
+            "query_xy": sparse_capture["query_xy"],
+            "render_xy": sparse_ref_xy,
+            "p3d": sparse_capture["p3d"],
+            "inliers": sparse_capture["inliers"],
+        }
+        selected_is_clean_for_sadc = render_control_mode != "none" and str(selected.get("label", selected_label)) != "base"
+        native_source = "clean_render" if selected_is_clean_for_sadc else "native"
+        native_candidates = {
+            "query_xy": p2d_np + 0.5,
+            "render_xy": rendered_xy_np + 0.5,
+            "p3d": p3d_np,
+            "match_scores": fine_scores_np,
+        }
+        patch_candidates_for_sadc = None
+        if bool(sadc_include_patch_candidates):
+            patch_raw = generate_patch_dense_candidates(
+                query_fine.detach().cpu().numpy(),
+                fine_render.detach().cpu().numpy(),
+                depth.detach().cpu().numpy(),
+                sadc_anchors,
+                policy=PatchDenseCandidatePolicy(),
+                render_pose_w2c=render_pose,
+                intrinsic=K,
+            )
+            patch_candidates_for_sadc = dict(patch_raw)
+            patch_candidates_for_sadc["query_xy"] = np.asarray(patch_raw.get("xy", np.empty((0, 2))), dtype=np.float32) + 0.5
+            patch_candidates_for_sadc["render_xy"] = np.asarray(patch_raw.get("render_xy", np.empty((0, 2))), dtype=np.float32) + 0.5
+        sadc_pool = merge_sadc_candidate_sources(
+            {
+                native_source: native_candidates,
+                "patch": patch_candidates_for_sadc,
+            }
+        )
+        if str(sadc_mode) == "topk":
+            sadc_result = filter_sadc_correspondences(
+                sadc_pool,
+                sparse_pose=sparse_pose,
+                sparse_anchors=sadc_anchors,
+                intrinsic=K,
+                image_size=(int(Wf), int(Hf)),
+                policy=sadc_policy,
+            )
+        else:
+            sadc_result = sanitize_sadc_correspondences(
+                sadc_pool,
+                sparse_pose=sparse_pose,
+                sparse_anchors=sadc_anchors,
+                intrinsic=K,
+                image_size=(int(Wf), int(Hf)),
+                policy=sadc_policy,
+            )
+        if int(sadc_result.get("kept_count", 0) or 0) >= 4:
+            p2d_np = np.asarray(sadc_result["query_xy"], dtype=np.float32) - 0.5
+            rendered_xy_np = np.asarray(sadc_result["render_xy"], dtype=np.float32) - 0.5
+            p3d_np = np.asarray(sadc_result["p3d"], dtype=np.float32)
+            fine_scores_np = np.asarray(sadc_result["match_scores"], dtype=np.float32).reshape(-1)
     pose, inliers = stdloc.solve_pose(
         p2d_np + 0.5,
         p3d_np,
@@ -1749,6 +1925,29 @@ def _capture_dense(
     final_pose = pose
     apd_result = None
     apd_switch = None
+    sadc_anchor_monotonic_diag = None
+    if (
+        bool(sadc_dense)
+        and bool(sadc_anchor_monotonic)
+        and sparse_capture is not None
+        and bool((sadc_activation or {}).get("active", True))
+    ):
+        sadc_anchor_monotonic_anchors = {
+            "query_xy": sparse_capture["query_xy"],
+            "p3d": sparse_capture["p3d"],
+            "inliers": sparse_capture["inliers"],
+        }
+        final_pose, sadc_anchor_monotonic_diag = apply_sadc_anchor_monotonic_update(
+            sparse_pose=sparse_pose,
+            candidate_pose=pose,
+            sparse_anchors=sadc_anchor_monotonic_anchors,
+            intrinsic=K,
+            image_size=(int(Wf), int(Hf)),
+            policy=sadc_policy if sadc_policy is not None else SADCCorrespondencePolicy(
+                anchor_monotonic=True,
+                anchor_monotonic_epsilon_px=float(sadc_anchor_monotonic_epsilon_px),
+            ),
+        )
     if bool(apd_dense) and sparse_capture is not None:
         apd_policy = APDDensePolicy(
             dense_group_weight=float(apd_dense_group_weight),
@@ -1944,7 +2143,7 @@ def _capture_dense(
         final_pose = np.asarray(transition_control["selected_pose_w2c"], dtype=np.float32).reshape(4, 4)
     result = {
         "query_xy": p2d_np + 0.5,
-        "rendered_xy": rendered_xy.detach().cpu().numpy().astype(np.float32),
+        "rendered_xy": rendered_xy_np,
         "p3d": p3d_np,
         "raw_pose_w2c": pose,
         "pose_w2c": final_pose,
@@ -1959,6 +2158,9 @@ def _capture_dense(
         "_clean_render_visualization": clean_render_visualization,
         "apd_dense": _compact_apd_result(apd_result),
         "apd_pose_switch": apd_switch,
+        "sadc_dense": _compact_sadc_result(sadc_result),
+        "sadc_activation": sadc_activation,
+        "sadc_anchor_monotonic": sadc_anchor_monotonic_diag,
     }
     result["dense_pose_quality"] = _dense_pose_quality(result)
     if (
@@ -2336,6 +2538,22 @@ def _analyze_case(
     apd_gate_max_median_reproj_increase_px: float,
     apd_gate_max_p90_reproj_increase_px: float,
     apd_gate_min_inlier_count_ratio: float,
+    sadc_dense: bool,
+    sadc_include_patch_candidates: bool,
+    sadc_mode: str,
+    sadc_max_candidates: int,
+    sadc_anchor_flow_scale_px: float,
+    sadc_native_drop_percentile: float,
+    sadc_min_native_keep_ratio: float,
+    sadc_min_native_conflict_score: float,
+    sadc_patch_add_percentile: float,
+    sadc_max_patch_fraction: float,
+    sadc_min_patch_anchor_consistency: float,
+    sadc_anchor_monotonic: bool,
+    sadc_anchor_monotonic_epsilon_px: float,
+    sadc_activation_mode: str,
+    sadc_activation_min_risk: float,
+    sadc_activation_min_sparse_confidence: float,
 ) -> dict[str, Any]:
     camera = ctx["camera_by_name"].get(row["image_name"])
     if camera is None:
@@ -2399,6 +2617,22 @@ def _analyze_case(
             apd_gate_max_median_reproj_increase_px=apd_gate_max_median_reproj_increase_px,
             apd_gate_max_p90_reproj_increase_px=apd_gate_max_p90_reproj_increase_px,
             apd_gate_min_inlier_count_ratio=apd_gate_min_inlier_count_ratio,
+            sadc_dense=sadc_dense,
+            sadc_include_patch_candidates=sadc_include_patch_candidates,
+            sadc_mode=sadc_mode,
+            sadc_max_candidates=sadc_max_candidates,
+            sadc_anchor_flow_scale_px=sadc_anchor_flow_scale_px,
+            sadc_native_drop_percentile=sadc_native_drop_percentile,
+            sadc_min_native_keep_ratio=sadc_min_native_keep_ratio,
+            sadc_min_native_conflict_score=sadc_min_native_conflict_score,
+            sadc_patch_add_percentile=sadc_patch_add_percentile,
+            sadc_max_patch_fraction=sadc_max_patch_fraction,
+            sadc_min_patch_anchor_consistency=sadc_min_patch_anchor_consistency,
+            sadc_anchor_monotonic=sadc_anchor_monotonic,
+            sadc_anchor_monotonic_epsilon_px=sadc_anchor_monotonic_epsilon_px,
+            sadc_activation_mode=sadc_activation_mode,
+            sadc_activation_min_risk=sadc_activation_min_risk,
+            sadc_activation_min_sparse_confidence=sadc_activation_min_sparse_confidence,
         )
 
     query_pil = _tensor_to_image(query_image, size=(sparse["width"], sparse["height"]))
@@ -2561,6 +2795,7 @@ def _analyze_case(
         "slcdp_repair_search": dense.get("slcdp_repair_search"),
         "slcdp_transition_control": dense.get("slcdp_transition_control"),
         "apd_dense": dense.get("apd_dense"),
+        "sadc_dense": dense.get("sadc_dense"),
         "slcdp_raw_step_acceptance": slcdp_raw_step_acceptance,
         "slcdp_step_acceptance": slcdp_step_acceptance,
         "sparse_ray_depth": _summarize_ray_depth(ray_depth_rows),
@@ -2652,6 +2887,33 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--apd_gate_max_median_reproj_increase_px", type=float, default=1.0)
     parser.add_argument("--apd_gate_max_p90_reproj_increase_px", type=float, default=3.0)
     parser.add_argument("--apd_gate_min_inlier_count_ratio", type=float, default=0.90)
+    parser.add_argument("--sadc_dense", action="store_true", help="Filter dense correspondences with sparse-anchor consistency before dense PnP.")
+    parser.add_argument("--sadc_include_patch_candidates", action="store_true")
+    parser.add_argument(
+        "--sadc_mode",
+        choices=[
+            "topk",
+            "passthrough",
+            "score_only",
+            "conflict_filter",
+            "patch_append",
+            "conflict_filter_patch_append",
+        ],
+        default="conflict_filter_patch_append",
+    )
+    parser.add_argument("--sadc_max_candidates", type=int, default=4096)
+    parser.add_argument("--sadc_anchor_flow_scale_px", type=float, default=8.0)
+    parser.add_argument("--sadc_native_drop_percentile", type=float, default=95.0)
+    parser.add_argument("--sadc_min_native_keep_ratio", type=float, default=0.90)
+    parser.add_argument("--sadc_min_native_conflict_score", type=float, default=0.75)
+    parser.add_argument("--sadc_patch_add_percentile", type=float, default=90.0)
+    parser.add_argument("--sadc_max_patch_fraction", type=float, default=0.15)
+    parser.add_argument("--sadc_min_patch_anchor_consistency", type=float, default=0.75)
+    parser.add_argument("--sadc_anchor_monotonic", action="store_true")
+    parser.add_argument("--sadc_anchor_monotonic_epsilon_px", type=float, default=1.0)
+    parser.add_argument("--sadc_activation_mode", choices=["always", "dense_damage_risk"], default="always")
+    parser.add_argument("--sadc_activation_min_risk", type=float, default=0.5)
+    parser.add_argument("--sadc_activation_min_sparse_confidence", type=float, default=0.0)
     return parser
 
 

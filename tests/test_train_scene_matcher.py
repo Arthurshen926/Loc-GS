@@ -139,6 +139,39 @@ def test_train_scene_matcher_writes_reloadable_listwise_checkpoint(tmp_path):
     assert len(checkpoint["metadata"]["class_weight"]) == 4
 
 
+def test_train_scene_matcher_listwise_can_train_positive_rows_only(tmp_path):
+    pair_path = tmp_path / "listwise_pairs.pt"
+    output_path = tmp_path / "best_listwise_positive_only.pt"
+    _write_listwise_pairs(pair_path)
+    args = build_argparser().parse_args(
+        [
+            "--pair_files",
+            str(pair_path),
+            "--output_path",
+            str(output_path),
+            "--listwise",
+            "--listwise_positive_only",
+            "--epochs",
+            "1",
+            "--batch_size",
+            "4",
+            "--hidden_dim",
+            "8",
+            "--num_layers",
+            "2",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    main(args)
+    checkpoint = torch.load(output_path, map_location="cpu")
+
+    assert checkpoint["metadata"]["listwise_positive_only"] is True
+    assert checkpoint["metadata"]["samples"] == 6
+    assert checkpoint["metadata"]["dustbin_ratio"] == 0.0
+
+
 def test_train_scene_matcher_loads_optional_listwise_reprojection_errors(tmp_path):
     missing_path = tmp_path / "listwise_missing_errors.pt"
     present_path = tmp_path / "listwise_with_errors.pt"
@@ -311,3 +344,48 @@ def test_train_scene_matcher_listwise_can_use_rank_gap_features(tmp_path):
     assert matcher.config["scalar_dim"] == 7
     assert matcher.config["listwise_extra_features"] == "query_score_rank_gap"
     assert checkpoint["metadata"]["listwise_extra_features"] == "query_score_rank_gap"
+
+
+def test_train_scene_matcher_listwise_can_use_query_context_features(tmp_path):
+    pair_path = tmp_path / "listwise_pairs.pt"
+    output_path = tmp_path / "best_listwise_query_context.pt"
+    _write_listwise_pairs(pair_path)
+    args = build_argparser().parse_args(
+        [
+            "--pair_files",
+            str(pair_path),
+            "--output_path",
+            str(output_path),
+            "--listwise",
+            "--listwise_extra_features",
+            "query_context",
+            "--epochs",
+            "1",
+            "--batch_size",
+            "4",
+            "--hidden_dim",
+            "8",
+            "--num_layers",
+            "2",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    main(args)
+    checkpoint = torch.load(output_path, map_location="cpu")
+    matcher = load_scene_matcher(output_path)
+
+    assert matcher.config["scalar_dim"] == 12
+    assert matcher.config["listwise_extra_features"] == "query_context"
+    assert checkpoint["metadata"]["listwise_extra_features"] == "query_context"
+    assert checkpoint["metadata"]["extra_scalar_features"] == [
+        "query_score",
+        "candidate_rank",
+        "cosine_gap_to_best",
+        "cosine_centered",
+        "cosine_softmax_prob",
+        "landmark_prior_centered",
+        "landmark_prior_gap_to_best",
+        "landmark_prior_softmax_prob",
+    ]

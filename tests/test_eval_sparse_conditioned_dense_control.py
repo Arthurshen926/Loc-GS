@@ -82,6 +82,19 @@ def test_fixed_options_can_enable_apd_dense_without_legacy_transition():
         apd_anchor_monotonic_epsilon_px=0.5,
         apd_risk_weighted=True,
         apd_risk_max_beta=0.8,
+        sadc_dense=True,
+        sadc_include_patch_candidates=True,
+        sadc_mode="conflict_filter_patch_append",
+        sadc_max_candidates=1024,
+        sadc_native_drop_percentile=97.0,
+        sadc_min_native_keep_ratio=0.95,
+        sadc_patch_add_percentile=92.0,
+        sadc_max_patch_fraction=0.1,
+        sadc_anchor_monotonic=True,
+        sadc_anchor_monotonic_epsilon_px=0.6,
+        sadc_activation_mode="dense_damage_risk",
+        sadc_activation_min_risk=0.45,
+        sadc_activation_min_sparse_confidence=0.25,
     )
 
     assert options["apd_dense"] is True
@@ -92,6 +105,19 @@ def test_fixed_options_can_enable_apd_dense_without_legacy_transition():
     assert options["apd_anchor_monotonic_epsilon_px"] == 0.5
     assert options["apd_risk_weighted"] is True
     assert options["apd_risk_max_beta"] == 0.8
+    assert options["sadc_dense"] is True
+    assert options["sadc_include_patch_candidates"] is True
+    assert options["sadc_mode"] == "conflict_filter_patch_append"
+    assert options["sadc_max_candidates"] == 1024
+    assert options["sadc_native_drop_percentile"] == 97.0
+    assert options["sadc_min_native_keep_ratio"] == 0.95
+    assert options["sadc_patch_add_percentile"] == 92.0
+    assert options["sadc_max_patch_fraction"] == 0.1
+    assert options["sadc_anchor_monotonic"] is True
+    assert options["sadc_anchor_monotonic_epsilon_px"] == 0.6
+    assert options["sadc_activation_mode"] == "dense_damage_risk"
+    assert options["sadc_activation_min_risk"] == 0.45
+    assert options["sadc_activation_min_sparse_confidence"] == 0.25
     assert options["slcdp_transition_control"] is False
     assert options["slcdp_soft_transition_control"] is False
 

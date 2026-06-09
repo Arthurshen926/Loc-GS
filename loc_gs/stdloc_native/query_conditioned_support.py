@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 import torch
 
-from loc_gs.feedback.audit import audit_feedback_bank_v2
+from loc_gs.feedback.audit import audit_feedback_bank_v2, audit_feedback_bank_v3
 from loc_gs.feedback.io import load_feedback_bank
 
 
@@ -38,6 +38,17 @@ def _source_set(source_idx: torch.Tensor | Any) -> set[int]:
         int(item)
         for item in torch.as_tensor(source_idx, dtype=torch.long).reshape(-1).cpu().tolist()
     }
+
+
+def _audit_solver_feedback_bank(feedback_bank: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    bank = load_feedback_bank(feedback_bank)
+    manifest = dict(bank.get("manifest", {}))
+    schema = str(manifest.get("schema_version", "")).strip()
+    if schema == "feedback_bank_v3":
+        audit = audit_feedback_bank_v3(feedback_bank)
+    else:
+        audit = audit_feedback_bank_v2(feedback_bank)
+    return bank, audit
 
 
 def _map_landmark_ids(ids: torch.Tensor, base_gaussian_id: torch.Tensor | Any | None, num_gaussians: int) -> torch.Tensor:
@@ -376,12 +387,11 @@ def build_feedback_bank_v2_solver_constraints(
     cvar_alpha: float | None = 0.2,
     min_cvar_score: float = 0.0,
 ) -> dict[str, Any]:
-    """Build solver admissibility constraints directly from audited feedback_bank_v2."""
+    """Build solver admissibility constraints directly from audited feedback banks."""
 
-    audit = audit_feedback_bank_v2(feedback_bank)
+    bank, audit = _audit_solver_feedback_bank(feedback_bank)
     if audit["audit_status"] != "passed":
-        raise ValueError(f"feedback bank v2 audit failed: {audit['reasons']}")
-    bank = load_feedback_bank(feedback_bank)
+        raise ValueError(f"feedback bank audit failed: {audit['reasons']}")
     manifest = dict(bank.get("manifest", {}))
     split_name = str(manifest.get("split_name", manifest.get("split", ""))).strip()
     if split_name.lower() == "test":

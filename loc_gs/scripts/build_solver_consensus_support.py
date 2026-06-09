@@ -53,6 +53,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--num_gaussians", type=int, default=None)
     parser.add_argument("--support_threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--evidence_mode",
+        choices=("all", "inlier_positive_only"),
+        default="all",
+        help=(
+            "all keeps the historical support-minus-risk aggregation; "
+            "inlier_positive_only ignores non-PnP-inlier matches as unknown evidence."
+        ),
+    )
     parser.add_argument("--reprojection_quality_threshold_px", type=float, default=8.0)
     parser.add_argument("--hard_negative_descriptor_score_min", type=float, default=0.5)
     parser.add_argument("--hard_negative_reprojection_error_px_min", type=float, default=8.0)
@@ -68,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         args.feedback_bank,
         num_gaussians=args.num_gaussians,
         support_threshold=args.support_threshold,
+        evidence_mode=args.evidence_mode,
         reprojection_quality_threshold_px=args.reprojection_quality_threshold_px,
         hard_negative_descriptor_score_min=args.hard_negative_descriptor_score_min,
         hard_negative_reprojection_error_px_min=args.hard_negative_reprojection_error_px_min,

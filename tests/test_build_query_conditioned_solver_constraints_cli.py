@@ -6,6 +6,7 @@ import sys
 import torch
 
 from loc_gs.feedback.io import save_feedback_bank
+from loc_gs.feedback.schema import FeedbackMatchRecord
 
 
 def test_build_query_conditioned_solver_constraints_cli_writes_exporter_payload(tmp_path):
@@ -148,3 +149,79 @@ def test_build_feedback_bank_v2_solver_admissibility_cli_writes_v3_payload(tmp_p
     assert payload["hard_query_ids"] == ["seq1/frame00001.png"]
     assert payload["candidate_gain"]["2"]["seq1/frame00001.png"]["dense_worsen_risk"] == 1.0
     assert payload["thresholds"]["cvar_alpha"] == 0.5
+
+
+def test_build_feedback_bank_solver_admissibility_cli_accepts_feedback_bank_v3(tmp_path):
+    bank = tmp_path / "feedback_bank_v3.jsonl"
+    source_idx = tmp_path / "sampled_idx.pkl"
+    output = tmp_path / "constraints_from_v3.json"
+    save_feedback_bank(
+        bank,
+        [
+            FeedbackMatchRecord(
+                scene="ToyScene",
+                split_name="selfmap_train",
+                query_id="seq1/frame00001.png",
+                image_id="seq1/frame00001.png",
+                source_view_id="seq1/frame00001.png",
+                source_role="candidate_trace",
+                keypoint_id="kp_000000",
+                keypoint_xy=(10.0, 20.0),
+                matched_landmark_id="sampled:2",
+                matched_gaussian_id="2",
+                descriptor_score=0.8,
+                descriptor_margin=0.1,
+                detector_score=0.7,
+                pnp_inlier=True,
+                pnp_success=True,
+                pose_success=True,
+                query_sparse_te_cm=4.0,
+                pose_error_t_cm=4.0,
+                pose_error_r_deg=0.1,
+                reprojection_error_px=2.0,
+                query_xy_norm=(0.1, 0.2),
+                bearing=(0.0, 0.1, 1.0),
+                camera_xyz=(1.0, 2.0, 6.0),
+                depth_m=6.0,
+                image_cell=(0, 1),
+                depth_bin=2,
+                local_geometry_score=1.0,
+                dense_refine_success=False,
+                dense_transition="worsened",
+                dense_delta_te_cm=6.0,
+            )
+        ],
+        {
+            "scene": "ToyScene",
+            "split_name": "selfmap_train",
+            "schema_version": "feedback_bank_v3",
+            "query_id_source": "real_image_id",
+            "split_audit": {"audit_status": "passed", "split_name": "selfmap_train"},
+        },
+    )
+    with source_idx.open("wb") as handle:
+        pickle.dump(torch.tensor([0, 1], dtype=torch.long), handle)
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loc_gs.scripts.build_feedback_bank_v2_solver_admissibility",
+            "--feedback_bank",
+            str(bank),
+            "--source_idx",
+            str(source_idx),
+            "--output_json",
+            str(output),
+            "--num_gaussians",
+            "4",
+            "--hard_query_topk",
+            "1",
+        ],
+        check=True,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["metadata"]["feedback_bank_schema"] == "feedback_bank_v3"
+    assert payload["metadata"]["split_audit"]["audit_status"] == "passed"
+    assert payload["candidate_gain"]["2"]["seq1/frame00001.png"]["support"] == 1.0

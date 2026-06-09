@@ -21,6 +21,7 @@ def build_calibration_command(
     max_views: int = 256,
     rendered_rehearsal_views: int = 256,
     max_landmarks: int = 16384,
+    landmark_candidate_source: str = "sampled",
     topk: int = 8,
     query_detector: str = "stdloc",
     feedback_detector_full_res: bool = False,
@@ -48,6 +49,8 @@ def build_calibration_command(
         str(int(max_views)),
         "--max_landmarks",
         str(int(max_landmarks)),
+        "--landmark_candidate_source",
+        str(landmark_candidate_source),
         "--topk",
         str(int(topk)),
         "--query_detector",
@@ -129,6 +132,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max_views", type=int, default=256)
     parser.add_argument("--rendered_rehearsal_views", type=int, default=256)
     parser.add_argument("--max_landmarks", type=int, default=16384)
+    parser.add_argument("--landmark_candidate_source", choices=["sampled", "all_gaussians"], default="sampled")
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--query_detector", choices=["superpoint", "stdloc", "feedback"], default="stdloc")
     parser.add_argument("--feedback_detector_full_res", action="store_true")
@@ -188,6 +192,7 @@ def main() -> None:
             max_views=args.max_views,
             rendered_rehearsal_views=args.rendered_rehearsal_views,
             max_landmarks=args.max_landmarks,
+            landmark_candidate_source=args.landmark_candidate_source,
             topk=args.topk,
             query_detector=args.query_detector,
             feedback_detector_full_res=args.feedback_detector_full_res,

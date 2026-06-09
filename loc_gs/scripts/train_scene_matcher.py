@@ -186,6 +186,11 @@ def build_argparser() -> argparse.ArgumentParser:
         default=DEFAULT_LISTWISE_EXTRA_FEATURES,
     )
     parser.add_argument("--listwise_loss_balance", choices=["binary", "none"], default="binary")
+    parser.add_argument(
+        "--listwise_positive_only",
+        action="store_true",
+        help="Train listwise reranker only on rows with at least one positive candidate.",
+    )
     parser.add_argument("--listwise_ce_loss_weight", type=float, default=1.0)
     parser.add_argument("--listwise_verifier_loss_weight", type=float, default=0.0)
     parser.add_argument("--listwise_verifier_sigma_px", type=float, default=4.0)
@@ -198,6 +203,28 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     return parser
+
+
+def _listwise_extra_feature_names(mode: str) -> list[str]:
+    mode = str(mode)
+    if mode == "query_score":
+        return ["query_score"]
+    if mode == "query_score_rank_gap":
+        return ["query_score", "candidate_rank", "cosine_gap_to_best"]
+    if mode == "query_context":
+        return [
+            "query_score",
+            "candidate_rank",
+            "cosine_gap_to_best",
+            "cosine_centered",
+            "cosine_softmax_prob",
+            "landmark_prior_centered",
+            "landmark_prior_gap_to_best",
+            "landmark_prior_softmax_prob",
+        ]
+    if mode == "none":
+        return []
+    raise ValueError(f"unsupported listwise_extra_features: {mode}")
 
 
 def main(args: argparse.Namespace | None = None) -> None:
@@ -332,6 +359,16 @@ def _train_listwise(args: argparse.Namespace, device: torch.device) -> None:
     labels = tensors["label"].long().reshape(-1)
     descriptor_dim = int(tensors["query_desc"].shape[-1])
     topk = int(tensors["landmark_desc"].shape[1])
+    positive_only = bool(getattr(args, "listwise_positive_only", False))
+    if positive_only:
+        keep = labels < topk
+        if not bool(keep.any()):
+            raise ValueError("listwise_positive_only requested but no positive rows are available")
+        tensors = {
+            key: (value[keep] if torch.as_tensor(value).shape[0] == int(labels.numel()) else value)
+            for key, value in tensors.items()
+        }
+        labels = tensors["label"].long().reshape(-1)
     dataset = TensorDataset(
         tensors["query_desc"].float(),
         tensors["landmark_desc"].float(),
@@ -465,9 +502,8 @@ def _train_listwise(args: argparse.Namespace, device: torch.device) -> None:
                 "samples": int(labels.numel()),
                 "topk": int(topk),
                 "dustbin_ratio": float((labels == topk).float().mean().item()),
-                "extra_scalar_features": ["query_score"]
-                if str(args.listwise_extra_features) == "query_score"
-                else ["query_score", "candidate_rank", "cosine_gap_to_best"],
+                "listwise_positive_only": bool(positive_only),
+                "extra_scalar_features": _listwise_extra_feature_names(str(args.listwise_extra_features)),
                 "listwise_extra_features": str(args.listwise_extra_features),
                 "listwise_loss_balance": loss_balance,
                 "listwise_ce_loss_weight": float(ce_loss_weight),

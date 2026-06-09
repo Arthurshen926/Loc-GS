@@ -22,6 +22,14 @@ def _record_missing(record: dict[str, Any], fields: tuple[str, ...]) -> list[str
     return [field for field in fields if not _present(record.get(field))]
 
 
+def _record_missing_any(record: dict[str, Any], field_groups: tuple[tuple[str, ...], ...]) -> list[str]:
+    missing: list[str] = []
+    for group in field_groups:
+        if not any(_present(record.get(field)) for field in group):
+            missing.append("/".join(group))
+    return missing
+
+
 def _identity_base(value: str) -> str:
     text = str(value).strip()
     if text.startswith("rendered_from:"):
@@ -109,5 +117,103 @@ def audit_feedback_bank_v2(path: str | Path) -> dict[str, Any]:
         "split_name": split_name,
         "schema_version": schema_version,
         "query_id_source": query_id_source,
+        "reasons": reasons,
+    }
+
+
+def audit_feedback_bank_v3(path: str | Path) -> dict[str, Any]:
+    """Audit sparse correspondence-level solver feedback attribution.
+
+    Unlike v2, v3 is sparse-only and therefore does not require dense transition
+    fields. It does require per-correspondence geometry/solver attribution so it
+    can drive SparseSet, feature fusion, and match-scoring without falling back
+    to query-level metric deltas.
+    """
+
+    bank = load_feedback_bank(path)
+    manifest = dict(bank.get("manifest", {}))
+    records = [dict(record) for record in bank.get("records", [])]
+    reasons: list[str] = []
+
+    split_name = str(manifest.get("split_name", manifest.get("split", ""))).strip()
+    if not split_name:
+        reasons.append("missing split_name")
+    elif split_name.lower() == "test":
+        reasons.append("test split is not allowed")
+
+    schema_version = str(manifest.get("schema_version", "")).strip()
+    if schema_version != "feedback_bank_v3":
+        reasons.append("schema_version must be feedback_bank_v3")
+
+    query_id_source = str(manifest.get("query_id_source", "")).strip().lower()
+    if query_id_source in {"", "synthetic", "synthetic_index"}:
+        reasons.append("synthetic query_id source is not allowed")
+
+    split_audit = manifest.get("split_audit")
+    audit_status = split_audit.get("audit_status") if isinstance(split_audit, dict) else None
+    if audit_status != "passed":
+        reasons.append("split_audit.audit_status must be passed")
+
+    required = (
+        "scene",
+        "query_id",
+        "image_id",
+        "source_role",
+        "keypoint_id",
+        "keypoint_xy",
+        "query_xy_norm",
+        "descriptor_score",
+        "descriptor_margin",
+        "detector_score",
+        "pnp_inlier",
+        "reprojection_error_px",
+        "local_geometry_score",
+        "depth_m",
+        "camera_xyz",
+        "bearing",
+        "image_cell",
+        "depth_bin",
+        "pose_success",
+    )
+    alias_groups = (
+        ("matched_landmark_id", "landmark_id"),
+        ("matched_gaussian_id", "gaussian_id"),
+        ("query_sparse_te_cm", "pose_error_t_cm"),
+    )
+    allowed_roles = {"baseline_trace", "candidate_trace", "render_aug_trace"}
+    query_ids: set[str] = set()
+    image_ids: set[str] = set()
+    role_counts: dict[str, int] = {}
+    for index, record in enumerate(records):
+        query_id = str(record.get("query_id", ""))
+        if query_id:
+            query_ids.add(query_id)
+        image_id = str(record.get("image_id", "")).strip()
+        if image_id:
+            image_ids.add(image_id)
+        missing = _record_missing(record, required) + _record_missing_any(record, alias_groups)
+        if missing:
+            reasons.append(f"record {index} missing required fields: {', '.join(missing)}")
+        if _synthetic_identity(query_id):
+            reasons.append(f"record {index} uses synthetic query_id: {query_id}")
+        if _synthetic_identity(image_id):
+            reasons.append(f"record {index} uses synthetic image_id: {image_id}")
+        role = str(record.get("source_role", "")).strip()
+        role_counts[role] = int(role_counts.get(role, 0) + 1)
+        if role not in allowed_roles:
+            reasons.append(f"record {index} has unsupported source_role: {role!r}")
+
+    return {
+        "format": "loc_gs_feedback_bank_v3_audit",
+        "path": str(path),
+        "audit_status": "passed" if not reasons else "failed",
+        "paper_safe_candidate": not reasons,
+        "record_count": int(len(records)),
+        "query_count": int(len(query_ids)),
+        "image_group_count": int(len(image_ids)),
+        "split_name": split_name,
+        "schema_version": schema_version,
+        "query_id_source": query_id_source,
+        "source_role_counts": role_counts,
         "reasons": reasons,
     }

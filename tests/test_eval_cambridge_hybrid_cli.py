@@ -12,6 +12,7 @@ from loc_gs.scripts.eval_cambridge_hybrid import (
     build_argparser,
     build_eval_split_audit,
     build_match_filter_stats,
+    bootstrap_consensus_match_filter,
     select_stdloc_candidate_ids_without_weights,
     effective_eval_config,
     fuse_projected_teacher_descriptors,
@@ -25,6 +26,7 @@ from loc_gs.scripts.eval_cambridge_hybrid import (
     select_view_landmark_indices,
     sparse_candidate_oracle_matches,
     sparse_matchability_metrics,
+    sparse_pose_confidence_metrics,
 )
 
 
@@ -192,7 +194,7 @@ def test_eval_parser_exposes_stdloc_parity_options():
             "--match_calibrated_prior_weight",
             "0.2",
             "--match_filter_mode",
-            "calibrated_coverage",
+            "ambiguity_aware",
             "--match_filter_calibrated_score_weight",
             "0.3",
             "--match_filter_margin_weight",
@@ -210,7 +212,7 @@ def test_eval_parser_exposes_stdloc_parity_options():
             "--match_filter_min_matches",
             "64",
             "--sparse_match_filter_mode",
-            "calibrated_coverage",
+            "bootstrap_consensus",
             "--dense_match_filter_mode",
             "none",
             "--sparse_match_filter_top_m",
@@ -305,7 +307,7 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert args.calibrated_matchability_path == "output/cache/calibrated/ShopFacade/matchability.pt"
     assert args.landmark_score_calibrated_matchability_weight == 0.7
     assert args.match_calibrated_prior_weight == 0.2
-    assert args.match_filter_mode == "calibrated_coverage"
+    assert args.match_filter_mode == "ambiguity_aware"
     assert args.match_filter_calibrated_score_weight == 0.3
     assert args.match_filter_margin_weight == 0.4
     assert args.match_filter_top_m == 1024
@@ -314,7 +316,7 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert args.match_filter_max_per_image_cell == 4
     assert args.match_filter_max_per_xyz_cell == 6
     assert args.match_filter_min_matches == 64
-    assert args.sparse_match_filter_mode == "calibrated_coverage"
+    assert args.sparse_match_filter_mode == "bootstrap_consensus"
     assert args.dense_match_filter_mode == "none"
     assert args.sparse_match_filter_top_m == 1024
     assert args.dense_match_filter_top_m == 0
@@ -353,7 +355,7 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert config["pnp_prefilter"] == "image_xyz_grid"
     assert config["sparse_pnp_max_matches"] == 512
     assert config["dense_pnp_max_matches"] == 4096
-    assert config["match_filter_mode"] == "calibrated_coverage"
+    assert config["match_filter_mode"] == "ambiguity_aware"
     assert config["match_calibrated_prior_weight"] == 0.2
     assert config["match_filter_top_m"] == 1024
     assert config["match_filter_margin_weight"] == 0.4
@@ -361,7 +363,7 @@ def test_eval_parser_exposes_stdloc_parity_options():
     assert config["match_filter_xyz_grid_size"] == 10
     assert config["match_filter_max_per_image_cell"] == 4
     assert config["match_filter_max_per_xyz_cell"] == 6
-    assert config["sparse_match_filter_mode"] == "calibrated_coverage"
+    assert config["sparse_match_filter_mode"] == "bootstrap_consensus"
     assert config["dense_match_filter_mode"] == "none"
     assert config["sparse_match_filter_top_m"] == 1024
     assert config["dense_match_filter_top_m"] == 0
@@ -542,6 +544,155 @@ def test_eval_parser_exposes_scene_matcher_single_path_rerank():
     assert config["match_filter_query_score_weight"] == 0.2
 
 
+def test_ambiguity_aware_prefilter_keeps_score_order_under_spatial_constraints():
+    query_yx = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.2, 0.1],
+            [0.1, 0.2],
+            [0.3, 0.2],
+            [10.0, 10.0],
+            [20.0, 20.0],
+            [30.0, 30.0],
+            [40.0, 40.0],
+        ],
+        dtype=torch.float32,
+    )
+    points3d = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.01, 0.0, 1.0],
+            [0.0, 0.01, 1.0],
+            [0.01, 0.01, 1.0],
+            [2.0, 0.0, 3.0],
+            [0.0, 2.0, 4.0],
+            [2.0, 2.0, 5.0],
+            [4.0, 4.0, 6.0],
+        ],
+        dtype=torch.float32,
+    )
+    scores = torch.tensor([10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0], dtype=torch.float32)
+
+    keep = select_pnp_match_indices(
+        query_yx,
+        points3d,
+        scores=scores,
+        max_matches=4,
+        mode="ambiguity_aware",
+        image_grid_size=4,
+        xyz_grid_size=2,
+        max_per_image_cell=1,
+        max_per_xyz_cell=1,
+        min_matches=4,
+    )
+
+    assert keep.numel() == 4
+    assert int((keep < 4).sum()) <= 1
+    assert {4, 5, 6}.issubset(set(int(v) for v in keep.tolist()))
+
+
+def test_ambiguity_aware_prefilter_preserves_prosac_score_prefix_for_large_pools():
+    count = 256
+    query_yx = torch.stack(
+        [
+            torch.linspace(0.0, 255.0, count),
+            torch.linspace(255.0, 0.0, count),
+        ],
+        dim=1,
+    )
+    points3d = torch.stack(
+        [
+            torch.linspace(0.0, 8.0, count),
+            torch.linspace(8.0, 0.0, count),
+            torch.linspace(1.0, 20.0, count),
+        ],
+        dim=1,
+    )
+    scores = torch.linspace(1.0, 0.0, count)
+
+    keep = select_pnp_match_indices(
+        query_yx,
+        points3d,
+        scores=scores,
+        max_matches=128,
+        mode="ambiguity_aware",
+        image_grid_size=8,
+        xyz_grid_size=4,
+        max_per_image_cell=1,
+        max_per_xyz_cell=1,
+        min_matches=32,
+    )
+
+    assert keep.numel() == 128
+    # Large-pool mode must not let diversity constraints destroy the high-score
+    # PROSAC prefix; the first 75% budget is score-protected.
+    assert set(range(96)).issubset(set(int(v) for v in keep.tolist()))
+
+
+def test_bootstrap_consensus_filter_demotes_high_score_reprojection_outlier():
+    K = torch.tensor(
+        [
+            [120.0, 0.0, 50.0],
+            [0.0, 120.0, 40.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    correct_xyz = torch.tensor(
+        [
+            [-0.6, -0.4, 4.0],
+            [-0.2, -0.4, 4.5],
+            [0.2, -0.4, 5.0],
+            [0.6, -0.4, 5.5],
+            [-0.6, 0.0, 4.2],
+            [-0.2, 0.0, 4.8],
+            [0.2, 0.0, 5.2],
+            [0.6, 0.0, 5.8],
+            [-0.6, 0.4, 4.4],
+            [-0.2, 0.4, 5.0],
+            [0.2, 0.4, 5.4],
+            [0.6, 0.4, 6.0],
+        ],
+        dtype=torch.float32,
+    )
+    correct_uv = torch.stack(
+        [
+            K[0, 0] * correct_xyz[:, 0] / correct_xyz[:, 2] + K[0, 2],
+            K[1, 1] * correct_xyz[:, 1] / correct_xyz[:, 2] + K[1, 2],
+        ],
+        dim=1,
+    )
+    correct_yx = correct_uv[:, [1, 0]]
+    false_xyz = torch.tensor([[3.0, 0.0, 4.0], [-3.0, 0.0, 4.0], [0.0, 3.0, 4.0]], dtype=torch.float32)
+    false_yx = torch.tensor([[40.0, 50.0], [10.0, 10.0], [80.0, 80.0]], dtype=torch.float32)
+    query_yx = torch.cat([false_yx[:1], correct_yx, false_yx[1:]], dim=0)
+    points3d = torch.cat([false_xyz[:1], correct_xyz, false_xyz[1:]], dim=0)
+    scores = torch.cat(
+        [
+            torch.tensor([1.0], dtype=torch.float32),
+            torch.linspace(0.95, 0.80, correct_xyz.shape[0]),
+            torch.tensor([0.3, 0.2], dtype=torch.float32),
+        ]
+    )
+
+    keep, consensus_scores = bootstrap_consensus_match_filter(
+        query_yx,
+        points3d,
+        K,
+        scores=scores,
+        max_matches=12,
+        min_matches=4,
+        reprojection_error=4.0,
+        iterations=2000,
+    )
+
+    selected = set(int(v) for v in keep.tolist())
+    assert keep.numel() == 12
+    assert consensus_scores.numel() == 12
+    assert 0 not in selected
+    assert set(range(1, 13)).issubset(selected)
+
+
 def test_scene_matcher_candidate_mode_defaults_to_best_query_match():
     args = build_argparser().parse_args(
         [
@@ -694,6 +845,30 @@ def test_sparse_matchability_metrics_reports_pose_information_for_four_points():
     assert np.isfinite(metrics["sparse_xyz_cov_logdet"])
     assert np.isfinite(metrics["sparse_all_pose_info_logdet"])
     assert metrics["sparse_inlier8_pose_info_min_eig"] > 0.0
+
+
+def test_sparse_pose_confidence_metrics_uses_pose_observable_prefix():
+    K = np.eye(3, dtype=np.float64)
+    K[0, 0] = 100.0
+    K[1, 1] = 100.0
+    pose = np.eye(4, dtype=np.float64)
+    xyz = np.array(
+        [
+            [0.0, 0.0, 10.0],
+            [0.2, 0.0, 10.0],
+            [0.0, 0.2, 10.5],
+            [0.2, 0.2, 11.0],
+        ],
+        dtype=np.float64,
+    )
+    query_yx = eval_cambridge_hybrid.project_world_points_yx_np(xyz, pose, K)
+
+    metrics = sparse_pose_confidence_metrics(query_yx, xyz, pose, K)
+
+    assert metrics["sparse_pose_match_count"] == 4.0
+    assert metrics["sparse_pose_reproj_median_px"] == 0.0
+    assert metrics["sparse_pose_inlier_8px"] == 1.0
+    assert np.isfinite(metrics["sparse_pose_inlier8_pose_info_logdet"])
 
 
 def test_oracle_reprojection_match_scores_rank_existing_matches_only():
