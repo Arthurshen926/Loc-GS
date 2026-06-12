@@ -13,6 +13,8 @@ class OpenCvPnPConfig:
     confidence: float = 0.999
     iterations: int = 10000
     method: str = "epnp"
+    refine_with_inliers: bool = False
+    refinement_method: str = "iterative"
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,9 @@ class PnPResult:
     success: bool
     pose_w2c: np.ndarray | None
     inlier_mask: np.ndarray
+    method: str = "epnp"
+    refined: bool = False
+    refinement_method: str | None = None
 
     @property
     def inlier_count(self) -> int:
@@ -48,7 +53,12 @@ def solve_pnp_ransac(
     if points.shape[0] != pixels.shape[0]:
         raise ValueError("points3d_world and keypoints_xy must contain the same number of correspondences")
     if points.shape[0] < 4:
-        return PnPResult(success=False, pose_w2c=None, inlier_mask=np.zeros(points.shape[0], dtype=bool))
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros(points.shape[0], dtype=bool),
+            method=str(config.method),
+        )
 
     order = np.arange(points.shape[0])
     if match_scores is not None:
@@ -72,16 +82,48 @@ def solve_pnp_ransac(
         flags=_cv2_method(cv2, config.method),
     )
     if not ok or rvec is None or tvec is None:
-        return PnPResult(success=False, pose_w2c=None, inlier_mask=np.zeros(order.shape[0], dtype=bool))
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros(order.shape[0], dtype=bool),
+            method=str(config.method),
+        )
+
+    sorted_mask = np.zeros(order.shape[0], dtype=bool)
+    if inliers is not None:
+        sorted_mask[np.asarray(inliers, dtype=np.int64).reshape(-1)] = True
+    refined = False
+    refinement_method = None
+    if bool(config.refine_with_inliers) and int(sorted_mask.sum()) >= 4:
+        refine_points = points[sorted_mask].astype(np.float64)
+        refine_pixels = pixels[sorted_mask].astype(np.float64)
+        refine_ok, refine_rvec, refine_tvec = cv2.solvePnP(
+            refine_points,
+            refine_pixels,
+            intrinsics.matrix,
+            None,
+            rvec=np.asarray(rvec, dtype=np.float64),
+            tvec=np.asarray(tvec, dtype=np.float64),
+            useExtrinsicGuess=True,
+            flags=_cv2_method(cv2, config.refinement_method),
+        )
+        if refine_ok and refine_rvec is not None and refine_tvec is not None:
+            rvec = refine_rvec
+            tvec = refine_tvec
+            refined = True
+            refinement_method = str(config.refinement_method)
 
     rotation, _ = cv2.Rodrigues(rvec)
     pose = np.eye(4, dtype=np.float64)
     pose[:3, :3] = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
     pose[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
-
-    sorted_mask = np.zeros(order.shape[0], dtype=bool)
-    if inliers is not None:
-        sorted_mask[np.asarray(inliers, dtype=np.int64).reshape(-1)] = True
     original_mask = np.zeros_like(sorted_mask)
     original_mask[order] = sorted_mask
-    return PnPResult(success=True, pose_w2c=pose, inlier_mask=original_mask)
+    return PnPResult(
+        success=True,
+        pose_w2c=pose,
+        inlier_mask=original_mask,
+        method=str(config.method),
+        refined=refined,
+        refinement_method=refinement_method,
+    )

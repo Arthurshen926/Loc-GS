@@ -13,6 +13,7 @@ from loc_gs.sparse.rerank import (
     rerank_candidate_rows,
     summarize_candidate_availability,
 )
+from loc_gs.sparse.sparse_lgcv import filter_correspondences_by_reprojection
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,11 @@ class SparseLocalizationConfig:
     reprojection_error_px: float = 8.0
     pnp_iterations: int = 10000
     min_correspondences: int = 4
+    pnp_method: str = "epnp"
+    refine_with_inliers: bool = False
+    second_pnp_enabled: bool = False
+    second_pnp_method: str = "iterative"
+    lgcv_reprojection_error_px: float = 4.0
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,11 @@ class SparseLocalizationResult:
     selected_landmark_ids: list[int]
     selected_keypoint_indices: list[int]
     availability_summary: dict[str, int]
+    pnp_stage_count: int = 0
+    initial_inlier_count: int = 0
+    lgcv_keep_count: int | None = None
+    pnp_method: str = "epnp"
+    second_pnp_method: str | None = None
 
     @property
     def inlier_count(self) -> int:
@@ -136,6 +147,7 @@ def run_sparse_localization(
             selected_landmark_ids=selected_landmark_ids,
             selected_keypoint_indices=selected_keypoint_indices,
             availability_summary=availability,
+            pnp_method=str(cfg.pnp_method),
         )
 
     pnp = solve_pnp_ransac(
@@ -145,14 +157,57 @@ def run_sparse_localization(
         OpenCvPnPConfig(
             reprojection_error_px=float(cfg.reprojection_error_px),
             iterations=int(cfg.pnp_iterations),
+            method=str(cfg.pnp_method),
+            refine_with_inliers=bool(cfg.refine_with_inliers),
         ),
         match_scores=scores,
     )
+    final_pnp = pnp
+    final_mask = np.asarray(pnp.inlier_mask, dtype=bool)
+    pnp_stage_count = 1 if bool(pnp.success) else 0
+    lgcv_keep_count = None
+    second_method = None
+    if bool(pnp.success) and bool(cfg.second_pnp_enabled) and pnp.pose_w2c is not None:
+        lgcv = filter_correspondences_by_reprojection(
+            points,
+            keypoints_xy,
+            pnp.pose_w2c,
+            data.intrinsics,
+            threshold_px=float(cfg.lgcv_reprojection_error_px),
+        )
+        lgcv_keep = np.asarray(lgcv.keep_mask, dtype=bool)
+        lgcv_keep_count = int(lgcv.keep_count)
+        if lgcv_keep_count >= int(cfg.min_correspondences):
+            second_pnp = solve_pnp_ransac(
+                points[lgcv_keep],
+                keypoints_xy[lgcv_keep],
+                data.intrinsics,
+                OpenCvPnPConfig(
+                    reprojection_error_px=float(cfg.reprojection_error_px),
+                    iterations=int(cfg.pnp_iterations),
+                    method=str(cfg.second_pnp_method),
+                    refine_with_inliers=bool(cfg.refine_with_inliers),
+                ),
+                match_scores=scores[lgcv_keep],
+            )
+            pnp_stage_count = 2
+            second_method = str(cfg.second_pnp_method)
+            if bool(second_pnp.success):
+                mapped = np.zeros(points.shape[0], dtype=bool)
+                mapped_indices = np.flatnonzero(lgcv_keep)
+                mapped[mapped_indices[np.asarray(second_pnp.inlier_mask, dtype=bool)]] = True
+                final_pnp = second_pnp
+                final_mask = mapped
     return SparseLocalizationResult(
-        success=bool(pnp.success),
-        pose_w2c=pnp.pose_w2c,
-        inlier_mask=pnp.inlier_mask,
+        success=bool(final_pnp.success),
+        pose_w2c=final_pnp.pose_w2c,
+        inlier_mask=final_mask,
         selected_landmark_ids=selected_landmark_ids,
         selected_keypoint_indices=selected_keypoint_indices,
         availability_summary=availability,
+        pnp_stage_count=pnp_stage_count,
+        initial_inlier_count=int(pnp.inlier_count),
+        lgcv_keep_count=lgcv_keep_count,
+        pnp_method=str(cfg.pnp_method),
+        second_pnp_method=second_method,
     )

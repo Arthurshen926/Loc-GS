@@ -67,6 +67,7 @@ def test_internal_mainline_audit_cli_source_set_is_clean():
     assert any(str(path).endswith("core/pnp.py") for path in paths)
     assert any(str(path).endswith("sparse/artifact_adapter.py") for path in paths)
     assert any(str(path).endswith("sparse/landmarks.py") for path in paths)
+    assert any(str(path).endswith("sparse/sparse_lgcv.py") for path in paths)
     assert any(str(path).endswith("sparse/pipeline.py") for path in paths)
     assert any(str(path).endswith("sparse/pose_map_frame_audit.py") for path in paths)
     assert any(str(path).endswith("sparse/real_inputs.py") for path in paths)

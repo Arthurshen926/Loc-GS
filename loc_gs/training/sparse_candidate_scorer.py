@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -27,6 +29,17 @@ class LinearCandidateScorer:
             "schema_version": "internal_sparse_candidate_scorer_v1",
             **asdict(self),
         }
+
+    @classmethod
+    def from_json_dict(cls, payload: dict[str, object]) -> "LinearCandidateScorer":
+        weights = tuple(float(value) for value in payload.get("weights", ()))
+        if len(weights) != 3:
+            raise ValueError("internal sparse candidate scorer weights must contain three values")
+        return cls(
+            weights=weights,
+            bias=float(payload.get("bias", 0.0)),
+            feature_names=tuple(str(value) for value in payload.get("feature_names", ("native_score", "negative_rank", "valid"))),
+        )
 
 
 def _sigmoid(values: np.ndarray) -> np.ndarray:
@@ -107,6 +120,27 @@ def score_candidate_rows(batch: SparseCandidateBatch, model: LinearCandidateScor
             )
         rows.append(sorted(scored, key=lambda row: -float(row["solver_score"])))
     return rows
+
+
+def candidate_solver_score_rows(batch: SparseCandidateBatch, model: LinearCandidateScorer) -> list[list[float]]:
+    weights = np.asarray(model.weights, dtype=np.float64)
+    rows: list[list[float]] = []
+    for scores in batch.candidate_scores:
+        row: list[float] = []
+        for rank, score in enumerate(scores):
+            feature = np.asarray([float(score), -float(rank), 1.0], dtype=np.float64)
+            row.append(float(feature @ weights + float(model.bias)))
+        rows.append(row)
+    return rows
+
+
+def load_candidate_scorer(path: str | Path) -> LinearCandidateScorer:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"candidate scorer JSON must contain an object: {path}")
+    if payload.get("schema_version") != "internal_sparse_candidate_scorer_v1":
+        raise ValueError(f"unsupported candidate scorer schema: {payload.get('schema_version')}")
+    return LinearCandidateScorer.from_json_dict(payload)
 
 
 def _count_top1_correct(artifact: CachedCandidateArtifact, model: LinearCandidateScorer) -> int:

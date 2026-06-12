@@ -24,6 +24,7 @@ INTERNAL_MAINLINE_RELATIVE_PATHS: tuple[str, ...] = (
     "sparse/pose_map_frame_audit.py",
     "sparse/real_inputs.py",
     "sparse/rerank.py",
+    "sparse/sparse_lgcv.py",
     "simulation/query_sampler.py",
     "teacher/labels.py",
     "teacher/solver_feedback.py",

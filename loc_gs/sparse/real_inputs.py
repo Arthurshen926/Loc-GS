@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Sequence
 
 import numpy as np
 
@@ -18,6 +18,7 @@ ScoreMode = Literal["native", "teacher_oracle"]
 class CachedSparseInputConfig:
     score_mode: ScoreMode = "native"
     max_keypoints: int | None = None
+    solver_score_rows: Sequence[Sequence[float]] | None = None
 
 
 def _solver_score(*, correct: bool | None, score_mode: ScoreMode) -> float:
@@ -39,6 +40,9 @@ def sparse_input_from_cached_batch(
         cfg = CachedSparseInputConfig()
     batch.validate()
     max_keypoints = batch.keypoint_count if cfg.max_keypoints is None else min(batch.keypoint_count, int(cfg.max_keypoints))
+    solver_score_rows = cfg.solver_score_rows
+    if solver_score_rows is not None and len(solver_score_rows) < max_keypoints:
+        raise ValueError("solver_score_rows must contain at least max_keypoints rows")
     gaussian_ids = resolver.resolve_gaussian_ids(batch.candidate_landmark_ids[:max_keypoints])
     xyz = resolver.landmark_map.lookup_xyz(gaussian_ids)
 
@@ -54,13 +58,18 @@ def sparse_input_from_cached_batch(
             if not valid or not np.all(np.isfinite(point)):
                 continue
             correct = None if correct_rows is None else bool(correct_rows[source_row_idx][candidate_idx])
+            solver_score = (
+                float(solver_score_rows[source_row_idx][candidate_idx])
+                if solver_score_rows is not None
+                else _solver_score(correct=correct, score_mode=cfg.score_mode)
+            )
             candidates.append(
                 SparsePipelineCandidate(
                     keypoint_index=len(keypoints_xy),
                     landmark_id=int(gaussian_ids[source_row_idx, candidate_idx]),
                     point3d=point.tolist(),
                     native_score=float(native_score),
-                    solver_score=_solver_score(correct=correct, score_mode=cfg.score_mode),
+                    solver_score=solver_score,
                     geometric_correct=correct,
                 )
             )

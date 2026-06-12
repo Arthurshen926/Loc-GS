@@ -148,6 +148,32 @@ def test_cached_batch_converts_to_sparse_localization_input_with_resolved_xyz(tm
     assert first[1].solver_score == 1.0
 
 
+def test_cached_batch_can_use_trained_candidate_solver_scores(tmp_path: Path):
+    ply = _write_ply(tmp_path / "point_cloud.ply")
+    pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
+    artifact = load_listwise_candidate_artifact(pair_cache)
+    landmark_map = load_gaussian_landmark_map(ply)
+    resolver = CacheLandmarkResolver.from_pair_cache(pair_cache, landmark_map)
+
+    data = sparse_input_from_cached_batch(
+        artifact.batches[0],
+        resolver,
+        intrinsics=load_camera_records_from_inline()["img.png"].intrinsics,
+        cfg=CachedSparseInputConfig(
+            score_mode="native",
+            solver_score_rows=[
+                [-2.0, 3.0],
+                [4.0, -1.0],
+            ],
+        ),
+    )
+
+    assert data.candidates_by_keypoint[0][0].solver_score == -2.0
+    assert data.candidates_by_keypoint[0][1].solver_score == 3.0
+    assert data.candidates_by_keypoint[1][0].solver_score == 4.0
+    assert data.candidates_by_keypoint[1][1].solver_score == -1.0
+
+
 def load_camera_records_from_inline():
     from loc_gs.core.camera import CameraRecord, CameraIntrinsics
 

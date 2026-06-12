@@ -113,6 +113,21 @@ def _write_resized_canvas_artifact(path: Path, cameras: Path) -> Path:
     return path
 
 
+def _write_linear_scorer(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_sparse_candidate_scorer_v1",
+                "weights": [0.0, 0.0, 0.0],
+                "bias": 2.0,
+                "feature_names": ["native_score", "negative_rank", "valid"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_internal_sparse_smoke_cli_runs_cached_candidates_through_pnp(tmp_path: Path):
     cameras = tmp_path / "cameras.json"
     cameras.write_text(
@@ -220,3 +235,69 @@ def test_internal_sparse_smoke_cli_can_use_resized_cache_canvas_intrinsics(tmp_p
     assert metrics["pose_metric_frame"] == "camera_json_c2w_resized_pixel_center"
     assert manifest["hyperparameters"]["image_width"] == 120
     assert manifest["hyperparameters"]["missing_principal_point"] == "pixel_center"
+
+
+def test_internal_sparse_smoke_cli_loads_candidate_scorer_and_second_pnp_controls(tmp_path: Path):
+    cameras = tmp_path / "cameras.json"
+    cameras.write_text(
+        json.dumps(
+            [
+                {
+                    "img_name": "img.png",
+                    "width": 240,
+                    "height": 180,
+                    "fx": 140.0,
+                    "fy": 140.0,
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "smoke_scorer"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train",
+            "--candidate_artifact",
+            str(_write_resized_canvas_artifact(tmp_path / "pairs_resized.pt", cameras)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--candidate_scorer",
+            str(_write_linear_scorer(tmp_path / "model.json")),
+            "--pnp_method",
+            "epnp",
+            "--second_pnp_enabled",
+            "--second_pnp_method",
+            "iterative",
+            "--lgcv_reprojection_error_px",
+            "3.0",
+            "--refine_with_inliers",
+            "--output_dir",
+            str(out),
+            "--max_queries",
+            "1",
+            "--score_mode",
+            "native",
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert metrics["success_count"] == 1
+    assert metrics["pnp_stage_count_median"] == 2
+    assert manifest["candidate_scorer"] == str(tmp_path / "model.json")
+    assert manifest["hyperparameters"]["second_pnp_enabled"] is True
+    assert manifest["hyperparameters"]["second_pnp_method"] == "iterative"
+    assert manifest["hyperparameters"]["refine_with_inliers"] is True

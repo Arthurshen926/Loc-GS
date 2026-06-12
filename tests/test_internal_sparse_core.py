@@ -77,3 +77,45 @@ def test_solve_pnp_ransac_recovers_synthetic_pose():
     te_cm, re_deg = pose_error_cm_deg(result.pose_w2c, pose)
     assert te_cm < 0.1
     assert re_deg < 0.1
+
+
+def test_solve_pnp_ransac_reports_iterative_refinement_with_inliers():
+    cv2 = pytest.importorskip("cv2")
+    _ = cv2
+    intr = CameraIntrinsics(width=220, height=180, fx=130.0, fy=132.0, cx=109.5, cy=89.5)
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, 3] = np.array([0.04, -0.03, 0.22], dtype=np.float64)
+    points = np.array(
+        [
+            [-0.6, -0.3, 3.0],
+            [0.5, -0.2, 3.2],
+            [-0.3, 0.4, 2.8],
+            [0.7, 0.5, 3.5],
+            [0.0, 0.0, 2.6],
+            [-0.8, 0.2, 3.4],
+            [0.2, -0.6, 3.1],
+            [0.8, 0.1, 2.9],
+        ],
+        dtype=np.float64,
+    )
+    keypoints_xy, valid = project_points_w2c(points, pose, intr)
+    assert bool(valid.all())
+
+    result = solve_pnp_ransac(
+        points,
+        keypoints_xy,
+        intr,
+        OpenCvPnPConfig(
+            reprojection_error_px=1.0,
+            method="epnp",
+            refine_with_inliers=True,
+        ),
+    )
+
+    assert result.success is True
+    assert result.refined is True
+    assert result.method == "epnp"
+    assert result.refinement_method == "iterative"
+    te_cm, re_deg = pose_error_cm_deg(result.pose_w2c, pose)
+    assert te_cm < 0.1
+    assert re_deg < 0.1
