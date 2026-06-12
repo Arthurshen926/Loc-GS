@@ -19,6 +19,7 @@ INTERNAL_MAINLINE_RELATIVE_PATHS: tuple[str, ...] = (
     "sparse/artifact_adapter.py",
     "sparse/correspondences.py",
     "sparse/gate.py",
+    "sparse/landmarks.py",
     "sparse/pipeline.py",
     "sparse/rerank.py",
     "teacher/labels.py",

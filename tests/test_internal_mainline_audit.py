@@ -66,6 +66,7 @@ def test_internal_mainline_audit_cli_source_set_is_clean():
     assert any(str(path).endswith("run_internal_sparse_gate.py") for path in paths)
     assert any(str(path).endswith("core/pnp.py") for path in paths)
     assert any(str(path).endswith("sparse/artifact_adapter.py") for path in paths)
+    assert any(str(path).endswith("sparse/landmarks.py") for path in paths)
     assert any(str(path).endswith("sparse/pipeline.py") for path in paths)
 
     assert run_internal_mainline_audit(paths) == {
