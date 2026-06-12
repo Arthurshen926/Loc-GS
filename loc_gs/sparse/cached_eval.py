@@ -147,6 +147,10 @@ def run_cached_sparse_eval(
     selected_correct_ratios: list[float] = []
     selected_bbox_area_fractions: list[float] = []
     selected_depth_ranges: list[float] = []
+    inlier_correct_counts: list[float] = []
+    inlier_correct_ratios: list[float] = []
+    inlier_bbox_area_fractions: list[float] = []
+    inlier_depth_ranges: list[float] = []
     rerank_native_top1_correct = 0
     rerank_top1_correct = 0
     rerank_top1_changed_count = 0
@@ -240,6 +244,14 @@ def run_cached_sparse_eval(
                 float(selected_set_diagnostics.get("selected_keypoint_bbox_area_fraction", 0.0))
             )
             selected_depth_ranges.append(float(selected_set_diagnostics.get("selected_depth_range_m", 0.0)))
+        inlier_set_diagnostics = dict(result.inlier_set_diagnostics or {})
+        if inlier_set_diagnostics:
+            inlier_correct_counts.append(float(inlier_set_diagnostics.get("inlier_geometric_correct_count", 0.0)))
+            inlier_correct_ratios.append(float(inlier_set_diagnostics.get("inlier_geometric_correct_ratio", 0.0)))
+            inlier_bbox_area_fractions.append(
+                float(inlier_set_diagnostics.get("inlier_keypoint_bbox_area_fraction", 0.0))
+            )
+            inlier_depth_ranges.append(float(inlier_set_diagnostics.get("inlier_depth_range_m", 0.0)))
         rows.append(
             {
                 "query_id": batch.query_id,
@@ -257,6 +269,7 @@ def run_cached_sparse_eval(
                 "re_deg": re_deg,
                 "availability_summary": result.availability_summary,
                 "selected_set_diagnostics": selected_set_diagnostics,
+                "inlier_set_diagnostics": inlier_set_diagnostics,
                 **({} if rerank_diagnostic is None else {"rerank_diagnostic": rerank_diagnostic}),
             }
         )
@@ -301,6 +314,10 @@ def run_cached_sparse_eval(
         "selected_geometric_correct_ratio_median": _median_or_none(selected_correct_ratios),
         "selected_keypoint_bbox_area_fraction_median": _median_or_none(selected_bbox_area_fractions),
         "selected_depth_range_m_median": _median_or_none(selected_depth_ranges),
+        "inlier_geometric_correct_count_median": _median_or_none(inlier_correct_counts),
+        "inlier_geometric_correct_ratio_median": _median_or_none(inlier_correct_ratios),
+        "inlier_keypoint_bbox_area_fraction_median": _median_or_none(inlier_bbox_area_fractions),
+        "inlier_depth_range_m_median": _median_or_none(inlier_depth_ranges),
         "pnp_stage_count_median": _median_or_none(stage_counts),
         "lgcv_keep_count_median": _median_or_none(lgcv_keep_counts),
         "post_pnp_rescore_changed_count_median": _median_or_none(post_pnp_changed_counts),

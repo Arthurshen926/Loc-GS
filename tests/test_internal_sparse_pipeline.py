@@ -85,6 +85,8 @@ def test_sparse_pipeline_uses_reranked_candidates_for_pnp():
     assert result.selected_set_diagnostics["selected_geometric_correct_ratio"] == 1.0
     assert result.selected_set_diagnostics["selected_keypoint_bbox_area_fraction"] > 0.01
     assert result.selected_set_diagnostics["selected_depth_range_m"] == pytest.approx(0.8)
+    assert result.inlier_set_diagnostics["inlier_geometric_correct_count"] >= 5
+    assert result.inlier_set_diagnostics["inlier_geometric_correct_ratio"] == 1.0
     assert result.availability_summary["top1_correct"] == 0
     assert result.availability_summary["topk_available"] == 6
     te_cm, re_deg = pose_error_cm_deg(result.pose_w2c, gt_pose)
@@ -108,6 +110,8 @@ def test_sparse_pipeline_native_order_can_expose_oracle_gap():
     assert result.selected_landmark_ids == [1000, 1001, 1002, 1003, 1004, 1005]
     assert result.selected_set_diagnostics["selected_geometric_correct_count"] == 0
     assert result.selected_set_diagnostics["selected_geometric_correct_ratio"] == 0.0
+    assert result.inlier_set_diagnostics["inlier_geometric_correct_count"] == 0
+    assert result.inlier_set_diagnostics["inlier_geometric_correct_ratio"] == 0.0
     assert result.availability_summary["oracle_gap"] == 6
     assert result.success is True
     assert result.inlier_count == 6

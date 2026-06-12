@@ -425,11 +425,17 @@ def test_eval_internal_sparse_cached_cli_accepts_mlp_candidate_scorer(tmp_path: 
     assert metrics["selected_geometric_correct_ratio_median"] == 1.0
     assert metrics["selected_keypoint_bbox_area_fraction_median"] > 0.01
     assert metrics["selected_depth_range_m_median"] > 0.0
+    assert metrics["inlier_geometric_correct_count_median"] == 6
+    assert metrics["inlier_geometric_correct_ratio_median"] == 1.0
+    assert metrics["inlier_keypoint_bbox_area_fraction_median"] > 0.01
+    assert metrics["inlier_depth_range_m_median"] > 0.0
     assert rows[0]["rerank_diagnostic"]["native_top1_correct"] == 0
     assert rows[0]["rerank_diagnostic"]["reranked_top1_correct"] == 6
     assert rows[0]["rerank_diagnostic"]["reranked_top1_gain"] == 6
     assert rows[0]["selected_set_diagnostics"]["selected_geometric_correct_count"] == 6
     assert rows[0]["selected_set_diagnostics"]["selected_geometric_correct_ratio"] == 1.0
+    assert rows[0]["inlier_set_diagnostics"]["inlier_geometric_correct_count"] == 6
+    assert rows[0]["inlier_set_diagnostics"]["inlier_geometric_correct_ratio"] == 1.0
     assert rows[0]["success"] is True
     assert rows[0]["te_cm"] < 1.0
 
