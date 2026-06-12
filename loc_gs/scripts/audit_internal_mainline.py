@@ -50,6 +50,7 @@ INTERNAL_MAINLINE_RELATIVE_PATHS: tuple[str, ...] = (
     "training/sparse_candidate_scorer.py",
     "scripts/build_internal_distillation_artifact.py",
     "scripts/build_internal_candidate_completion_plan.py",
+    "scripts/build_internal_candidate_mlp_feature_cache.py",
     "scripts/build_internal_candidate_shard_artifact.py",
     "scripts/build_internal_candidate_shards_from_query_cache.py",
     "scripts/build_internal_candidate_shard_from_feature_maps.py",

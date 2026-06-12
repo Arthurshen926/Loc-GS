@@ -14,7 +14,9 @@ from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 from loc_gs.sparse.audit import reject_test_split
 from loc_gs.students.candidate_mlp_scorer import (
     CandidateMLPScorerConfig,
+    load_candidate_mlp_feature_cache,
     train_candidate_mlp_scorer,
+    train_candidate_mlp_scorer_from_feature_cache,
 )
 from loc_gs.training.sparse_candidate_scorer import classify_feature_input_policy
 
@@ -31,7 +33,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train an internal tensorized MLP sparse candidate scorer.")
     parser.add_argument("--scene", required=True)
     parser.add_argument("--split_name", required=True)
-    parser.add_argument("--candidate_artifact", type=Path, required=True)
+    parser.add_argument("--candidate_artifact", type=Path, default=None)
+    parser.add_argument("--feature_cache", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--max_rows", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=100)
@@ -58,9 +61,11 @@ def _feature_names(raw: str) -> tuple[str, ...]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_argparser().parse_args(argv)
+    parser = build_argparser()
+    args = parser.parse_args(argv)
+    if args.candidate_artifact is None and args.feature_cache is None:
+        parser.error("one of --candidate_artifact or --feature_cache is required")
     split = reject_test_split(str(args.split_name), purpose="internal candidate MLP scorer training")
-    artifact = load_listwise_candidate_artifact(args.candidate_artifact, max_rows=args.max_rows)
     scalar_feature_names = _feature_names(str(args.scalar_feature_names))
     cfg = CandidateMLPScorerConfig(
         epochs=int(args.epochs),
@@ -74,7 +79,19 @@ def main(argv: list[str] | None = None) -> int:
         scalar_feature_names=scalar_feature_names,
     )
     feature_policy = classify_feature_input_policy(cfg.scalar_feature_names)
-    model, summary = train_candidate_mlp_scorer(artifact, cfg)
+    if args.feature_cache is not None:
+        if args.max_rows is not None:
+            parser.error("--max_rows is only supported when training directly from --candidate_artifact")
+        cache = load_candidate_mlp_feature_cache(args.feature_cache)
+        reject_test_split(cache.split_name, purpose="internal candidate MLP scorer feature cache training")
+        if str(cache.scene) != str(args.scene):
+            raise ValueError(f"feature cache scene {cache.scene!r} does not match requested scene {args.scene!r}")
+        if str(cache.split_name) != split:
+            raise ValueError(f"feature cache split {cache.split_name!r} does not match requested split {split!r}")
+        model, summary = train_candidate_mlp_scorer_from_feature_cache(cache, cfg)
+    else:
+        artifact = load_listwise_candidate_artifact(args.candidate_artifact, max_rows=args.max_rows)
+        model, summary = train_candidate_mlp_scorer(artifact, cfg)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model_path = args.output_dir / "model.pt"
     torch.save(model.to_torch_dict(), model_path)
@@ -91,7 +108,8 @@ def main(argv: list[str] | None = None) -> int:
         "dense_inference_enabled": False,
         "external_runtime_dependency": "forbidden",
         **feature_policy,
-        "candidate_artifact": str(args.candidate_artifact),
+        "candidate_artifact": None if args.candidate_artifact is None else str(args.candidate_artifact),
+        "feature_cache": None if args.feature_cache is None else str(args.feature_cache),
         "candidate_mlp_scorer": str(model_path),
         "hyperparameters": {
             "max_rows": None if args.max_rows is None else int(args.max_rows),
@@ -102,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
             "listwise_loss_weight": float(args.listwise_loss_weight),
             "batch_size": int(args.batch_size),
             "stream_features": bool(args.stream_features),
+            "feature_cache": None if args.feature_cache is None else str(args.feature_cache),
             "rank_feature_scale": float(args.rank_feature_scale),
             "scalar_feature_names": list(cfg.scalar_feature_names),
         },

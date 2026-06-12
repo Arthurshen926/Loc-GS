@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+from loc_gs.scripts.build_internal_candidate_mlp_feature_cache import main as build_feature_cache_main
 from loc_gs.scripts.train_internal_candidate_mlp_scorer import main
 from loc_gs.sparse.artifact_adapter import CachedCandidateArtifact
 from loc_gs.sparse.correspondences import SparseCandidateBatch
@@ -12,9 +13,13 @@ from loc_gs.students.candidate_mlp_scorer import (
     CandidateMLPScorerConfig,
     _feature_batch_from_sparse_batch,
     _training_matrix,
+    build_candidate_mlp_feature_cache,
     build_candidate_mlp_scorer_runtime,
     candidate_mlp_score_rows,
+    load_candidate_mlp_feature_cache,
     load_candidate_mlp_scorer,
+    save_candidate_mlp_feature_cache,
+    train_candidate_mlp_scorer_from_feature_cache,
     train_candidate_mlp_scorer,
 )
 
@@ -170,6 +175,45 @@ def test_candidate_mlp_vectorized_feature_batch_matches_training_matrix():
     assert feature_batch.weighted_sample_count == pytest.approx(stats["weighted_sample_count"])
 
 
+def test_candidate_mlp_feature_cache_roundtrip_and_training(tmp_path: Path):
+    cfg = CandidateMLPScorerConfig(
+        epochs=80,
+        learning_rate=0.03,
+        hidden_dim=8,
+        seed=7,
+        listwise_loss_weight=1.0,
+        batch_size=2,
+    )
+    artifact = _artifact()
+    cache = build_candidate_mlp_feature_cache(artifact, cfg)
+    features, labels, weights, group_slices, stats = _training_matrix(artifact, cfg, descriptor_dim=2)
+
+    np.testing.assert_allclose(cache.features, features, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(cache.labels, labels, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(cache.sample_weights, weights, rtol=1.0e-6, atol=1.0e-6)
+    assert list(cache.group_slices) == group_slices
+    assert cache.scene == "GreatCourt"
+    assert cache.split_name == "train"
+    assert cache.descriptor_dim == 2
+    assert cache.dense_teacher_sample_count == stats["dense_teacher_sample_count"]
+    assert cache.native_top1_correct == 0
+
+    cache_path = save_candidate_mlp_feature_cache(cache, tmp_path / "feature_cache.pt")
+    loaded = load_candidate_mlp_feature_cache(cache_path)
+    np.testing.assert_allclose(loaded.features, cache.features, rtol=1.0e-6, atol=1.0e-6)
+    assert loaded.group_slices == cache.group_slices
+    assert loaded.summarize()["feature_materialization"] == "feature_cache"
+
+    model, summary = train_candidate_mlp_scorer_from_feature_cache(loaded, cfg)
+    rows = candidate_mlp_score_rows(_descriptor_batch(), model)
+    assert summary["feature_materialization"] == "feature_cache"
+    assert summary["feature_cache_enabled"] is True
+    assert summary["trained_top1_correct"] == 4
+    assert summary["native_top1_correct"] == 0
+    assert summary["paper_safe_sparse_inference"] is True
+    assert all(row[1] > row[0] for row in rows)
+
+
 def test_train_internal_candidate_mlp_scorer_cli_writes_pt_bundle(tmp_path: Path):
     out = tmp_path / "mlp"
 
@@ -216,3 +260,82 @@ def test_train_internal_candidate_mlp_scorer_cli_writes_pt_bundle(tmp_path: Path
     assert manifest["external_runtime_dependency"] == "forbidden"
     assert manifest["hyperparameters"]["batch_size"] == 2
     assert manifest["hyperparameters"]["stream_features"] is True
+
+
+def test_build_internal_candidate_mlp_feature_cache_cli_writes_audited_artifact(tmp_path: Path):
+    out = tmp_path / "feature-cache"
+    source = _write_artifact(tmp_path / "pairs.pt")
+
+    rc = build_feature_cache_main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train",
+            "--candidate_artifact",
+            str(source),
+            "--output_dir",
+            str(out),
+            "--batch_size",
+            "2",
+        ]
+    )
+
+    assert rc == 0
+    cache = load_candidate_mlp_feature_cache(out / "feature_cache.pt")
+    summary = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert cache.scene == "GreatCourt"
+    assert summary["schema_version"] == "internal_candidate_mlp_feature_cache_summary_v1"
+    assert summary["feature_materialization"] == "feature_cache"
+    assert manifest["schema_version"] == "internal_candidate_mlp_feature_cache_manifest_v1"
+    assert manifest["candidate_artifact"] == str(source)
+    assert manifest["feature_cache"] == str(out / "feature_cache.pt")
+    assert manifest["dense_teacher_enabled"] is True
+    assert manifest["dense_inference_enabled"] is False
+    assert manifest["external_runtime_dependency"] == "forbidden"
+
+
+def test_train_internal_candidate_mlp_scorer_cli_accepts_feature_cache(tmp_path: Path):
+    source = _write_artifact(tmp_path / "pairs.pt")
+    cache = build_candidate_mlp_feature_cache(
+        _artifact(),
+        CandidateMLPScorerConfig(epochs=1, hidden_dim=8, batch_size=2),
+    )
+    cache_path = save_candidate_mlp_feature_cache(cache, tmp_path / "feature_cache.pt")
+    out = tmp_path / "mlp-from-cache"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train",
+            "--candidate_artifact",
+            str(source),
+            "--feature_cache",
+            str(cache_path),
+            "--output_dir",
+            str(out),
+            "--epochs",
+            "60",
+            "--learning_rate",
+            "0.03",
+            "--hidden_dim",
+            "8",
+            "--listwise_loss_weight",
+            "1.0",
+            "--batch_size",
+            "2",
+        ]
+    )
+
+    assert rc == 0
+    summary = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert summary["feature_materialization"] == "feature_cache"
+    assert summary["feature_cache_enabled"] is True
+    assert summary["trained_top1_correct"] == 4
+    assert manifest["feature_cache"] == str(cache_path)
+    assert manifest["candidate_artifact"] == str(source)
+    assert manifest["hyperparameters"]["feature_cache"] == str(cache_path)

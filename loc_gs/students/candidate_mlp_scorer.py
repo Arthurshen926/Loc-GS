@@ -120,6 +120,127 @@ class CandidateMLPScorer:
 
 
 @dataclass(frozen=True)
+class CandidateMLPFeatureCache:
+    scene: str
+    split_name: str
+    source_path: str
+    features: np.ndarray
+    labels: np.ndarray
+    sample_weights: np.ndarray
+    group_slices: tuple[tuple[int, int], ...]
+    scalar_feature_names: tuple[str, ...]
+    descriptor_dim: int
+    dense_teacher_sample_count: int
+    weighted_sample_count: float
+    native_top1_correct: int
+    metadata: Mapping[str, object] | None = None
+
+    @property
+    def input_dim(self) -> int:
+        return len(self.scalar_feature_names) + 4 * int(self.descriptor_dim)
+
+    @property
+    def sample_count(self) -> int:
+        return int(np.asarray(self.labels).reshape(-1).shape[0])
+
+    def validate(self) -> None:
+        features = np.asarray(self.features, dtype=np.float32)
+        labels = np.asarray(self.labels, dtype=np.float32).reshape(-1)
+        sample_weights = np.asarray(self.sample_weights, dtype=np.float32).reshape(-1)
+        if features.ndim != 2:
+            raise ValueError("candidate MLP feature cache features must be a 2-D matrix")
+        if features.shape[0] <= 0:
+            raise ValueError("candidate MLP feature cache must contain at least one sample")
+        if features.shape[1] != int(self.input_dim):
+            raise ValueError("candidate MLP feature cache feature dimension does not match descriptor/scalar config")
+        if labels.shape[0] != features.shape[0] or sample_weights.shape[0] != features.shape[0]:
+            raise ValueError("candidate MLP feature cache labels and sample weights must align with features")
+        for start, end in self.group_slices:
+            if int(start) < 0 or int(end) <= int(start) or int(end) > features.shape[0]:
+                raise ValueError("candidate MLP feature cache group_slices are out of range")
+
+    def summarize(self) -> dict[str, object]:
+        self.validate()
+        feature_policy = classify_feature_input_policy(self.scalar_feature_names)
+        return {
+            "schema_version": "internal_candidate_mlp_feature_cache_summary_v1",
+            "scene": str(self.scene),
+            "split_name": str(self.split_name),
+            "source_path": str(self.source_path),
+            "sample_count": int(self.sample_count),
+            "label_count": int(np.asarray(self.labels, dtype=np.float32).sum()),
+            "group_count": int(len(self.group_slices)),
+            "descriptor_dim": int(self.descriptor_dim),
+            "scalar_feature_names": list(self.scalar_feature_names),
+            "feature_materialization": "feature_cache",
+            "feature_cache_enabled": True,
+            "dense_teacher_sample_count": int(self.dense_teacher_sample_count),
+            "weighted_sample_count": float(self.weighted_sample_count),
+            "native_top1_correct": int(self.native_top1_correct),
+            "paper_safe_sparse_inference": True,
+            **feature_policy,
+        }
+
+    def to_torch_dict(self) -> dict[str, object]:
+        self.validate()
+        group_slices = np.asarray(self.group_slices, dtype=np.int64).reshape(-1, 2)
+        return {
+            "schema_version": "internal_candidate_mlp_feature_cache_v1",
+            "scene": str(self.scene),
+            "split_name": str(self.split_name),
+            "source_path": str(self.source_path),
+            "features": torch.tensor(np.asarray(self.features, dtype=np.float32), dtype=torch.float32),
+            "labels": torch.tensor(np.asarray(self.labels, dtype=np.float32).reshape(-1), dtype=torch.float32),
+            "sample_weights": torch.tensor(
+                np.asarray(self.sample_weights, dtype=np.float32).reshape(-1),
+                dtype=torch.float32,
+            ),
+            "group_slices": torch.tensor(group_slices, dtype=torch.int64),
+            "scalar_feature_names": list(self.scalar_feature_names),
+            "descriptor_dim": int(self.descriptor_dim),
+            "dense_teacher_sample_count": int(self.dense_teacher_sample_count),
+            "weighted_sample_count": float(self.weighted_sample_count),
+            "native_top1_correct": int(self.native_top1_correct),
+            "metadata": dict(self.metadata or {}),
+            **classify_feature_input_policy(self.scalar_feature_names),
+        }
+
+    @classmethod
+    def from_torch_dict(cls, payload: Mapping[str, object]) -> "CandidateMLPFeatureCache":
+        if payload.get("schema_version") != "internal_candidate_mlp_feature_cache_v1":
+            raise ValueError(f"unsupported candidate MLP feature cache schema: {payload.get('schema_version')}")
+        features = _as_numpy_float32(payload.get("features"), name="features")
+        labels = _as_numpy_float32(payload.get("labels"), name="labels").reshape(-1)
+        sample_weights = _as_numpy_float32(payload.get("sample_weights"), name="sample_weights").reshape(-1)
+        group_value = payload.get("group_slices")
+        if group_value is None:
+            raise ValueError("candidate MLP feature cache payload missing group_slices")
+        if hasattr(group_value, "detach"):
+            group_value = group_value.detach().cpu()
+        group_array = np.asarray(group_value, dtype=np.int64).reshape(-1, 2)
+        metadata = payload.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        cache = cls(
+            scene=str(payload.get("scene") or "unknown"),
+            split_name=str(payload.get("split_name") or "unknown"),
+            source_path=str(payload.get("source_path") or "unknown"),
+            features=features,
+            labels=labels,
+            sample_weights=sample_weights,
+            group_slices=tuple((int(start), int(end)) for start, end in group_array.tolist()),
+            scalar_feature_names=tuple(str(name) for name in payload.get("scalar_feature_names", ())),
+            descriptor_dim=int(payload.get("descriptor_dim", 0)),
+            dense_teacher_sample_count=int(payload.get("dense_teacher_sample_count", 0)),
+            weighted_sample_count=float(payload.get("weighted_sample_count", float(sample_weights.sum()))),
+            native_top1_correct=int(payload.get("native_top1_correct", 0)),
+            metadata=dict(metadata),
+        )
+        cache.validate()
+        return cache
+
+
+@dataclass(frozen=True)
 class _FeatureBatch:
     features: np.ndarray
     labels: np.ndarray
@@ -260,6 +381,162 @@ def train_candidate_mlp_scorer(
         **training_stats,
     }
     return model, summary
+
+
+def build_candidate_mlp_feature_cache(
+    artifact: CachedCandidateArtifact,
+    cfg: CandidateMLPScorerConfig | None = None,
+    *,
+    descriptor_dim: int | None = None,
+) -> CandidateMLPFeatureCache:
+    if cfg is None:
+        cfg = CandidateMLPScorerConfig()
+    if descriptor_dim is None:
+        descriptor_dim = _infer_descriptor_dim(artifact)
+    feature_chunks: list[np.ndarray] = []
+    label_chunks: list[np.ndarray] = []
+    weight_chunks: list[np.ndarray] = []
+    group_slices: list[tuple[int, int]] = []
+    dense_teacher_sample_count = 0
+    weighted_sample_count = 0.0
+    sample_offset = 0
+    for feature_batch in _iter_feature_batches(artifact, cfg, descriptor_dim=int(descriptor_dim)):
+        if feature_batch.features.shape[0] == 0:
+            continue
+        feature_chunks.append(np.asarray(feature_batch.features, dtype=np.float32))
+        label_chunks.append(np.asarray(feature_batch.labels, dtype=np.float32).reshape(-1))
+        weight_chunks.append(np.asarray(feature_batch.sample_weights, dtype=np.float32).reshape(-1))
+        for start, end in feature_batch.group_slices:
+            group_slices.append((int(sample_offset + int(start)), int(sample_offset + int(end))))
+        sample_offset += int(feature_batch.features.shape[0])
+        dense_teacher_sample_count += int(feature_batch.dense_teacher_sample_count)
+        weighted_sample_count += float(feature_batch.weighted_sample_count)
+    if not feature_chunks:
+        raise ValueError("candidate artifact did not contain trainable MLP scorer samples")
+    cache = CandidateMLPFeatureCache(
+        scene=str(artifact.scene),
+        split_name=str(artifact.split_name),
+        source_path=str(artifact.source_path),
+        features=np.concatenate(feature_chunks, axis=0).astype(np.float32, copy=False),
+        labels=np.concatenate(label_chunks, axis=0).astype(np.float32, copy=False),
+        sample_weights=np.concatenate(weight_chunks, axis=0).astype(np.float32, copy=False),
+        group_slices=tuple(group_slices),
+        scalar_feature_names=tuple(str(name) for name in cfg.scalar_feature_names),
+        descriptor_dim=int(descriptor_dim),
+        dense_teacher_sample_count=int(dense_teacher_sample_count),
+        weighted_sample_count=float(weighted_sample_count),
+        native_top1_correct=int(_count_native_top1_correct(artifact)),
+        metadata={
+            "artifact_format": str(artifact.artifact_format),
+            "topk": int(artifact.topk),
+            "artifact_metadata": dict(artifact.metadata),
+            "builder_hyperparameters": asdict(cfg),
+        },
+    )
+    cache.validate()
+    return cache
+
+
+def train_candidate_mlp_scorer_from_feature_cache(
+    cache: CandidateMLPFeatureCache,
+    cfg: CandidateMLPScorerConfig | None = None,
+) -> tuple[CandidateMLPScorer, dict[str, object]]:
+    if cfg is None:
+        cfg = CandidateMLPScorerConfig()
+    cache.validate()
+    if tuple(str(name) for name in cfg.scalar_feature_names) != tuple(cache.scalar_feature_names):
+        raise ValueError("candidate MLP scorer scalar_feature_names must match the feature cache")
+    torch.manual_seed(int(cfg.seed))
+    features_raw = torch.tensor(np.asarray(cache.features, dtype=np.float32), dtype=torch.float32)
+    labels = torch.tensor(np.asarray(cache.labels, dtype=np.float32).reshape(-1, 1), dtype=torch.float32)
+    weights = torch.tensor(np.asarray(cache.sample_weights, dtype=np.float32).reshape(-1, 1), dtype=torch.float32)
+    feature_mean = features_raw.mean(dim=0)
+    feature_std = features_raw.std(dim=0, unbiased=False)
+    feature_std = torch.where(feature_std < 1.0e-6, torch.ones_like(feature_std), feature_std)
+    features = (features_raw - feature_mean) / feature_std
+    network = _network(features.shape[1], int(cfg.hidden_dim))
+    optimizer = torch.optim.AdamW(network.parameters(), lr=float(cfg.learning_rate))
+    train_batches = _training_batches(
+        sample_count=int(features.shape[0]),
+        group_slices=cache.group_slices,
+        batch_size=int(cfg.batch_size),
+    )
+    optimizer_step_count = 0
+    for _epoch in range(int(cfg.epochs)):
+        for start, end, batch_group_slices in train_batches:
+            batch_features = features[int(start) : int(end)]
+            batch_labels = labels[int(start) : int(end)]
+            batch_weights = weights[int(start) : int(end)]
+            logits = network(batch_features)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, batch_labels, reduction="none")
+            normalizer = torch.clamp(batch_weights.sum(), min=torch.tensor(1.0e-6))
+            pointwise = (loss * batch_weights).sum() / normalizer
+            objective = pointwise + float(cfg.listwise_loss_weight) * _listwise_softmax_loss(
+                logits,
+                batch_labels,
+                batch_weights,
+                batch_group_slices,
+            )
+            optimizer.zero_grad()
+            objective.backward()
+            optimizer.step()
+            optimizer_step_count += 1
+    with torch.no_grad():
+        train_logits = network(features).reshape(-1)
+        logit_mean = float(train_logits.mean().item())
+        logit_std = float(train_logits.std(unbiased=False).item())
+        if logit_std <= 1.0e-6:
+            logit_std = 1.0
+    model = CandidateMLPScorer(
+        scalar_feature_names=tuple(str(name) for name in cache.scalar_feature_names),
+        descriptor_dim=int(cache.descriptor_dim),
+        hidden_dim=int(cfg.hidden_dim),
+        feature_mean=tuple(float(v) for v in feature_mean.tolist()),
+        feature_std=tuple(float(v) for v in feature_std.tolist()),
+        state_dict={str(key): value.detach().cpu() for key, value in network.state_dict().items()},
+        logit_mean=float(logit_mean),
+        logit_std=float(logit_std),
+    )
+    summary = {
+        "schema_version": "internal_candidate_mlp_scorer_training_summary_v1",
+        "student_modules": ["candidate_mlp_scorer"],
+        "label_count": int(np.asarray(cache.labels, dtype=np.float32).sum()),
+        "sample_count": int(cache.sample_count),
+        "native_top1_correct": int(cache.native_top1_correct),
+        "trained_top1_correct": int(_count_top1_correct_from_feature_cache(cache, train_logits)),
+        "epochs": int(cfg.epochs),
+        "learning_rate": float(cfg.learning_rate),
+        "hidden_dim": int(cfg.hidden_dim),
+        "listwise_loss_weight": float(cfg.listwise_loss_weight),
+        "batch_size": int(cfg.batch_size),
+        "feature_materialization": "feature_cache",
+        "feature_cache_enabled": True,
+        "training_batch_count": int(len(train_batches)),
+        "optimizer_step_count": int(optimizer_step_count),
+        "descriptor_dim": int(cache.descriptor_dim),
+        "score_calibration": "train_logit_zscore",
+        "logit_mean": float(logit_mean),
+        "logit_std": float(logit_std),
+        "hyperparameters": asdict(cfg),
+        **classify_feature_input_policy(cache.scalar_feature_names),
+        "dense_teacher_sample_count": int(cache.dense_teacher_sample_count),
+        "weighted_sample_count": float(cache.weighted_sample_count),
+    }
+    return model, summary
+
+
+def save_candidate_mlp_feature_cache(cache: CandidateMLPFeatureCache, path: str | Path) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(cache.to_torch_dict(), target)
+    return target
+
+
+def load_candidate_mlp_feature_cache(path: str | Path) -> CandidateMLPFeatureCache:
+    payload = torch.load(Path(path), map_location="cpu")
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"candidate MLP feature cache torch payload must contain an object: {path}")
+    return CandidateMLPFeatureCache.from_torch_dict(payload)
 
 
 def _train_candidate_mlp_scorer_streaming(
@@ -947,6 +1224,31 @@ def _count_native_top1_correct(artifact: CachedCandidateArtifact) -> int:
             if row and bool(row[0]):
                 total += 1
     return total
+
+
+def _count_top1_correct_from_feature_cache(cache: CandidateMLPFeatureCache, logits: torch.Tensor) -> int:
+    labels = np.asarray(cache.labels, dtype=np.float32).reshape(-1)
+    scores = np.asarray(logits.detach().cpu(), dtype=np.float32).reshape(-1)
+    total = 0
+    for start, end in cache.group_slices:
+        group_scores = scores[int(start) : int(end)]
+        if group_scores.size == 0:
+            continue
+        best = int(start) + int(group_scores.argmax())
+        if bool(labels[best] > 0.5):
+            total += 1
+    return total
+
+
+def _as_numpy_float32(value: object, *, name: str) -> np.ndarray:
+    if value is None:
+        raise ValueError(f"candidate MLP feature cache payload missing {name}")
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+    array = np.asarray(value, dtype=np.float32)
+    if array.size == 0:
+        raise ValueError(f"candidate MLP feature cache payload {name} must not be empty")
+    return array
 
 
 def _as_cpu_tensor(value: object) -> torch.Tensor:
