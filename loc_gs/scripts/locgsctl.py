@@ -311,6 +311,9 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
     nested_scorer_training = data.get("candidate_scorer_training")
     if isinstance(nested_scorer_training, dict):
         payload["candidate_scorer_training"] = _compact_candidate_scorer_training(nested_scorer_training)
+    nested_rerank = data.get("candidate_rerank_diagnostic")
+    if isinstance(nested_rerank, dict):
+        payload["candidate_rerank_diagnostic"] = _compact_rerank_diagnostic(nested_rerank)
     for stage in ("sparse", "dense"):
         stage_data = data.get(stage, {})
         if isinstance(stage_data, dict):

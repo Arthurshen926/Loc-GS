@@ -178,6 +178,15 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                     "top1_gain": 279,
                     "relative_top1_gain": 0.9489795918367347,
                 },
+                "candidate_rerank_diagnostic": {
+                    "rerank_diagnostic_enabled": True,
+                    "rerank_diagnostic_query_count": 1536,
+                    "native_top1_correct": 91,
+                    "reranked_top1_correct": 225,
+                    "reranked_top1_gain": 134,
+                    "reranked_top1_changed_count": 1065,
+                    "reranked_topk_available": 259,
+                },
             }
         ),
         encoding="utf-8",
@@ -194,6 +203,8 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
     }
     assert payload["candidate_scorer_training"]["top1_gain"] == 279
     assert payload["candidate_scorer_training"]["feature_materialization"] == "feature_cache"
+    assert payload["candidate_rerank_diagnostic"]["reranked_top1_gain"] == 134
+    assert payload["candidate_rerank_diagnostic"]["reranked_top1_correct"] == 225
 
 
 def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, capsys):
