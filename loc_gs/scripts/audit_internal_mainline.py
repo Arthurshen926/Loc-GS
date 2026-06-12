@@ -11,8 +11,13 @@ from loc_gs.sparse.audit import assert_internal_mainline_sources
 
 
 INTERNAL_MAINLINE_RELATIVE_PATHS: tuple[str, ...] = (
+    "core/camera.py",
+    "core/geometry.py",
+    "core/metrics.py",
+    "core/pnp.py",
     "sparse/audit.py",
     "sparse/correspondences.py",
+    "sparse/pipeline.py",
     "sparse/rerank.py",
     "teacher/labels.py",
     "scripts/eval_sparse_distilled_cambridge.py",
