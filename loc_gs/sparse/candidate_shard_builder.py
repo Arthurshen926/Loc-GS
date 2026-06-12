@@ -22,6 +22,7 @@ def build_candidate_shard_artifact(
     topk: int,
     max_landmarks: int | None = None,
     landmark_chunk_size: int | None = None,
+    include_base_landmark_desc: bool = True,
 ) -> dict[str, object]:
     split = reject_test_split(split_name, purpose="internal candidate shard artifact")
     shard_split = reject_test_split(
@@ -80,6 +81,7 @@ def build_candidate_shard_artifact(
         base_candidate_artifact=base_candidate_artifact,
         query_feature_cache=query_feature_cache,
         landmark_chunk_size=landmark_chunk_size,
+        include_base_landmark_desc=bool(include_base_landmark_desc),
         split_audit=_split_audit(split, base_split_audit),
     )
     output_path = Path(output_artifact)
@@ -99,6 +101,7 @@ def build_candidate_shard_artifact(
         "topk": int(k),
         "base_landmark_count": int(base_desc.shape[0]),
         "landmark_chunk_size": None if landmark_chunk_size is None else int(landmark_chunk_size),
+        "base_landmark_desc_included": bool(include_base_landmark_desc),
         "output_artifact": str(output_path),
         "dense_teacher_enabled": False,
         "dense_inference_enabled": False,
@@ -233,6 +236,7 @@ def _build_listwise_payload(
     base_candidate_artifact: str | Path,
     query_feature_cache: str | Path,
     landmark_chunk_size: int | None,
+    include_base_landmark_desc: bool,
     split_audit: Mapping[str, object],
 ) -> dict[str, Any]:
     image_ids = [str(row["image_id"]) for row in query_rows]
@@ -245,7 +249,7 @@ def _build_listwise_payload(
     landmark_desc = base_landmark_desc[top_indices].float()
     margin = top_scores[:, 0] - top_scores[:, 1] if top_scores.shape[1] > 1 else top_scores[:, 0]
     row_count, topk = top_indices.shape
-    return {
+    payload: dict[str, Any] = {
         "metadata": {
             "format": "listwise",
             "scene": scene,
@@ -256,10 +260,10 @@ def _build_listwise_payload(
             "base_candidate_artifact": str(base_candidate_artifact),
             "query_feature_cache": str(query_feature_cache),
             "landmark_chunk_size": None if landmark_chunk_size is None else int(landmark_chunk_size),
+            "base_landmark_desc_included": bool(include_base_landmark_desc),
             "split_audit": dict(split_audit),
         },
         "base_gaussian_id": base_gaussian_id.long(),
-        "base_landmark_desc": base_landmark_desc.float(),
         "query_desc": query_desc.float(),
         "landmark_desc": landmark_desc.float(),
         "cosine": top_scores,
@@ -276,6 +280,9 @@ def _build_listwise_payload(
         "keypoint_id": keypoint_ids,
         "source_phase": [split_name] * row_count,
     }
+    if bool(include_base_landmark_desc):
+        payload["base_landmark_desc"] = base_landmark_desc.float()
+    return payload
 
 
 def _split_audit(split_name: str, base_split_audit: Mapping[str, Any]) -> dict[str, object]:
