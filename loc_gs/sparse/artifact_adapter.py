@@ -88,10 +88,19 @@ def _first_field(payload: Mapping[str, Any], keys: Sequence[str]) -> Any:
     return None
 
 
-def _rows(value: Any, *, max_rows: int | None = None) -> list[Any]:
+def _rows(value: Any, *, max_rows: int | None = None, row_indices: Sequence[int] | None = None) -> list[Any]:
     if hasattr(value, "detach"):
         value = value.detach().cpu()
-    if max_rows is not None:
+    if row_indices is not None:
+        if hasattr(value, "index_select"):
+            try:
+                import torch
+            except ImportError as exc:  # pragma: no cover - torch is present in the project environment.
+                raise RuntimeError("torch is required to row-filter cached candidate tensors") from exc
+            value = value.index_select(0, torch.as_tensor(list(row_indices), dtype=torch.long))
+        else:
+            value = [value[int(idx)] for idx in row_indices]
+    elif max_rows is not None:
         value = value[: int(max_rows)]
     if hasattr(value, "tolist"):
         return value.tolist()
@@ -161,7 +170,60 @@ def _infer_image_id(query_id: str) -> str:
     return query_id
 
 
-def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None = None) -> CachedCandidateArtifact:
+def _unique_ordered(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        item = str(value)
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _selected_row_indices(
+    *,
+    full_query_ids: Sequence[str],
+    full_image_ids: Sequence[str],
+    requested_query_ids: Sequence[str] | None,
+    max_batches: int | None,
+    max_rows: int | None,
+) -> list[int] | None:
+    if len(full_query_ids) != len(full_image_ids):
+        raise ValueError("query_id and image_id must have the same row count before filtering")
+    if requested_query_ids is None and max_batches is None and max_rows is None:
+        return None
+    if requested_query_ids is not None:
+        requested = [str(query_id) for query_id in requested_query_ids]
+        allowed_query_ids = set(requested)
+        requested_images = _unique_ordered(_infer_image_id(query_id) for query_id in requested)
+        if max_batches is not None:
+            requested_images = requested_images[: max(0, int(max_batches))]
+            allowed_query_ids = {query_id for query_id in allowed_query_ids if _infer_image_id(query_id) in requested_images}
+        allowed_images = set(requested_images)
+        indices = [
+            row_idx
+            for row_idx, (query_id, image_id) in enumerate(zip(full_query_ids, full_image_ids))
+            if str(query_id) in allowed_query_ids or str(image_id) in allowed_images
+        ]
+    elif max_batches is not None:
+        allowed_images = set(_unique_ordered(full_image_ids)[: max(0, int(max_batches))])
+        indices = [row_idx for row_idx, image_id in enumerate(full_image_ids) if str(image_id) in allowed_images]
+    else:
+        indices = list(range(len(full_query_ids)))
+    if max_rows is not None:
+        indices = indices[: max(0, int(max_rows))]
+    return indices
+
+
+def load_listwise_candidate_artifact(
+    path: str | Path,
+    *,
+    max_rows: int | None = None,
+    query_ids: Sequence[str] | None = None,
+    max_batches: int | None = None,
+) -> CachedCandidateArtifact:
     source_path = Path(path)
     payload = _load_torch_payload(source_path)
     meta = _metadata(payload)
@@ -171,12 +233,26 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
     scene = str(payload.get("scene") or meta.get("scene") or "unknown")
     split_name = _reject_unsafe_split(payload, meta, purpose="internal sparse candidate adapter")
 
-    query_yx = _rows(_field(payload, "query_yx"), max_rows=max_rows)
-    landmark_ids = _rows(_field(payload, "landmark_id"), max_rows=max_rows)
-    scores = _rows(_field(payload, "cosine"), max_rows=max_rows)
-    labels = [int(v) for v in _rows(_field(payload, "label"), max_rows=max_rows)]
-    query_ids = [str(v) for v in _rows(_field(payload, "query_id"), max_rows=max_rows)]
     image_ids_field = _field(payload, "image_id", required=False)
+    full_query_ids = [str(v) for v in _rows(_field(payload, "query_id"))]
+    full_image_ids = (
+        [str(v) for v in _rows(image_ids_field)]
+        if image_ids_field is not None
+        else [_infer_image_id(qid) for qid in full_query_ids]
+    )
+    row_indices = _selected_row_indices(
+        full_query_ids=full_query_ids,
+        full_image_ids=full_image_ids,
+        requested_query_ids=query_ids,
+        max_batches=max_batches,
+        max_rows=max_rows,
+    )
+
+    query_yx = _rows(_field(payload, "query_yx"), row_indices=row_indices)
+    landmark_ids = _rows(_field(payload, "landmark_id"), row_indices=row_indices)
+    scores = _rows(_field(payload, "cosine"), row_indices=row_indices)
+    labels = [int(v) for v in _rows(_field(payload, "label"), row_indices=row_indices)]
+    artifact_query_ids = [str(v) for v in _rows(_field(payload, "query_id"), row_indices=row_indices)]
     keypoint_ids_field = _field(payload, "keypoint_id", required=False)
     phase_field = _field(payload, "source_phase", required=False)
     masks_field = _field(payload, "candidate_mask", required=False)
@@ -194,38 +270,40 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
     query_score_field = _first_field(payload, ("query_score", "detector_score", "candidate_query_score"))
     landmark_prior_field = _first_field(payload, ("landmark_prior", "candidate_landmark_prior"))
     image_ids = (
-        [str(v) for v in _rows(image_ids_field, max_rows=max_rows)]
+        [str(v) for v in _rows(image_ids_field, row_indices=row_indices)]
         if image_ids_field is not None
-        else [_infer_image_id(qid) for qid in query_ids]
+        else [_infer_image_id(qid) for qid in artifact_query_ids]
     )
     keypoint_ids = (
-        [str(v) for v in _rows(keypoint_ids_field, max_rows=max_rows)]
+        [str(v) for v in _rows(keypoint_ids_field, row_indices=row_indices)]
         if keypoint_ids_field is not None
-        else [qid.rsplit("::", 1)[-1] for qid in query_ids]
+        else [qid.rsplit("::", 1)[-1] for qid in artifact_query_ids]
     )
     phases = (
-        [str(v) for v in _rows(phase_field, max_rows=max_rows)] if phase_field is not None else [split_name] * len(query_ids)
+        [str(v) for v in _rows(phase_field, row_indices=row_indices)]
+        if phase_field is not None
+        else [split_name] * len(artifact_query_ids)
     )
-    masks = _rows(masks_field, max_rows=max_rows) if masks_field is not None else None
-    query_descriptors = _rows(query_desc_field, max_rows=max_rows) if query_desc_field is not None else None
-    landmark_descriptors = _rows(landmark_desc_field, max_rows=max_rows) if landmark_desc_field is not None else None
-    dense_consistent = _rows(dense_consistent_field, max_rows=max_rows) if dense_consistent_field is not None else None
-    sparse_inlier = _rows(sparse_inlier_field, max_rows=max_rows) if sparse_inlier_field is not None else None
+    masks = _rows(masks_field, row_indices=row_indices) if masks_field is not None else None
+    query_descriptors = _rows(query_desc_field, row_indices=row_indices) if query_desc_field is not None else None
+    landmark_descriptors = _rows(landmark_desc_field, row_indices=row_indices) if landmark_desc_field is not None else None
+    dense_consistent = _rows(dense_consistent_field, row_indices=row_indices) if dense_consistent_field is not None else None
+    sparse_inlier = _rows(sparse_inlier_field, row_indices=row_indices) if sparse_inlier_field is not None else None
     reprojection_error = (
-        _rows(reprojection_error_field, max_rows=max_rows) if reprojection_error_field is not None else None
+        _rows(reprojection_error_field, row_indices=row_indices) if reprojection_error_field is not None else None
     )
-    solver_weight = _rows(solver_weight_field, max_rows=max_rows) if solver_weight_field is not None else None
-    label_roles = _rows(label_roles_field, max_rows=max_rows) if label_roles_field is not None else None
-    margin = _rows(margin_field, max_rows=max_rows) if margin_field is not None else None
-    query_score = _rows(query_score_field, max_rows=max_rows) if query_score_field is not None else None
-    landmark_prior = _rows(landmark_prior_field, max_rows=max_rows) if landmark_prior_field is not None else None
+    solver_weight = _rows(solver_weight_field, row_indices=row_indices) if solver_weight_field is not None else None
+    label_roles = _rows(label_roles_field, row_indices=row_indices) if label_roles_field is not None else None
+    margin = _rows(margin_field, row_indices=row_indices) if margin_field is not None else None
+    query_score = _rows(query_score_field, row_indices=row_indices) if query_score_field is not None else None
+    landmark_prior = _rows(landmark_prior_field, row_indices=row_indices) if landmark_prior_field is not None else None
 
     row_count = len(query_yx)
     lengths = {
         "landmark_id": len(landmark_ids),
         "cosine": len(scores),
         "label": len(labels),
-        "query_id": len(query_ids),
+        "query_id": len(artifact_query_ids),
         "image_id": len(image_ids),
         "keypoint_id": len(keypoint_ids),
         "source_phase": len(phases),

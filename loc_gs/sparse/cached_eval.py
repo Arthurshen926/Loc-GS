@@ -66,7 +66,12 @@ def run_cached_sparse_eval(
     cfg: CachedSparseEvalConfig,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     split = reject_test_split(split_name, purpose="internal sparse cached eval")
-    artifact = load_listwise_candidate_artifact(candidate_artifact)
+    requested_query_ids = [str(query_id) for query_id in cfg.query_ids] if cfg.query_ids is not None else None
+    artifact = load_listwise_candidate_artifact(
+        candidate_artifact,
+        query_ids=requested_query_ids,
+        max_batches=cfg.max_queries,
+    )
     landmark_map = load_gaussian_landmark_map(point_cloud)
     resolver = CacheLandmarkResolver.from_pair_cache(candidate_artifact, landmark_map)
     if (cfg.image_width is None) != (cfg.image_height is None):
@@ -127,7 +132,6 @@ def run_cached_sparse_eval(
         post_pnp_rescore_max_residual_px=float(cfg.post_pnp_rescore_max_residual_px),
         post_pnp_rescore_only_initial_outliers=bool(cfg.post_pnp_rescore_only_initial_outliers),
     )
-    requested_query_ids = [str(query_id) for query_id in cfg.query_ids] if cfg.query_ids is not None else None
     requested_query_set = set(requested_query_ids) if requested_query_ids is not None else None
     rows: list[dict[str, object]] = []
     te_values: list[float] = []
@@ -138,8 +142,11 @@ def run_cached_sparse_eval(
     post_pnp_changed_counts: list[float] = []
     batches = artifact.batches
     available_query_ids = {batch.query_id for batch in batches}
+    missing_query_basis = requested_query_ids
+    if missing_query_basis is not None and cfg.max_queries is not None:
+        missing_query_basis = missing_query_basis[: max(0, int(cfg.max_queries))]
     missing_query_ids = (
-        [query_id for query_id in requested_query_ids or [] if query_id not in available_query_ids]
+        [query_id for query_id in missing_query_basis or [] if query_id not in available_query_ids]
         if requested_query_ids is not None
         else []
     )

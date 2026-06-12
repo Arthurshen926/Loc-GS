@@ -124,6 +124,20 @@ def test_listwise_artifact_adapter_rejects_test_split(tmp_path: Path):
         load_listwise_candidate_artifact(path)
 
 
+def test_listwise_artifact_adapter_filters_requested_query_images_before_grouping(tmp_path: Path):
+    path = _write_pair_cache(tmp_path / "pairs.pt")
+
+    artifact = load_listwise_candidate_artifact(path, query_ids=["img_b.png"])
+
+    assert artifact.batch_count == 1
+    assert artifact.keypoint_count == 1
+    assert artifact.batches[0].query_id == "img_b.png"
+    assert artifact.batches[0].source_keypoint_ids == ["kp_0001"]
+    assert artifact.batches[0].query_descriptors == [[0.5, 0.5]]
+    assert artifact.batches[0].candidate_landmark_ids == [[301, 302, 303]]
+    assert artifact.batches[0].candidate_dense_consistent == [[True, False, False]]
+
+
 def test_candidate_batches_jsonl_exports_internal_input_preview(tmp_path: Path):
     path = _write_pair_cache(tmp_path / "pairs.pt")
     artifact = load_listwise_candidate_artifact(path)

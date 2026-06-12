@@ -7,6 +7,7 @@ import torch
 
 from loc_gs.core.camera import load_camera_records
 from loc_gs.core.geometry import project_points_w2c
+import loc_gs.sparse.cached_eval as cached_eval
 from loc_gs.sparse.cached_eval import CachedSparseEvalConfig, run_cached_sparse_eval
 
 
@@ -168,4 +169,36 @@ def test_cached_sparse_eval_filters_queries_and_reports_missing_coverage(tmp_pat
     assert summary["matched_query_count"] == 1
     assert summary["missing_query_count"] == 1
     assert summary["missing_query_ids_preview"] == ["missing.png"]
+    assert summary["query_count"] == 1
+
+
+def test_cached_sparse_eval_pushes_query_filter_into_artifact_adapter(tmp_path: Path, monkeypatch):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    real_loader = cached_eval.load_listwise_candidate_artifact
+    calls: list[dict[str, object]] = []
+
+    def recording_loader(path, **kwargs):
+        calls.append(dict(kwargs))
+        return real_loader(path, **kwargs)
+
+    monkeypatch.setattr(cached_eval, "load_listwise_candidate_artifact", recording_loader)
+
+    summary, rows = run_cached_sparse_eval(
+        scene="GreatCourt",
+        split_name="train_dev",
+        candidate_artifact=_write_pair_cache(tmp_path / "pairs.pt", cameras),
+        point_cloud=_write_ply(tmp_path / "point_cloud.ply"),
+        cameras_json=cameras,
+        cfg=CachedSparseEvalConfig(
+            image_width=120,
+            image_height=90,
+            query_ids=("b.png", "a.png"),
+            max_queries=1,
+            max_keypoints=16,
+        ),
+    )
+
+    assert calls[0]["query_ids"] == ["b.png", "a.png"]
+    assert calls[0]["max_batches"] == 1
+    assert [row["query_id"] for row in rows] == ["b.png"]
     assert summary["query_count"] == 1
