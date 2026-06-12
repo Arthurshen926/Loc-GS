@@ -20,6 +20,7 @@ class SparseGateComparison:
     candidate_metrics: Mapping[str, Any]
     candidate_artifact: CachedCandidateArtifact
     candidate_coverage_metrics: Mapping[str, Any] | None = None
+    candidate_scorer_metrics: Mapping[str, Any] | None = None
 
     def build_metrics_summary(self) -> dict[str, object]:
         baseline_te = float(self.baseline_metrics["median_te_cm"])
@@ -88,6 +89,7 @@ class SparseGateComparison:
             "candidate_pose_metric_status": candidate_pose_metric_status,
             "candidate_artifact": artifact_summary,
             "candidate_coverage": _compact_coverage_metrics(coverage_metrics),
+            "candidate_scorer_training": _compact_candidate_scorer_metrics(self.candidate_scorer_metrics),
             "baseline_metrics_path": self.baseline_metrics_path,
             "candidate_metrics_path": self.candidate_metrics_path,
             "candidate_artifact_path": self.candidate_artifact.source_path,
@@ -124,6 +126,29 @@ def _compact_coverage_metrics(metrics: Mapping[str, Any] | None) -> dict[str, ob
     return {key: metrics[key] for key in keys if key in metrics}
 
 
+def _compact_candidate_scorer_metrics(metrics: Mapping[str, Any] | None) -> dict[str, object] | None:
+    if metrics is None:
+        return None
+    keys = (
+        "schema_version",
+        "feature_materialization",
+        "feature_input_policy",
+        "paper_safe_sparse_inference",
+        "sample_count",
+        "label_count",
+        "native_top1_correct",
+        "trained_top1_correct",
+        "dense_teacher_sample_count",
+    )
+    out = {key: metrics[key] for key in keys if key in metrics}
+    native = _maybe_int(metrics.get("native_top1_correct"))
+    trained = _maybe_int(metrics.get("trained_top1_correct"))
+    if native is not None and trained is not None:
+        out["top1_gain"] = int(trained - native)
+        out["relative_top1_gain"] = float((trained - native) / native) if native > 0 else 0.0
+    return out
+
+
 def load_metrics_summary(path: str | Path) -> dict[str, Any]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict):
@@ -140,12 +165,16 @@ def build_sparse_gate_comparison(
     dense_target_cm: float,
     candidate_artifact: CachedCandidateArtifact,
     candidate_coverage_metrics_path: str | Path | None = None,
+    candidate_scorer_metrics_path: str | Path | None = None,
 ) -> SparseGateComparison:
     split = reject_test_split(split_name, purpose="internal sparse gate")
     baseline_metrics = load_metrics_summary(baseline_metrics_path)
     candidate_metrics = load_metrics_summary(candidate_metrics_path)
     candidate_coverage_metrics = (
         load_metrics_summary(candidate_coverage_metrics_path) if candidate_coverage_metrics_path is not None else None
+    )
+    candidate_scorer_metrics = (
+        load_metrics_summary(candidate_scorer_metrics_path) if candidate_scorer_metrics_path is not None else None
     )
     for label, metrics in (("baseline", baseline_metrics), ("candidate", candidate_metrics)):
         metric_split = metrics.get("split_name")
@@ -155,6 +184,11 @@ def build_sparse_gate_comparison(
         reject_test_split(
             str(candidate_coverage_metrics["split_name"]),
             purpose="internal sparse gate candidate coverage metrics",
+        )
+    if candidate_scorer_metrics is not None and candidate_scorer_metrics.get("split_name"):
+        reject_test_split(
+            str(candidate_scorer_metrics["split_name"]),
+            purpose="internal sparse gate candidate scorer metrics",
         )
     return SparseGateComparison(
         scene=str(scene),
@@ -166,4 +200,5 @@ def build_sparse_gate_comparison(
         candidate_metrics=candidate_metrics,
         candidate_artifact=candidate_artifact,
         candidate_coverage_metrics=candidate_coverage_metrics,
+        candidate_scorer_metrics=candidate_scorer_metrics,
     )
