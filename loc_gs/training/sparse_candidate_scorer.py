@@ -90,6 +90,44 @@ def _grid_value(rows: Sequence[Sequence[object]] | None, row_idx: int, rank: int
     return rows[row_idx][rank]
 
 
+def _normalized_descriptor(value: object | None) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        array = np.asarray(value, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if array.size == 0 or not np.all(np.isfinite(array)):
+        return None
+    norm = float(np.linalg.norm(array))
+    if norm <= 1.0e-12:
+        return None
+    return array / norm
+
+
+def _descriptor_pair_features(batch: SparseCandidateBatch, *, row_idx: int, rank: int) -> dict[str, float]:
+    query_desc = None
+    if batch.query_descriptors is not None and row_idx < len(batch.query_descriptors):
+        query_desc = _normalized_descriptor(batch.query_descriptors[row_idx])
+    landmark_desc = _normalized_descriptor(
+        _grid_value(batch.candidate_landmark_descriptors, row_idx, rank, None)
+    )
+    if query_desc is None or landmark_desc is None or query_desc.shape != landmark_desc.shape:
+        return {
+            "descriptor_alignment": 0.0,
+            "negative_descriptor_l2": 0.0,
+            "negative_descriptor_abs_diff_mean": 0.0,
+            "descriptor_product_mean": 0.0,
+        }
+    diff = query_desc - landmark_desc
+    return {
+        "descriptor_alignment": float(query_desc @ landmark_desc),
+        "negative_descriptor_l2": -float(np.linalg.norm(diff)),
+        "negative_descriptor_abs_diff_mean": -float(np.mean(np.abs(diff))),
+        "descriptor_product_mean": float(np.mean(query_desc * landmark_desc)),
+    }
+
+
 def _candidate_feature(
     batch: SparseCandidateBatch,
     *,
@@ -121,6 +159,7 @@ def _candidate_feature(
         "query_score": float(query_score),
         "landmark_prior": float(landmark_prior),
     }
+    feature_values.update(_descriptor_pair_features(batch, row_idx=row_idx, rank=rank))
     try:
         return [float(feature_values[str(name)]) for name in feature_names]
     except KeyError as exc:

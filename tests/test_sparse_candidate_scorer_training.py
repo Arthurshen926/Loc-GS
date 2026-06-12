@@ -142,6 +142,56 @@ def test_candidate_scorer_training_uses_inference_safe_match_context_features():
     assert all(row[0]["candidate_rank"] == 1 for row in scored)
 
 
+def test_candidate_scorer_training_uses_inference_safe_descriptor_pair_features():
+    batch = SparseCandidateBatch(
+        scene="GreatCourt",
+        split_name="train",
+        query_id="img.png",
+        keypoint_xy=[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+        query_descriptors=[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+        candidate_landmark_ids=[[1, 2], [3, 4], [5, 6]],
+        candidate_scores=[[0.95, 0.10], [0.90, 0.20], [0.85, 0.30]],
+        candidate_landmark_descriptors=[
+            [[0.0, 1.0], [1.0, 0.0]],
+            [[0.0, 1.0], [1.0, 0.0]],
+            [[0.0, 1.0], [1.0, 0.0]],
+        ],
+        candidate_valid_mask=[[True, True], [True, True], [True, True]],
+        candidate_geometric_correct=[[False, True], [False, True], [False, True]],
+    )
+    artifact = CachedCandidateArtifact(
+        scene="GreatCourt",
+        split_name="train",
+        source_path="memory",
+        artifact_format="listwise",
+        topk=2,
+        batches=[batch],
+        metadata={},
+    )
+
+    model, summary = train_candidate_scorer(
+        artifact,
+        CandidateScorerConfig(
+            epochs=120,
+            learning_rate=0.5,
+            feature_names=(
+                "native_score",
+                "negative_rank",
+                "valid",
+                "descriptor_alignment",
+                "negative_descriptor_l2",
+                "negative_descriptor_abs_diff_mean",
+            ),
+        ),
+    )
+
+    scored = score_candidate_rows(batch, model)
+    assert summary["feature_input_policy"] == "inference_safe"
+    assert summary["paper_safe_sparse_inference"] is True
+    assert summary["teacher_only_feature_names"] == []
+    assert all(row[0]["candidate_rank"] == 1 for row in scored)
+
+
 def test_candidate_scorer_training_cli_writes_model_manifest_and_summary(tmp_path: Path):
     out = tmp_path / "model"
 
