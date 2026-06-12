@@ -53,3 +53,18 @@ def test_internal_mainline_audit_allows_reference_text_when_disabled(tmp_path: P
     path.write_text("REFERENCE = 'third_party/stdloc/configs/stdloc_cambridge.yaml'\n", encoding="utf-8")
 
     assert_internal_mainline_sources([path])
+
+
+def test_internal_mainline_audit_cli_source_set_is_clean():
+    from loc_gs.scripts.audit_internal_mainline import (
+        internal_mainline_source_paths,
+        run_internal_mainline_audit,
+    )
+
+    paths = internal_mainline_source_paths(Path("loc_gs"))
+    assert any(str(path).endswith("eval_sparse_distilled_cambridge.py") for path in paths)
+
+    assert run_internal_mainline_audit(paths) == {
+        "checked_file_count": len(paths),
+        "forbidden_hit_count": 0,
+    }

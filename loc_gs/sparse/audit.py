@@ -40,10 +40,18 @@ def scan_forbidden_runtime_dependencies(paths: Iterable[str | Path]) -> list[For
         path = Path(raw_path)
         if not path.is_file():
             continue
+        inside_pattern_definition = False
         for line_number, line in enumerate(
             path.read_text(encoding="utf-8", errors="replace").splitlines(),
             start=1,
         ):
+            stripped = line.strip()
+            if stripped.startswith("FORBIDDEN_RUNTIME_PATTERNS"):
+                inside_pattern_definition = True
+            if inside_pattern_definition:
+                if stripped == ")":
+                    inside_pattern_definition = False
+                continue
             for pattern in FORBIDDEN_RUNTIME_PATTERNS:
                 if pattern in line:
                     hits.append(
