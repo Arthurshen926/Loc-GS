@@ -35,6 +35,7 @@ class CachedSparseEvalConfig:
     descriptor_fusion_weight: float = 1.0
     detector_student: str | Path | None = None
     detector_student_weight: float = 1.0
+    set_conflict_penalty: float = 0.0
     rerank_prefix_fraction: float = 1.0
     solver_weight: float = 1.0
     native_weight: float = 1.0
@@ -113,6 +114,11 @@ def run_cached_sparse_eval(
     selector = load_landmark_selector(cfg.landmark_selector) if cfg.landmark_selector is not None else None
     descriptor_fusion = load_descriptor_fusion(cfg.descriptor_fusion) if cfg.descriptor_fusion is not None else None
     detector_student = load_detector_student(cfg.detector_student) if cfg.detector_student is not None else None
+    conflict_edges = (
+        _resolve_selector_conflict_edges(selector.conflict_edges, resolver)
+        if selector is not None and float(cfg.set_conflict_penalty) > 0.0
+        else None
+    )
     input_cfg = CachedSparseInputConfig(score_mode=cfg.score_mode, max_keypoints=int(cfg.max_keypoints))
     loc_cfg = SparseLocalizationConfig(
         rerank_prefix_fraction=float(cfg.rerank_prefix_fraction),
@@ -131,6 +137,8 @@ def run_cached_sparse_eval(
         post_pnp_rescore_min_improvement_px=float(cfg.post_pnp_rescore_min_improvement_px),
         post_pnp_rescore_max_residual_px=float(cfg.post_pnp_rescore_max_residual_px),
         post_pnp_rescore_only_initial_outliers=bool(cfg.post_pnp_rescore_only_initial_outliers),
+        conflict_edges=conflict_edges,
+        set_conflict_penalty=float(cfg.set_conflict_penalty),
     )
     requested_query_set = set(requested_query_ids) if requested_query_ids is not None else None
     rows: list[dict[str, object]] = []
@@ -143,6 +151,7 @@ def run_cached_sparse_eval(
     post_pnp_corrected_counts: list[float] = []
     post_pnp_worsened_counts: list[float] = []
     post_pnp_correct_deltas: list[float] = []
+    set_conflict_changed_counts: list[float] = []
     selected_correct_counts: list[float] = []
     selected_correct_ratios: list[float] = []
     selected_bbox_area_fractions: list[float] = []
@@ -236,6 +245,7 @@ def run_cached_sparse_eval(
         post_pnp_corrected_counts.append(float(result.post_pnp_rescore_corrected_count))
         post_pnp_worsened_counts.append(float(result.post_pnp_rescore_worsened_count))
         post_pnp_correct_deltas.append(float(result.post_pnp_rescore_correct_delta))
+        set_conflict_changed_counts.append(float(result.set_conflict_rerank_changed_count))
         selected_set_diagnostics = dict(result.selected_set_diagnostics or {})
         if selected_set_diagnostics:
             selected_correct_counts.append(float(selected_set_diagnostics.get("selected_geometric_correct_count", 0.0)))
@@ -263,6 +273,7 @@ def run_cached_sparse_eval(
                 "post_pnp_rescore_corrected_count": int(result.post_pnp_rescore_corrected_count),
                 "post_pnp_rescore_worsened_count": int(result.post_pnp_rescore_worsened_count),
                 "post_pnp_rescore_correct_delta": int(result.post_pnp_rescore_correct_delta),
+                "set_conflict_rerank_changed_count": int(result.set_conflict_rerank_changed_count),
                 "pnp_stage_count": int(result.pnp_stage_count),
                 "selected_count": int(len(result.selected_landmark_ids)),
                 "te_cm": te_cm,
@@ -325,6 +336,10 @@ def run_cached_sparse_eval(
         "post_pnp_rescore_worsened_count_median": _median_or_none(post_pnp_worsened_counts),
         "post_pnp_rescore_correct_delta_median": _median_or_none(post_pnp_correct_deltas),
         "post_pnp_candidate_rescore_enabled": bool(cfg.post_pnp_candidate_rescore),
+        "set_conflict_penalty_enabled": bool(conflict_edges) and float(cfg.set_conflict_penalty) > 0.0,
+        "set_conflict_penalty": float(cfg.set_conflict_penalty),
+        "set_conflict_edge_count": 0 if not conflict_edges else int(len(conflict_edges)),
+        "set_conflict_rerank_changed_count_median": _median_or_none(set_conflict_changed_counts),
         "candidate_artifact": artifact.summarize_candidate_availability(),
     }
     return summary, rows
@@ -386,6 +401,32 @@ def _combine_score_rows(
             [float(base_value) + float(selector_weight) * float(selector_value) for base_value, selector_value in zip(base, selector)]
         )
     return combined
+
+
+def _resolve_selector_conflict_edges(
+    edges: dict[str, float],
+    resolver: CacheLandmarkResolver,
+) -> dict[str, float]:
+    resolved: dict[str, float] = {}
+    for key, weight in edges.items():
+        parts = str(key).split("::")
+        if len(parts) != 2:
+            continue
+        try:
+            cache_ids = [[int(parts[0]), int(parts[1])]]
+        except ValueError:
+            continue
+        gaussian_ids = resolver.resolve_gaussian_ids(cache_ids).reshape(-1)
+        if int(gaussian_ids[0]) < 0 or int(gaussian_ids[1]) < 0:
+            continue
+        edge_key = "::".join(
+            sorted(
+                (str(int(gaussian_ids[0])), str(int(gaussian_ids[1]))),
+                key=lambda value: int(value) if value.lstrip("-").isdigit() else value,
+            )
+        )
+        resolved[edge_key] = resolved.get(edge_key, 0.0) + float(weight)
+    return resolved
 
 
 def _rerank_top1_diagnostic(

@@ -119,6 +119,82 @@ def test_sparse_pipeline_native_order_can_expose_oracle_gap():
     assert te_cm > 100.0
 
 
+def test_sparse_pipeline_set_conflict_penalty_promotes_non_conflicting_candidate():
+    intr = CameraIntrinsics(width=260, height=200, fx=150.0, fy=152.0, cx=129.5, cy=99.5)
+    gt_pose = np.eye(4, dtype=np.float64)
+    correct_points = np.array(
+        [
+            [-0.6, -0.3, 3.0],
+            [0.5, -0.2, 3.2],
+            [-0.3, 0.5, 2.9],
+            [0.6, 0.4, 3.4],
+            [0.0, 0.0, 2.6],
+            [-0.8, 0.1, 3.5],
+        ],
+        dtype=np.float64,
+    )
+    keypoints_xy, valid = project_points_w2c(correct_points, gt_pose, intr)
+    assert bool(valid.all())
+    candidates = []
+    for idx, point in enumerate(correct_points):
+        if idx == len(correct_points) - 1:
+            wrong = point + np.array([4.0, 0.0, 0.0], dtype=np.float64)
+            candidates.append(
+                [
+                    SparsePipelineCandidate(
+                        keypoint_index=idx,
+                        landmark_id=1005,
+                        point3d=wrong.tolist(),
+                        native_score=1.0,
+                        geometric_correct=False,
+                    ),
+                    SparsePipelineCandidate(
+                        keypoint_index=idx,
+                        landmark_id=idx,
+                        point3d=point.tolist(),
+                        native_score=0.8,
+                        geometric_correct=True,
+                    ),
+                ]
+            )
+        else:
+            candidates.append(
+                [
+                    SparsePipelineCandidate(
+                        keypoint_index=idx,
+                        landmark_id=idx,
+                        point3d=point.tolist(),
+                        native_score=1.0,
+                        geometric_correct=True,
+                    )
+                ]
+            )
+    data = SparseLocalizationInput(
+        scene="GreatCourt",
+        split_name="train_dev",
+        query_id="q-conflict",
+        intrinsics=intr,
+        keypoints_xy=keypoints_xy,
+        candidates_by_keypoint=candidates,
+    )
+
+    result = run_sparse_localization(
+        data,
+        SparseLocalizationConfig(
+            conflict_edges={"0::1005": 2.0},
+            set_conflict_penalty=1.0,
+            reprojection_error_px=4.0,
+        ),
+    )
+
+    assert result.selected_landmark_ids[-1] == 5
+    assert result.set_conflict_rerank_changed_count == 1
+    assert result.selected_set_diagnostics["selected_geometric_correct_count"] == 6
+    te_cm, re_deg = pose_error_cm_deg(result.pose_w2c, gt_pose)
+    assert te_cm < 0.5
+    assert re_deg < 0.5
+
+
 def test_sparse_pipeline_can_run_lgcv_second_pnp():
     intr = CameraIntrinsics(width=260, height=200, fx=150.0, fy=152.0, cx=129.5, cy=99.5)
     gt_pose = np.eye(4, dtype=np.float64)

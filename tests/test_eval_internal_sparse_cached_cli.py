@@ -322,6 +322,54 @@ def test_eval_internal_sparse_cached_cli_accepts_landmark_selector(tmp_path: Pat
     assert rows[0]["te_cm"] < 1.0
 
 
+def test_eval_internal_sparse_cached_cli_applies_set_conflict_penalty(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    selector_path = tmp_path / "landmark_selector_conflict.json"
+    selector = LandmarkSelectorModel(
+        landmark_scores={},
+        conflict_edges={"0::11": 2.0},
+        conflict_degrees={},
+        score_scale=1.0,
+        conflict_penalty=0.0,
+    )
+    selector_path.write_text(json.dumps(selector.to_json_dict(), sort_keys=True), encoding="utf-8")
+    out = tmp_path / "eval_selector_conflict"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt", cameras, single_buried_correct=True)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--landmark_selector",
+            str(selector_path),
+            "--set_conflict_penalty",
+            "1.0",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert metrics["set_conflict_penalty_enabled"] is True
+    assert metrics["set_conflict_rerank_changed_count_median"] == 1
+    assert metrics["selected_geometric_correct_count_median"] == 6
+    assert rows[0]["set_conflict_rerank_changed_count"] == 1
+    assert rows[0]["selected_set_diagnostics"]["selected_geometric_correct_count"] == 6
+
+
 def test_eval_internal_sparse_cached_cli_accepts_descriptor_fusion(tmp_path: Path):
     cameras = _write_cameras(tmp_path / "cameras.json")
     fusion_path = tmp_path / "descriptor_fusion.pt"

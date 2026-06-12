@@ -85,6 +85,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--descriptor_fusion_weight", type=float, default=1.0)
     parser.add_argument("--detector_student", type=Path, default=None)
     parser.add_argument("--detector_student_weight", type=float, default=1.0)
+    parser.add_argument("--set_conflict_penalty", type=float, default=0.0)
     parser.add_argument("--rerank_prefix_fraction", type=float, default=1.0)
     parser.add_argument("--solver_weight", type=float, default=1.0)
     parser.add_argument("--native_weight", type=float, default=1.0)
@@ -127,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         descriptor_fusion_weight=float(args.descriptor_fusion_weight),
         detector_student=args.detector_student,
         detector_student_weight=float(args.detector_student_weight),
+        set_conflict_penalty=float(args.set_conflict_penalty),
         rerank_prefix_fraction=float(args.rerank_prefix_fraction),
         solver_weight=float(args.solver_weight),
         native_weight=float(args.native_weight),
@@ -170,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         "descriptor_fusion_weight": float(args.descriptor_fusion_weight),
         "detector_student": None if args.detector_student is None else str(args.detector_student),
         "detector_student_weight": float(args.detector_student_weight),
+        "set_conflict_penalty": float(args.set_conflict_penalty),
         "rerank_prefix_fraction": float(args.rerank_prefix_fraction),
         "solver_weight": float(args.solver_weight),
         "native_weight": float(args.native_weight),

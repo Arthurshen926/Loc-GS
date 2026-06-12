@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -78,6 +78,8 @@ class SparseLocalizationConfig:
     post_pnp_rescore_min_improvement_px: float = 2.0
     post_pnp_rescore_max_residual_px: float = 4.0
     post_pnp_rescore_only_initial_outliers: bool = True
+    conflict_edges: Mapping[str, float] | None = None
+    set_conflict_penalty: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,7 @@ class SparseLocalizationResult:
     post_pnp_rescore_corrected_count: int = 0
     post_pnp_rescore_worsened_count: int = 0
     post_pnp_rescore_correct_delta: int = 0
+    set_conflict_rerank_changed_count: int = 0
     pnp_method: str = "epnp"
     second_pnp_method: str | None = None
     selected_set_diagnostics: dict[str, float | int] | None = None
@@ -129,6 +132,45 @@ def _match_scores(rows: Sequence[dict[str, object]], cfg: SparseLocalizationConf
         ],
         dtype=np.float64,
     )
+
+
+def _edge_key(first: int | str, second: int | str) -> str:
+    left = str(first)
+    right = str(second)
+    return "::".join(sorted((left, right), key=lambda value: int(value) if value.lstrip("-").isdigit() else value))
+
+
+def _conflict_weight(cfg: SparseLocalizationConfig, first: int | str, second: int | str) -> float:
+    if not cfg.conflict_edges:
+        return 0.0
+    return float(cfg.conflict_edges.get(_edge_key(first, second), 0.0))
+
+
+def _select_with_set_conflict(
+    ranked: Sequence[dict[str, object]],
+    selected_landmark_ids: Sequence[int],
+    cfg: SparseLocalizationConfig,
+) -> tuple[dict[str, object], bool]:
+    if not ranked:
+        raise ValueError("ranked candidate rows must not be empty")
+    if not selected_landmark_ids or not cfg.conflict_edges or float(cfg.set_conflict_penalty) <= 0.0:
+        return dict(ranked[0]), False
+    penalty = float(cfg.set_conflict_penalty)
+    scored: list[tuple[float, int, dict[str, object]]] = []
+    for idx, row in enumerate(ranked):
+        landmark_id = int(row["landmark_id"])
+        conflict = sum(_conflict_weight(cfg, landmark_id, selected_id) for selected_id in selected_landmark_ids)
+        base_score = (
+            float(row.get("native_score", 0.0)) * float(cfg.native_weight)
+            + float(row.get("solver_score", 0.0)) * float(cfg.solver_weight)
+        )
+        enriched = dict(row)
+        enriched["set_conflict_penalty"] = float(penalty * conflict)
+        enriched["set_conflict_runtime_score"] = float(base_score - penalty * conflict)
+        scored.append((float(base_score - penalty * conflict), -idx, enriched))
+    selected = max(scored, key=lambda item: (item[0], item[1]))[2]
+    changed = int(selected["landmark_id"]) != int(ranked[0]["landmark_id"])
+    return selected, bool(changed)
 
 
 def _row_set_diagnostics(
@@ -298,9 +340,11 @@ def run_sparse_localization(
     selected_rows: list[dict[str, object]] = []
     selected_keypoint_indices: list[int] = []
     selected_landmark_ids: list[int] = []
+    set_conflict_changed_count = 0
     for row_idx, candidates in enumerate(data.candidates_by_keypoint):
         ranked = _rank_candidates(candidates, cfg)
-        selected = ranked[0]
+        selected, conflict_changed = _select_with_set_conflict(ranked, selected_landmark_ids, cfg)
+        set_conflict_changed_count += int(conflict_changed)
         selected_rows.append(selected)
         selected_keypoint_indices.append(row_idx)
         selected_landmark_ids.append(int(selected["landmark_id"]))
@@ -320,6 +364,7 @@ def run_sparse_localization(
             pnp_method=str(cfg.pnp_method),
             selected_set_diagnostics=selected_diagnostics,
             inlier_set_diagnostics=_inlier_set_diagnostics(data, selected_rows, np.zeros(points.shape[0], dtype=bool)),
+            set_conflict_rerank_changed_count=int(set_conflict_changed_count),
         )
 
     pnp = solve_pnp_ransac(
@@ -407,6 +452,7 @@ def run_sparse_localization(
         post_pnp_rescore_corrected_count=int(post_pnp_corrected_count),
         post_pnp_rescore_worsened_count=int(post_pnp_worsened_count),
         post_pnp_rescore_correct_delta=int(post_pnp_correct_delta),
+        set_conflict_rerank_changed_count=int(set_conflict_changed_count),
         pnp_method=str(cfg.pnp_method),
         second_pnp_method=second_method,
         selected_set_diagnostics=selected_diagnostics,

@@ -97,6 +97,21 @@ def _add_inlier_set_diagnostic(path: Path) -> Path:
     return path
 
 
+def _add_set_conflict_diagnostic(path: Path) -> Path:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(
+        {
+            "schema_version": "internal_sparse_cached_eval_metrics_v1",
+            "set_conflict_penalty_enabled": True,
+            "set_conflict_penalty": 1.0,
+            "set_conflict_edge_count": 37,
+            "set_conflict_rerank_changed_count_median": 5.0,
+        }
+    )
+    path.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def _add_post_pnp_rescore_diagnostic(path: Path) -> Path:
     data = json.loads(path.read_text(encoding="utf-8"))
     data.update(
@@ -354,6 +369,41 @@ def test_internal_sparse_gate_includes_candidate_inlier_set_diagnostic(tmp_path:
         "inlier_geometric_correct_count_median": 21.0,
         "inlier_geometric_correct_ratio_median": 0.18,
         "inlier_keypoint_bbox_area_fraction_median": 0.75,
+    }
+
+
+def test_internal_sparse_gate_includes_candidate_set_conflict_diagnostic(tmp_path: Path):
+    pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
+    baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
+    candidate = _add_set_conflict_diagnostic(
+        _write_metrics(tmp_path / "candidate.json", median_te_cm=13.0, split_name="train_dev_seed13_20p")
+    )
+    out = tmp_path / "gate_eval_set_conflict"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev_seed13_20p",
+            "--candidate_artifact",
+            str(pair_cache),
+            "--baseline_metrics",
+            str(baseline),
+            "--candidate_metrics",
+            str(candidate),
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    assert metrics["candidate_set_conflict_diagnostic"] == {
+        "set_conflict_edge_count": 37,
+        "set_conflict_penalty": 1.0,
+        "set_conflict_penalty_enabled": True,
+        "set_conflict_rerank_changed_count_median": 5.0,
     }
 
 

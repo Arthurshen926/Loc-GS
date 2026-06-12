@@ -293,6 +293,16 @@ def _compact_inlier_set_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
     return {key: data[key] for key in keys if key in data}
 
 
+def _compact_set_conflict_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "set_conflict_penalty_enabled",
+        "set_conflict_penalty",
+        "set_conflict_edge_count",
+        "set_conflict_rerank_changed_count_median",
+    )
+    return {key: data[key] for key in keys if key in data}
+
+
 def _compact_post_pnp_rescore_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "post_pnp_candidate_rescore_enabled",
@@ -339,6 +349,9 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
         inlier_set = _compact_inlier_set_diagnostic(data)
         if inlier_set:
             payload["inlier_set_diagnostic"] = inlier_set
+        set_conflict = _compact_set_conflict_diagnostic(data)
+        if set_conflict:
+            payload["set_conflict_diagnostic"] = set_conflict
         post_pnp_rescore = _compact_post_pnp_rescore_diagnostic(data)
         if post_pnp_rescore:
             payload["post_pnp_rescore_diagnostic"] = post_pnp_rescore
@@ -360,6 +373,9 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
     nested_inlier_set = data.get("candidate_inlier_set_diagnostic")
     if isinstance(nested_inlier_set, dict):
         payload["candidate_inlier_set_diagnostic"] = _compact_inlier_set_diagnostic(nested_inlier_set)
+    nested_set_conflict = data.get("candidate_set_conflict_diagnostic")
+    if isinstance(nested_set_conflict, dict):
+        payload["candidate_set_conflict_diagnostic"] = _compact_set_conflict_diagnostic(nested_set_conflict)
     nested_post_pnp_rescore = data.get("candidate_post_pnp_rescore_diagnostic")
     if isinstance(nested_post_pnp_rescore, dict):
         payload["candidate_post_pnp_rescore_diagnostic"] = _compact_post_pnp_rescore_diagnostic(

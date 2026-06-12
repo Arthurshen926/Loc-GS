@@ -199,6 +199,12 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                     "inlier_keypoint_bbox_area_fraction_median": 0.75,
                     "inlier_depth_range_m_median": 35.0,
                 },
+                "candidate_set_conflict_diagnostic": {
+                    "set_conflict_penalty_enabled": True,
+                    "set_conflict_penalty": 1.0,
+                    "set_conflict_edge_count": 37,
+                    "set_conflict_rerank_changed_count_median": 5.0,
+                },
                 "candidate_post_pnp_rescore_diagnostic": {
                     "post_pnp_candidate_rescore_enabled": True,
                     "post_pnp_rescore_changed_count_median": 44.0,
@@ -235,6 +241,12 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
         "inlier_geometric_correct_count_median": 21.0,
         "inlier_geometric_correct_ratio_median": 0.18,
         "inlier_keypoint_bbox_area_fraction_median": 0.75,
+    }
+    assert payload["candidate_set_conflict_diagnostic"] == {
+        "set_conflict_edge_count": 37,
+        "set_conflict_penalty": 1.0,
+        "set_conflict_penalty_enabled": True,
+        "set_conflict_rerank_changed_count_median": 5.0,
     }
     assert payload["candidate_post_pnp_rescore_diagnostic"] == {
         "post_pnp_candidate_rescore_enabled": True,
@@ -273,6 +285,10 @@ def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, caps
                 "inlier_geometric_correct_ratio_median": 0.18,
                 "inlier_keypoint_bbox_area_fraction_median": 0.75,
                 "inlier_depth_range_m_median": 35.0,
+                "set_conflict_penalty_enabled": True,
+                "set_conflict_penalty": 1.0,
+                "set_conflict_edge_count": 37,
+                "set_conflict_rerank_changed_count_median": 5.0,
                 "post_pnp_candidate_rescore_enabled": True,
                 "post_pnp_rescore_changed_count_median": 44.0,
                 "post_pnp_rescore_corrected_count_median": 12.0,
@@ -307,6 +323,12 @@ def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, caps
         "inlier_geometric_correct_count_median": 21.0,
         "inlier_geometric_correct_ratio_median": 0.18,
         "inlier_keypoint_bbox_area_fraction_median": 0.75,
+    }
+    assert payload["set_conflict_diagnostic"] == {
+        "set_conflict_edge_count": 37,
+        "set_conflict_penalty": 1.0,
+        "set_conflict_penalty_enabled": True,
+        "set_conflict_rerank_changed_count_median": 5.0,
     }
     assert payload["post_pnp_rescore_diagnostic"] == {
         "post_pnp_candidate_rescore_enabled": True,

@@ -92,6 +92,7 @@ class SparseGateComparison:
             "candidate_rerank_diagnostic": _compact_rerank_diagnostic(self.candidate_metrics),
             "candidate_selected_set_diagnostic": _compact_selected_set_diagnostic(self.candidate_metrics),
             "candidate_inlier_set_diagnostic": _compact_inlier_set_diagnostic(self.candidate_metrics),
+            "candidate_set_conflict_diagnostic": _compact_set_conflict_diagnostic(self.candidate_metrics),
             "candidate_post_pnp_rescore_diagnostic": _compact_post_pnp_rescore_diagnostic(self.candidate_metrics),
             "candidate_scorer_training": _compact_candidate_scorer_metrics(self.candidate_scorer_metrics),
             "baseline_metrics_path": self.baseline_metrics_path,
@@ -188,6 +189,18 @@ def _compact_inlier_set_diagnostic(metrics: Mapping[str, Any]) -> dict[str, obje
     )
     out = {key: metrics[key] for key in keys if key in metrics}
     return out or None
+
+
+def _compact_set_conflict_diagnostic(metrics: Mapping[str, Any]) -> dict[str, object] | None:
+    if not bool(metrics.get("set_conflict_penalty_enabled")):
+        return None
+    keys = (
+        "set_conflict_penalty_enabled",
+        "set_conflict_penalty",
+        "set_conflict_edge_count",
+        "set_conflict_rerank_changed_count_median",
+    )
+    return {key: metrics[key] for key in keys if key in metrics}
 
 
 def _compact_post_pnp_rescore_diagnostic(metrics: Mapping[str, Any]) -> dict[str, object] | None:
