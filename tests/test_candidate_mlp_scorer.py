@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import numpy as np
+import pytest
 import torch
 
 from loc_gs.scripts.train_internal_candidate_mlp_scorer import main
@@ -8,6 +10,8 @@ from loc_gs.sparse.artifact_adapter import CachedCandidateArtifact
 from loc_gs.sparse.correspondences import SparseCandidateBatch
 from loc_gs.students.candidate_mlp_scorer import (
     CandidateMLPScorerConfig,
+    _feature_batch_from_sparse_batch,
+    _training_matrix,
     build_candidate_mlp_scorer_runtime,
     candidate_mlp_score_rows,
     load_candidate_mlp_scorer,
@@ -148,6 +152,22 @@ def test_candidate_mlp_scorer_streams_features_without_full_training_matrix():
     assert summary["optimizer_step_count"] == summary["epochs"] * summary["training_batch_count"]
     assert summary["trained_top1_correct"] == 4
     assert all(row[1] > row[0] for row in rows)
+
+
+def test_candidate_mlp_vectorized_feature_batch_matches_training_matrix():
+    cfg = CandidateMLPScorerConfig(batch_size=2)
+    batch = _descriptor_batch()
+    artifact = _artifact()
+
+    feature_batch = _feature_batch_from_sparse_batch(batch, cfg, descriptor_dim=2)
+    features, labels, weights, group_slices, stats = _training_matrix(artifact, cfg, descriptor_dim=2)
+
+    np.testing.assert_allclose(feature_batch.features, features, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(feature_batch.labels, labels, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(feature_batch.sample_weights, weights, rtol=1.0e-6, atol=1.0e-6)
+    assert list(feature_batch.group_slices) == group_slices
+    assert feature_batch.dense_teacher_sample_count == stats["dense_teacher_sample_count"]
+    assert feature_batch.weighted_sample_count == pytest.approx(stats["weighted_sample_count"])
 
 
 def test_train_internal_candidate_mlp_scorer_cli_writes_pt_bundle(tmp_path: Path):

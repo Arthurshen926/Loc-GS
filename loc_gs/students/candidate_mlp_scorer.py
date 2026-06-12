@@ -411,6 +411,280 @@ def _training_matrix(
     )
 
 
+def _feature_batch_from_sparse_batch(
+    batch: SparseCandidateBatch,
+    cfg: CandidateMLPScorerConfig,
+    *,
+    descriptor_dim: int,
+) -> _FeatureBatch:
+    batch.validate()
+    scalar_names = tuple(str(name) for name in cfg.scalar_feature_names)
+    supported_scalar_names = {
+        "native_score",
+        "negative_rank",
+        "valid",
+        "margin",
+        "query_score",
+        "landmark_prior",
+    }
+    if any(name not in supported_scalar_names for name in scalar_names):
+        return _feature_batch_from_sparse_batch_loop(batch, cfg, descriptor_dim=descriptor_dim)
+    row_count = len(batch.candidate_scores)
+    topk_lengths = [len(row) for row in batch.candidate_scores]
+    if not topk_lengths:
+        return _FeatureBatch(
+            features=np.zeros((0, len(scalar_names) + 4 * int(descriptor_dim)), dtype=np.float32),
+            labels=np.zeros((0,), dtype=np.float32),
+            sample_weights=np.zeros((0,), dtype=np.float32),
+            group_slices=(),
+            dense_teacher_sample_count=0,
+            weighted_sample_count=0.0,
+        )
+    topk = int(topk_lengths[0])
+    if any(length != topk for length in topk_lengths):
+        return _feature_batch_from_sparse_batch_loop(batch, cfg, descriptor_dim=descriptor_dim)
+
+    scores = np.asarray(batch.candidate_scores, dtype=np.float32)
+    valid_mask = (
+        np.asarray(batch.candidate_valid_mask, dtype=bool)
+        if batch.candidate_valid_mask is not None
+        else np.ones((row_count, topk), dtype=bool)
+    )
+    if scores.shape != (row_count, topk) or valid_mask.shape != (row_count, topk):
+        return _feature_batch_from_sparse_batch_loop(batch, cfg, descriptor_dim=descriptor_dim)
+
+    scalar_planes = []
+    ranks = np.arange(topk, dtype=np.float32).reshape(1, topk)
+    for name in scalar_names:
+        if name == "native_score":
+            scalar_planes.append(scores)
+        elif name == "negative_rank":
+            scalar_planes.append(-ranks * float(cfg.rank_feature_scale) + np.zeros_like(scores))
+        elif name == "valid":
+            scalar_planes.append(valid_mask.astype(np.float32))
+        elif name == "margin":
+            scalar_planes.append(_optional_float_grid(batch.candidate_margin, row_count=row_count, topk=topk, default=0.0))
+        elif name == "query_score":
+            scalar_planes.append(_optional_float_grid(batch.candidate_query_score, row_count=row_count, topk=topk, default=1.0))
+        elif name == "landmark_prior":
+            scalar_planes.append(
+                _optional_float_grid(batch.candidate_landmark_prior, row_count=row_count, topk=topk, default=0.0)
+            )
+
+    query_desc = _normalized_query_descriptor_matrix(batch, row_count=row_count, descriptor_dim=int(descriptor_dim))
+    landmark_desc = _normalized_landmark_descriptor_grid(
+        batch,
+        row_count=row_count,
+        topk=topk,
+        descriptor_dim=int(descriptor_dim),
+    )
+    repeated_query = np.repeat(query_desc[:, None, :], topk, axis=1)
+    descriptor_features = np.concatenate(
+        [
+            repeated_query,
+            landmark_desc,
+            np.abs(repeated_query - landmark_desc),
+            repeated_query * landmark_desc,
+        ],
+        axis=2,
+    )
+    scalar_features = np.stack(scalar_planes, axis=2) if scalar_planes else np.zeros((row_count, topk, 0), dtype=np.float32)
+    candidate_features = np.concatenate([scalar_features, descriptor_features.astype(np.float32)], axis=2)
+
+    labels: list[float] = []
+    weights: list[float] = []
+    group_slices: list[tuple[int, int]] = []
+    feature_rows: list[np.ndarray] = []
+    dense_teacher_sample_count = 0
+    linear_cfg = cfg.candidate_config()
+    for row_idx in range(row_count):
+        row_start = len(labels)
+        for rank in range(topk):
+            if not bool(valid_mask[row_idx, rank]):
+                continue
+            if batch.candidate_dense_consistent is not None:
+                dense_teacher_sample_count += 1
+            target = _candidate_target(batch, row_idx=row_idx, rank=rank)
+            labels.append(float(target))
+            weights.append(_candidate_sample_weight(batch, row_idx=row_idx, rank=rank, target=target, cfg=linear_cfg))
+            feature_rows.append(candidate_features[row_idx, rank])
+        if len(labels) > row_start:
+            group_slices.append((int(row_start), int(len(labels))))
+    if not feature_rows:
+        feature_dim = len(scalar_names) + 4 * int(descriptor_dim)
+        features = np.zeros((0, feature_dim), dtype=np.float32)
+    else:
+        features = np.asarray(feature_rows, dtype=np.float32)
+    sample_weights = np.asarray(weights, dtype=np.float32)
+    return _FeatureBatch(
+        features=features,
+        labels=np.asarray(labels, dtype=np.float32),
+        sample_weights=sample_weights,
+        group_slices=tuple(group_slices),
+        dense_teacher_sample_count=int(dense_teacher_sample_count),
+        weighted_sample_count=float(sum(weights)),
+    )
+
+
+def _feature_batch_from_sparse_batch_loop(
+    batch: SparseCandidateBatch,
+    cfg: CandidateMLPScorerConfig,
+    *,
+    descriptor_dim: int,
+) -> _FeatureBatch:
+    features: list[list[float]] = []
+    labels: list[float] = []
+    weights: list[float] = []
+    group_slices: list[tuple[int, int]] = []
+    dense_teacher_sample_count = 0
+    linear_cfg = cfg.candidate_config()
+    valid_rows = batch.candidate_valid_mask or []
+    for row_idx, scores in enumerate(batch.candidate_scores):
+        row_start = len(labels)
+        for rank, score in enumerate(scores):
+            valid = True if not valid_rows else bool(valid_rows[row_idx][rank])
+            if not valid:
+                continue
+            if batch.candidate_dense_consistent is not None:
+                dense_teacher_sample_count += 1
+            target = _candidate_target(batch, row_idx=row_idx, rank=rank)
+            features.append(
+                _candidate_mlp_feature(
+                    batch,
+                    row_idx=row_idx,
+                    rank=rank,
+                    native_score=float(score),
+                    valid=valid,
+                    cfg=cfg,
+                    descriptor_dim=descriptor_dim,
+                )
+            )
+            labels.append(target)
+            weights.append(_candidate_sample_weight(batch, row_idx=row_idx, rank=rank, target=target, cfg=linear_cfg))
+        if len(labels) > row_start:
+            group_slices.append((int(row_start), int(len(labels))))
+    return _FeatureBatch(
+        features=np.asarray(features, dtype=np.float32),
+        labels=np.asarray(labels, dtype=np.float32),
+        sample_weights=np.asarray(weights, dtype=np.float32),
+        group_slices=tuple(group_slices),
+        dense_teacher_sample_count=int(dense_teacher_sample_count),
+        weighted_sample_count=float(sum(weights)),
+    )
+
+
+def _optional_float_grid(
+    grid: Sequence[Sequence[float]] | None,
+    *,
+    row_count: int,
+    topk: int,
+    default: float,
+) -> np.ndarray:
+    if grid is None:
+        return np.full((int(row_count), int(topk)), float(default), dtype=np.float32)
+    try:
+        value = np.asarray(grid, dtype=np.float32)
+    except (TypeError, ValueError):
+        return np.full((int(row_count), int(topk)), float(default), dtype=np.float32)
+    if value.shape != (int(row_count), int(topk)):
+        return np.full((int(row_count), int(topk)), float(default), dtype=np.float32)
+    return value
+
+
+def _normalized_query_descriptor_matrix(
+    batch: SparseCandidateBatch,
+    *,
+    row_count: int,
+    descriptor_dim: int,
+) -> np.ndarray:
+    if batch.query_descriptors is None:
+        return np.zeros((int(row_count), int(descriptor_dim)), dtype=np.float32)
+    try:
+        value = np.asarray(batch.query_descriptors, dtype=np.float32)
+    except (TypeError, ValueError):
+        return np.zeros((int(row_count), int(descriptor_dim)), dtype=np.float32)
+    if value.shape != (int(row_count), int(descriptor_dim)):
+        return np.zeros((int(row_count), int(descriptor_dim)), dtype=np.float32)
+    return _normalize_rows(value.reshape(-1, int(descriptor_dim))).reshape(int(row_count), int(descriptor_dim))
+
+
+def _normalized_landmark_descriptor_grid(
+    batch: SparseCandidateBatch,
+    *,
+    row_count: int,
+    topk: int,
+    descriptor_dim: int,
+) -> np.ndarray:
+    if batch.candidate_landmark_descriptors is None:
+        return np.zeros((int(row_count), int(topk), int(descriptor_dim)), dtype=np.float32)
+    try:
+        value = np.asarray(batch.candidate_landmark_descriptors, dtype=np.float32)
+    except (TypeError, ValueError):
+        return np.zeros((int(row_count), int(topk), int(descriptor_dim)), dtype=np.float32)
+    if value.shape != (int(row_count), int(topk), int(descriptor_dim)):
+        return np.zeros((int(row_count), int(topk), int(descriptor_dim)), dtype=np.float32)
+    flat = value.reshape(-1, int(descriptor_dim))
+    return _normalize_rows(flat).reshape(int(row_count), int(topk), int(descriptor_dim))
+
+
+def _normalize_rows(values: np.ndarray) -> np.ndarray:
+    finite = np.all(np.isfinite(values), axis=1)
+    norms = np.linalg.norm(values, axis=1)
+    keep = finite & (norms > 1.0e-12)
+    normalized = np.zeros_like(values, dtype=np.float32)
+    normalized[keep] = values[keep] / norms[keep, None]
+    return normalized
+
+
+def _split_feature_batch(feature_batch: _FeatureBatch, *, max_samples: int) -> Iterator[_FeatureBatch]:
+    if int(max_samples) <= 0 or int(max_samples) >= int(feature_batch.features.shape[0]):
+        yield feature_batch
+        return
+    batch_start: int | None = None
+    batch_end: int | None = None
+    batch_groups: list[tuple[int, int]] = []
+    for group_start, group_end in feature_batch.group_slices:
+        group_start = int(group_start)
+        group_end = int(group_end)
+        if batch_start is None:
+            batch_start = group_start
+            batch_end = group_end
+            batch_groups = [(0, group_end - group_start)]
+            continue
+        assert batch_end is not None
+        if batch_groups and group_end - batch_start > int(max_samples):
+            yield _slice_feature_batch(feature_batch, start=batch_start, end=batch_end, group_slices=batch_groups)
+            batch_start = group_start
+            batch_end = group_end
+            batch_groups = [(0, group_end - group_start)]
+        else:
+            batch_groups.append((group_start - batch_start, group_end - batch_start))
+            batch_end = group_end
+    if batch_start is not None and batch_end is not None:
+        yield _slice_feature_batch(feature_batch, start=batch_start, end=batch_end, group_slices=batch_groups)
+
+
+def _slice_feature_batch(
+    feature_batch: _FeatureBatch,
+    *,
+    start: int,
+    end: int,
+    group_slices: Sequence[tuple[int, int]],
+) -> _FeatureBatch:
+    sample_weights = feature_batch.sample_weights[int(start) : int(end)]
+    dense_teacher_sample_count = 0
+    if feature_batch.dense_teacher_sample_count > 0:
+        dense_teacher_sample_count = int(end) - int(start)
+    return _FeatureBatch(
+        features=feature_batch.features[int(start) : int(end)],
+        labels=feature_batch.labels[int(start) : int(end)],
+        sample_weights=sample_weights,
+        group_slices=tuple((int(group_start), int(group_end)) for group_start, group_end in group_slices),
+        dense_teacher_sample_count=dense_teacher_sample_count,
+        weighted_sample_count=float(sample_weights.sum()),
+    )
+
+
 def _iter_feature_batches(
     artifact: CachedCandidateArtifact,
     cfg: CandidateMLPScorerConfig,
@@ -418,59 +692,11 @@ def _iter_feature_batches(
     descriptor_dim: int,
 ) -> Iterator[_FeatureBatch]:
     effective_batch_size = int(cfg.batch_size) if int(cfg.batch_size) > 0 else 8192
-    linear_cfg = cfg.candidate_config()
-    features: list[list[float]] = []
-    labels: list[float] = []
-    weights: list[float] = []
-    group_slices: list[tuple[int, int]] = []
-    dense_teacher_sample_count = 0
-
-    def make_feature_batch() -> _FeatureBatch:
-        return _FeatureBatch(
-            features=np.asarray(features, dtype=np.float32),
-            labels=np.asarray(labels, dtype=np.float32),
-            sample_weights=np.asarray(weights, dtype=np.float32),
-            group_slices=tuple((int(start), int(end)) for start, end in group_slices),
-            dense_teacher_sample_count=int(dense_teacher_sample_count),
-            weighted_sample_count=float(sum(weights)),
-        )
-
     for batch in artifact.batches:
-        batch.validate()
-        valid_rows = batch.candidate_valid_mask or []
-        for row_idx, scores in enumerate(batch.candidate_scores):
-            row_start = len(labels)
-            for rank, score in enumerate(scores):
-                valid = True if not valid_rows else bool(valid_rows[row_idx][rank])
-                if not valid:
-                    continue
-                if batch.candidate_dense_consistent is not None:
-                    dense_teacher_sample_count += 1
-                target = _candidate_target(batch, row_idx=row_idx, rank=rank)
-                features.append(
-                    _candidate_mlp_feature(
-                        batch,
-                        row_idx=row_idx,
-                        rank=rank,
-                        native_score=float(score),
-                        valid=valid,
-                        cfg=cfg,
-                        descriptor_dim=descriptor_dim,
-                    )
-                )
-                labels.append(target)
-                weights.append(_candidate_sample_weight(batch, row_idx=row_idx, rank=rank, target=target, cfg=linear_cfg))
-            if len(labels) > row_start:
-                group_slices.append((int(row_start), int(len(labels))))
-            if features and len(features) >= effective_batch_size:
-                yield make_feature_batch()
-                features = []
-                labels = []
-                weights = []
-                group_slices = []
-                dense_teacher_sample_count = 0
-    if features:
-        yield make_feature_batch()
+        feature_batch = _feature_batch_from_sparse_batch(batch, cfg, descriptor_dim=descriptor_dim)
+        if feature_batch.features.shape[0] == 0:
+            continue
+        yield from _split_feature_batch(feature_batch, max_samples=effective_batch_size)
 
 
 def _streaming_feature_stats(
