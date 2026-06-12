@@ -227,6 +227,41 @@ def test_candidate_shard_builder_chunked_topk_matches_full_bank(tmp_path: Path):
     assert torch.allclose(chunked_payload["cosine"], full_payload["cosine"])
 
 
+def test_candidate_shard_builder_query_chunked_topk_matches_full_bank(tmp_path: Path):
+    base = _write_ranked_base_artifact(tmp_path / "base.pt")
+    query = _write_ranked_query_feature_cache(tmp_path / "query_features.pt")
+    full_output = tmp_path / "candidate_shard_full.pt"
+    chunked_output = tmp_path / "candidate_shard_query_chunked.pt"
+
+    build_candidate_shard_artifact(
+        completion_shard=_shard(),
+        query_feature_cache=query,
+        base_candidate_artifact=base,
+        output_artifact=full_output,
+        scene="GreatCourt",
+        split_name="train_dev_seed13_20p",
+        topk=3,
+    )
+    chunked_summary = build_candidate_shard_artifact(
+        completion_shard=_shard(),
+        query_feature_cache=query,
+        base_candidate_artifact=base,
+        output_artifact=chunked_output,
+        scene="GreatCourt",
+        split_name="train_dev_seed13_20p",
+        topk=3,
+        landmark_chunk_size=2,
+        query_chunk_size=1,
+    )
+
+    full_payload = torch.load(full_output, map_location="cpu")
+    chunked_payload = torch.load(chunked_output, map_location="cpu")
+    assert chunked_summary["query_chunk_size"] == 1
+    assert chunked_payload["metadata"]["query_chunk_size"] == 1
+    assert chunked_payload["landmark_id"].tolist() == full_payload["landmark_id"].tolist()
+    assert torch.allclose(chunked_payload["cosine"], full_payload["cosine"])
+
+
 def test_candidate_shard_builder_can_omit_repeated_base_landmark_descriptors(tmp_path: Path):
     output = tmp_path / "candidate_shard.pt"
 
@@ -288,6 +323,8 @@ def test_candidate_shard_builder_cli_writes_manifest_summary_and_artifact(tmp_pa
             "2",
             "--landmark_chunk_size",
             "2",
+            "--query_chunk_size",
+            "1",
             "--omit_base_landmark_desc",
         ]
     )
@@ -301,10 +338,12 @@ def test_candidate_shard_builder_cli_writes_manifest_summary_and_artifact(tmp_pa
     assert artifact.keypoint_count == 2
     assert summary["keypoint_count"] == 2
     assert summary["landmark_chunk_size"] == 2
+    assert summary["query_chunk_size"] == 1
     assert summary["base_landmark_desc_included"] is False
     assert "base_landmark_desc" not in payload
     assert manifest["schema_version"] == "internal_candidate_shard_artifact_manifest_v1"
     assert manifest["hyperparameters"]["landmark_chunk_size"] == 2
+    assert manifest["hyperparameters"]["query_chunk_size"] == 1
     assert manifest["hyperparameters"]["include_base_landmark_desc"] is False
     assert manifest["dense_inference_enabled"] is False
     assert split_audit["audit_status"] == "passed"

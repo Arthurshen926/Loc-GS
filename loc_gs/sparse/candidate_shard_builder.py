@@ -22,6 +22,7 @@ def build_candidate_shard_artifact(
     topk: int,
     max_landmarks: int | None = None,
     landmark_chunk_size: int | None = None,
+    query_chunk_size: int | None = None,
     include_base_landmark_desc: bool = True,
 ) -> dict[str, object]:
     split = reject_test_split(split_name, purpose="internal candidate shard artifact")
@@ -68,6 +69,7 @@ def build_candidate_shard_artifact(
         base_desc=base_desc,
         topk=k,
         landmark_chunk_size=landmark_chunk_size,
+        query_chunk_size=query_chunk_size,
     )
     output = _build_listwise_payload(
         query_rows=query_rows,
@@ -81,6 +83,7 @@ def build_candidate_shard_artifact(
         base_candidate_artifact=base_candidate_artifact,
         query_feature_cache=query_feature_cache,
         landmark_chunk_size=landmark_chunk_size,
+        query_chunk_size=query_chunk_size,
         include_base_landmark_desc=bool(include_base_landmark_desc),
         split_audit=_split_audit(split, base_split_audit),
     )
@@ -101,6 +104,7 @@ def build_candidate_shard_artifact(
         "topk": int(k),
         "base_landmark_count": int(base_desc.shape[0]),
         "landmark_chunk_size": None if landmark_chunk_size is None else int(landmark_chunk_size),
+        "query_chunk_size": None if query_chunk_size is None else int(query_chunk_size),
         "base_landmark_desc_included": bool(include_base_landmark_desc),
         "output_artifact": str(output_path),
         "dense_teacher_enabled": False,
@@ -190,6 +194,39 @@ def _compute_topk_scores(
     base_desc: torch.Tensor,
     topk: int,
     landmark_chunk_size: int | None,
+    query_chunk_size: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    query_count = int(query_desc.shape[0])
+    query_step = query_count if query_chunk_size is None else int(query_chunk_size)
+    if query_step <= 0:
+        raise ValueError("query_chunk_size must be positive when provided")
+    if query_step >= query_count:
+        return _compute_topk_scores_for_query_block(
+            query_desc=query_desc,
+            base_desc=base_desc,
+            topk=topk,
+            landmark_chunk_size=landmark_chunk_size,
+        )
+    score_chunks: list[torch.Tensor] = []
+    index_chunks: list[torch.Tensor] = []
+    for start in range(0, query_count, query_step):
+        scores, indices = _compute_topk_scores_for_query_block(
+            query_desc=query_desc[start : start + query_step],
+            base_desc=base_desc,
+            topk=topk,
+            landmark_chunk_size=landmark_chunk_size,
+        )
+        score_chunks.append(scores)
+        index_chunks.append(indices)
+    return torch.cat(score_chunks, dim=0), torch.cat(index_chunks, dim=0)
+
+
+def _compute_topk_scores_for_query_block(
+    *,
+    query_desc: torch.Tensor,
+    base_desc: torch.Tensor,
+    topk: int,
+    landmark_chunk_size: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     query = F.normalize(query_desc, p=2, dim=-1)
     landmark_count = int(base_desc.shape[0])
@@ -236,6 +273,7 @@ def _build_listwise_payload(
     base_candidate_artifact: str | Path,
     query_feature_cache: str | Path,
     landmark_chunk_size: int | None,
+    query_chunk_size: int | None,
     include_base_landmark_desc: bool,
     split_audit: Mapping[str, object],
 ) -> dict[str, Any]:
@@ -260,6 +298,7 @@ def _build_listwise_payload(
             "base_candidate_artifact": str(base_candidate_artifact),
             "query_feature_cache": str(query_feature_cache),
             "landmark_chunk_size": None if landmark_chunk_size is None else int(landmark_chunk_size),
+            "query_chunk_size": None if query_chunk_size is None else int(query_chunk_size),
             "base_landmark_desc_included": bool(include_base_landmark_desc),
             "split_audit": dict(split_audit),
         },

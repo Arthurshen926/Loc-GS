@@ -78,6 +78,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max_keypoints", type=int, default=2048)
     parser.add_argument("--max_landmarks", type=int, default=None)
     parser.add_argument("--landmark_chunk_size", type=int, default=None)
+    parser.add_argument("--query_chunk_size", type=int, default=None)
     parser.add_argument("--omit_base_landmark_desc", action="store_true")
     parser.add_argument("--score_threshold", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=40)
@@ -132,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         topk=int(args.topk),
         max_landmarks=args.max_landmarks,
         landmark_chunk_size=args.landmark_chunk_size,
+        query_chunk_size=args.query_chunk_size,
         include_base_landmark_desc=not bool(args.omit_base_landmark_desc),
     )
     candidate_payload = torch.load(candidate_shard, map_location="cpu")
@@ -257,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
             "max_keypoints": int(args.max_keypoints),
             "max_landmarks": None if args.max_landmarks is None else int(args.max_landmarks),
             "landmark_chunk_size": None if args.landmark_chunk_size is None else int(args.landmark_chunk_size),
+            "query_chunk_size": None if args.query_chunk_size is None else int(args.query_chunk_size),
             "include_base_landmark_desc": not bool(args.omit_base_landmark_desc),
             "score_threshold": None if args.score_threshold is None else float(args.score_threshold),
             "epochs": int(args.epochs),
