@@ -16,11 +16,14 @@ INTERNAL_MAINLINE_RELATIVE_PATHS: tuple[str, ...] = (
     "core/metrics.py",
     "core/pnp.py",
     "sparse/audit.py",
+    "sparse/artifact_adapter.py",
     "sparse/correspondences.py",
+    "sparse/gate.py",
     "sparse/pipeline.py",
     "sparse/rerank.py",
     "teacher/labels.py",
     "scripts/eval_sparse_distilled_cambridge.py",
+    "scripts/run_internal_sparse_gate.py",
 )
 
 
