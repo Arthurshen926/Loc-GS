@@ -73,6 +73,57 @@ def _write_feedback(path: Path) -> Path:
     return path
 
 
+def _write_inlier_precision_feedback(path: Path) -> Path:
+    payload = {
+        "schema_version": "internal_inlier_precision_feedback_v1",
+        "scene": "GreatCourt",
+        "split_name": "train",
+        "query_count": 2,
+        "hard_query_count": 1,
+        "set_selection_hard_count": 1,
+        "inlier_precision_hard_count": 1,
+        "post_pnp_rescore_harm_count": 0,
+        "per_query": [
+            {
+                "schema_version": "internal_inlier_precision_feedback_row_v1",
+                "scene": "GreatCourt",
+                "split_name": "train",
+                "query_id": "a.png",
+                "query_role": "set_and_inlier_precision_hard",
+                "selected_set_hard": True,
+                "inlier_precision_hard": True,
+                "post_pnp_rescore_harm": False,
+                "selected_geometric_correct_ratio": 0.05,
+                "inlier_geometric_correct_ratio": 0.20,
+                "selected_gap": 0.5,
+                "inlier_gap": 0.6,
+                "set_selection_weight": 1.8,
+                "hard_negative_weight": 2.4,
+                "scorer_distill_weight": 2.2,
+            },
+            {
+                "schema_version": "internal_inlier_precision_feedback_row_v1",
+                "scene": "GreatCourt",
+                "split_name": "train",
+                "query_id": "b.png",
+                "query_role": "stable",
+                "selected_set_hard": False,
+                "inlier_precision_hard": False,
+                "post_pnp_rescore_harm": False,
+                "selected_geometric_correct_ratio": 0.35,
+                "inlier_geometric_correct_ratio": 0.80,
+                "selected_gap": 0.0,
+                "inlier_gap": 0.0,
+                "set_selection_weight": 1.0,
+                "hard_negative_weight": 1.0,
+                "scorer_distill_weight": 0.0,
+            },
+        ],
+    }
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    return path
+
+
 def _write_render_manifest(path: Path) -> Path:
     rows = [
         {
@@ -101,6 +152,8 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
             str(_write_pair_cache(tmp_path / "pairs.pt")),
             "--solver_feedback_labels",
             str(_write_feedback(tmp_path / "labels.jsonl")),
+            "--inlier_precision_feedback",
+            str(_write_inlier_precision_feedback(tmp_path / "inlier_precision_feedback.json")),
             "--render_manifest",
             str(_write_render_manifest(tmp_path / "render_manifest.jsonl")),
             "--output_dir",
@@ -136,6 +189,7 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     assert manifest["dense_teacher_enabled"] is True
     assert manifest["dense_inference_enabled"] is False
     assert manifest["external_runtime_dependency"] == "forbidden"
+    assert manifest["inlier_precision_feedback"] == str(tmp_path / "inlier_precision_feedback.json")
     assert manifest["render_manifest"] == str(tmp_path / "render_manifest.jsonl")
     assert manifest["hyperparameters"]["require_rendered_rgb"] is False
     assert summary["online_episode_count"] == 4
@@ -159,6 +213,8 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     assert summary["candidate_mlp_scorer"]["feature_materialization"] == "feature_cache"
     assert summary["candidate_mlp_scorer"]["feature_cache_enabled"] is True
     assert summary["candidate_mlp_feature_cache"]["schema_version"] == "internal_candidate_mlp_feature_cache_summary_v1"
+    assert summary["inlier_precision_feedback"]["schema_version"] == "internal_inlier_precision_feedback_merge_summary_v1"
+    assert summary["inlier_precision_feedback"]["boosted_solver_feedback_count"] == 1
     assert candidate_mlp_cache["schema_version"] == "internal_candidate_mlp_feature_cache_v1"
     assert manifest["candidate_mlp_feature_cache"] == str(out / "candidate_mlp_feature_cache.pt")
     assert manifest["hyperparameters"]["candidate_mlp_batch_size"] == 2

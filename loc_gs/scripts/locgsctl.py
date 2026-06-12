@@ -425,6 +425,25 @@ def _compact_sparse_failure_profile(data: dict[str, Any]) -> dict[str, Any]:
     return {key: data[key] for key in keys if key in data}
 
 
+def _compact_inlier_precision_feedback(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "schema_version",
+        "query_count",
+        "success_count",
+        "median_te_cm",
+        "target_gap_cm",
+        "hard_query_count",
+        "set_selection_hard_count",
+        "inlier_precision_hard_count",
+        "post_pnp_rescore_harm_count",
+        "mean_scorer_distill_weight",
+        "max_scorer_distill_weight",
+        "student_consumers",
+        "recommendation",
+    )
+    return {key: data[key] for key in keys if key in data}
+
+
 def _compact_rerank_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "rerank_diagnostic_enabled",
@@ -510,6 +529,8 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
         payload["candidate_student_training"] = _compact_student_training(data)
     if data.get("schema_version") == "internal_sparse_failure_profile_v1":
         payload["sparse_failure_profile"] = _compact_sparse_failure_profile(data)
+    if data.get("schema_version") == "internal_inlier_precision_feedback_v1":
+        payload["inlier_precision_feedback"] = _compact_inlier_precision_feedback(data)
     if data.get("schema_version") == "internal_sparse_train_dev_gate_v1":
         payload["sparse_gate"] = _compact_sparse_gate(data)
     if data.get("schema_version") == "internal_sparse_cached_eval_metrics_v1":
@@ -549,6 +570,11 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
     nested_failure_profile = data.get("candidate_failure_profile")
     if isinstance(nested_failure_profile, dict):
         payload["candidate_failure_profile"] = _compact_sparse_failure_profile(nested_failure_profile)
+    nested_inlier_precision_feedback = data.get("candidate_inlier_precision_feedback")
+    if isinstance(nested_inlier_precision_feedback, dict):
+        payload["candidate_inlier_precision_feedback"] = _compact_inlier_precision_feedback(
+            nested_inlier_precision_feedback
+        )
     nested_rerank = data.get("candidate_rerank_diagnostic")
     if isinstance(nested_rerank, dict):
         payload["candidate_rerank_diagnostic"] = _compact_rerank_diagnostic(nested_rerank)

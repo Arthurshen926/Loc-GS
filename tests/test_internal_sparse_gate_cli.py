@@ -342,6 +342,32 @@ def _write_candidate_failure_profile(path: Path) -> Path:
     return path
 
 
+def _write_candidate_inlier_precision_feedback(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_inlier_precision_feedback_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev_seed13_20p",
+                "query_count": 20,
+                "hard_query_count": 15,
+                "set_selection_hard_count": 11,
+                "inlier_precision_hard_count": 15,
+                "post_pnp_rescore_harm_count": 0,
+                "mean_scorer_distill_weight": 1.42,
+                "max_scorer_distill_weight": 3.1,
+                "recommendation": "boost_hard_negative_and_set_level_student_weights",
+                "student_consumers": ["candidate_mlp_scorer", "landmark_selector"],
+                "per_query": [{"query_id": "q.png", "scorer_distill_weight": 2.0}],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_internal_sparse_gate_cli_writes_manifest_metrics_and_candidate_preview(tmp_path: Path):
     pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
     baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
@@ -558,6 +584,44 @@ def test_internal_sparse_gate_includes_candidate_failure_profile_evidence(tmp_pa
     assert evidence["dominant_failure_modes"][0]["mode"] == "selected_set_low_precision"
     assert evidence["recommendation"] == "prioritize_set_level_selection_and_inlier_precision"
     assert evidence["rerank_diagnostic"]["reranked_top1_gain"] == 475
+
+
+def test_internal_sparse_gate_includes_candidate_inlier_precision_feedback_evidence(tmp_path: Path):
+    pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
+    baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
+    candidate = _write_metrics(tmp_path / "candidate.json", median_te_cm=13.0, split_name="train_dev_seed13_20p")
+    inlier_feedback = _write_candidate_inlier_precision_feedback(tmp_path / "inlier_feedback.json")
+    out = tmp_path / "gate_inlier_feedback"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev_seed13_20p",
+            "--candidate_artifact",
+            str(pair_cache),
+            "--baseline_metrics",
+            str(baseline),
+            "--candidate_metrics",
+            str(candidate),
+            "--candidate_inlier_precision_feedback_metrics",
+            str(inlier_feedback),
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    evidence = metrics["candidate_inlier_precision_feedback"]
+    assert manifest["candidate_inlier_precision_feedback_metrics"] == str(inlier_feedback)
+    assert evidence["schema_version"] == "internal_inlier_precision_feedback_v1"
+    assert evidence["hard_query_count"] == 15
+    assert evidence["inlier_precision_hard_count"] == 15
+    assert evidence["recommendation"] == "boost_hard_negative_and_set_level_student_weights"
+    assert "per_query" not in evidence
 
 
 def test_internal_sparse_gate_includes_candidate_eval_rerank_diagnostic(tmp_path: Path):

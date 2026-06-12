@@ -31,6 +31,10 @@ from loc_gs.teacher.distillation_artifact import (
     build_distillation_payload,
     load_solver_feedback_label_rows,
 )
+from loc_gs.teacher.inlier_precision_feedback import (
+    apply_inlier_precision_feedback_to_solver_rows,
+    load_inlier_precision_feedback_rows,
+)
 from loc_gs.teacher.online_episode import (
     OnlineEpisodeConfig,
     build_online_candidate_payload,
@@ -63,6 +67,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--cameras_json", type=Path, required=True)
     parser.add_argument("--candidate_artifact", type=Path, required=True)
     parser.add_argument("--solver_feedback_labels", type=Path, required=True)
+    parser.add_argument("--inlier_precision_feedback", type=Path, default=None)
+    parser.add_argument("--inlier_precision_feedback_weight", type=float, default=1.0)
     parser.add_argument("--render_manifest", type=Path, default=None)
     parser.add_argument("--require_rendered_rgb", action="store_true")
     parser.add_argument("--output_dir", type=Path, required=True)
@@ -111,6 +117,15 @@ def main(argv: list[str] | None = None) -> int:
         roll_std_deg=float(args.roll_std_deg),
     )
     feedback_rows = load_solver_feedback_label_rows(args.solver_feedback_labels)
+    inlier_precision_feedback_summary = None
+    if args.inlier_precision_feedback is not None:
+        inlier_precision_rows = load_inlier_precision_feedback_rows(args.inlier_precision_feedback)
+        feedback_rows, inlier_precision_feedback_summary = apply_inlier_precision_feedback_to_solver_rows(
+            feedback_rows,
+            inlier_precision_rows,
+            weight_scale=float(args.inlier_precision_feedback_weight),
+            max_distill_weight=float(args.max_solver_weight),
+        )
     render_records = load_simulation_plan_rows(args.render_manifest) if args.render_manifest is not None else None
     artifact = load_listwise_candidate_artifact(args.candidate_artifact)
     camera_records = load_camera_records(args.cameras_json)
@@ -215,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         "candidate_scorer": scorer_summary,
         "candidate_mlp_scorer": candidate_mlp_summary,
         "candidate_mlp_feature_cache": candidate_mlp_feature_cache_summary,
+        "inlier_precision_feedback": inlier_precision_feedback_summary,
         "landmark_selector": selector_summary,
         "descriptor_fusion": descriptor_summary,
         "detector_student": detector_summary,
@@ -234,6 +250,9 @@ def main(argv: list[str] | None = None) -> int:
         "cameras_json": str(args.cameras_json),
         "candidate_artifact": str(args.candidate_artifact),
         "solver_feedback_labels": str(args.solver_feedback_labels),
+        "inlier_precision_feedback": None
+        if args.inlier_precision_feedback is None
+        else str(args.inlier_precision_feedback),
         "render_manifest": None if args.render_manifest is None else str(args.render_manifest),
         "online_distilled_candidate_artifact": str(online_artifact_path),
         "candidate_mlp_scorer": str(args.output_dir / "candidate_mlp_scorer.pt"),
@@ -253,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             "sparse_inlier_reprojection_px": float(args.sparse_inlier_reprojection_px),
             "hard_negative_reprojection_px": float(args.hard_negative_reprojection_px),
             "max_solver_weight": float(args.max_solver_weight),
+            "inlier_precision_feedback_weight": float(args.inlier_precision_feedback_weight),
             "epochs": int(args.epochs),
             "learning_rate": float(args.learning_rate),
             "rank_feature_scale": float(args.rank_feature_scale),

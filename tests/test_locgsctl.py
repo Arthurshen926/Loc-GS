@@ -361,6 +361,40 @@ def test_summarize_compacts_internal_sparse_failure_profile(tmp_path, capsys):
     assert "per_query" not in evidence
 
 
+def test_summarize_compacts_internal_inlier_precision_feedback(tmp_path, capsys):
+    feedback_dir = tmp_path / "inlier_feedback"
+    feedback_dir.mkdir()
+    (feedback_dir / "metrics_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_inlier_precision_feedback_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev",
+                "query_count": 20,
+                "hard_query_count": 15,
+                "set_selection_hard_count": 11,
+                "inlier_precision_hard_count": 15,
+                "post_pnp_rescore_harm_count": 0,
+                "mean_scorer_distill_weight": 1.42,
+                "max_scorer_distill_weight": 3.1,
+                "recommendation": "boost_hard_negative_and_set_level_student_weights",
+                "student_consumers": ["candidate_mlp_scorer", "landmark_selector"],
+                "per_query": [{"query_id": "q.png", "scorer_distill_weight": 2.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _run_cli(capsys, "summarize", str(feedback_dir))
+
+    evidence = payload["inlier_precision_feedback"]
+    assert evidence["query_count"] == 20
+    assert evidence["hard_query_count"] == 15
+    assert evidence["inlier_precision_hard_count"] == 15
+    assert evidence["recommendation"] == "boost_hard_negative_and_set_level_student_weights"
+    assert "per_query" not in evidence
+
+
 def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, capsys):
     run_dir = tmp_path / "gate"
     run_dir.mkdir()
@@ -458,6 +492,19 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                         "reranked_topk_available": 1453,
                     },
                 },
+                "candidate_inlier_precision_feedback": {
+                    "schema_version": "internal_inlier_precision_feedback_v1",
+                    "query_count": 20,
+                    "hard_query_count": 15,
+                    "set_selection_hard_count": 11,
+                    "inlier_precision_hard_count": 15,
+                    "post_pnp_rescore_harm_count": 0,
+                    "mean_scorer_distill_weight": 1.42,
+                    "max_scorer_distill_weight": 3.1,
+                    "recommendation": "boost_hard_negative_and_set_level_student_weights",
+                    "student_consumers": ["candidate_mlp_scorer", "landmark_selector"],
+                    "per_query": [{"query_id": "q.png", "scorer_distill_weight": 2.0}],
+                },
                 "candidate_rerank_diagnostic": {
                     "rerank_diagnostic_enabled": True,
                     "rerank_diagnostic_query_count": 1536,
@@ -518,6 +565,8 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
     assert payload["candidate_student_training"]["candidate_mlp_scorer"]["top1_gain"] == 132
     assert payload["candidate_failure_profile"]["failure_mode_counts"]["selected_set_low_precision"] == 20
     assert payload["candidate_failure_profile"]["recommendation"] == "prioritize_set_level_selection_and_inlier_precision"
+    assert payload["candidate_inlier_precision_feedback"]["hard_query_count"] == 15
+    assert payload["candidate_inlier_precision_feedback"]["recommendation"] == "boost_hard_negative_and_set_level_student_weights"
     assert payload["candidate_rerank_diagnostic"]["reranked_top1_gain"] == 134
     assert payload["candidate_rerank_diagnostic"]["reranked_top1_correct"] == 225
     assert payload["candidate_selected_set_diagnostic"] == {
