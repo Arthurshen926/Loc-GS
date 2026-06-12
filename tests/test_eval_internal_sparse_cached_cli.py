@@ -401,6 +401,13 @@ def test_eval_internal_sparse_cached_cli_accepts_mlp_candidate_scorer(tmp_path: 
     metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
     rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
     assert metrics["candidate_scorer_enabled"] is True
+    assert metrics["rerank_diagnostic_enabled"] is True
+    assert metrics["native_top1_correct"] == 0
+    assert metrics["reranked_top1_correct"] == 6
+    assert metrics["reranked_top1_gain"] == 6
+    assert rows[0]["rerank_diagnostic"]["native_top1_correct"] == 0
+    assert rows[0]["rerank_diagnostic"]["reranked_top1_correct"] == 6
+    assert rows[0]["rerank_diagnostic"]["reranked_top1_gain"] == 6
     assert rows[0]["success"] is True
     assert rows[0]["te_cm"] < 1.0
 

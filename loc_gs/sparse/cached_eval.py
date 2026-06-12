@@ -140,6 +140,11 @@ def run_cached_sparse_eval(
     stage_counts: list[float] = []
     lgcv_keep_counts: list[float] = []
     post_pnp_changed_counts: list[float] = []
+    rerank_native_top1_correct = 0
+    rerank_top1_correct = 0
+    rerank_top1_changed_count = 0
+    rerank_topk_available = 0
+    rerank_diagnostic_query_count = 0
     batches = artifact.batches
     available_query_ids = {batch.query_id for batch in batches}
     missing_query_basis = requested_query_ids
@@ -190,6 +195,20 @@ def run_cached_sparse_eval(
                 max_keypoints=int(cfg.max_keypoints),
                 solver_score_rows=solver_score_rows,
             )
+        rerank_diagnostic = None
+        if solver_score_rows is not None:
+            rerank_diagnostic = _rerank_top1_diagnostic(
+                batch,
+                solver_score_rows,
+                max_keypoints=int(cfg.max_keypoints),
+                native_weight=float(cfg.native_weight),
+                solver_weight=float(cfg.solver_weight),
+            )
+            rerank_native_top1_correct += int(rerank_diagnostic["native_top1_correct"])
+            rerank_top1_correct += int(rerank_diagnostic["reranked_top1_correct"])
+            rerank_top1_changed_count += int(rerank_diagnostic["reranked_top1_changed_count"])
+            rerank_topk_available += int(rerank_diagnostic["topk_available"])
+            rerank_diagnostic_query_count += int(rerank_diagnostic["query_count"])
         data = sparse_input_from_cached_batch(batch, resolver, intrinsics=camera.intrinsics, cfg=batch_input_cfg)
         result = run_sparse_localization(data, loc_cfg)
         te_cm = None
@@ -216,6 +235,7 @@ def run_cached_sparse_eval(
                 "te_cm": te_cm,
                 "re_deg": re_deg,
                 "availability_summary": result.availability_summary,
+                **({} if rerank_diagnostic is None else {"rerank_diagnostic": rerank_diagnostic}),
             }
         )
     success_rows = [row for row in rows if bool(row.get("success"))]
@@ -248,6 +268,13 @@ def run_cached_sparse_eval(
         "landmark_selector_enabled": bool(selector is not None),
         "descriptor_fusion_enabled": bool(descriptor_fusion is not None),
         "detector_student_enabled": bool(detector_student is not None),
+        "rerank_diagnostic_enabled": bool(rerank_diagnostic_query_count > 0),
+        "rerank_diagnostic_query_count": int(rerank_diagnostic_query_count),
+        "native_top1_correct": int(rerank_native_top1_correct),
+        "reranked_top1_correct": int(rerank_top1_correct),
+        "reranked_top1_gain": int(rerank_top1_correct - rerank_native_top1_correct),
+        "reranked_top1_changed_count": int(rerank_top1_changed_count),
+        "reranked_topk_available": int(rerank_topk_available),
         "pnp_stage_count_median": _median_or_none(stage_counts),
         "lgcv_keep_count_median": _median_or_none(lgcv_keep_counts),
         "post_pnp_rescore_changed_count_median": _median_or_none(post_pnp_changed_counts),
@@ -313,6 +340,69 @@ def _combine_score_rows(
             [float(base_value) + float(selector_weight) * float(selector_value) for base_value, selector_value in zip(base, selector)]
         )
     return combined
+
+
+def _rerank_top1_diagnostic(
+    batch,
+    solver_score_rows: Sequence[Sequence[float]],
+    *,
+    max_keypoints: int,
+    native_weight: float,
+    solver_weight: float,
+) -> dict[str, int]:
+    batch.validate()
+    correct_rows = batch.candidate_geometric_correct
+    if correct_rows is None:
+        return {
+            "query_count": 0,
+            "native_top1_correct": 0,
+            "reranked_top1_correct": 0,
+            "reranked_top1_gain": 0,
+            "reranked_top1_changed_count": 0,
+            "topk_available": 0,
+        }
+    row_count = min(int(batch.keypoint_count), int(max_keypoints), len(solver_score_rows), len(correct_rows))
+    valid_rows = batch.candidate_valid_mask
+    native_top1_correct = 0
+    reranked_top1_correct = 0
+    changed_count = 0
+    topk_available = 0
+    query_count = 0
+    for row_idx in range(row_count):
+        scores = batch.candidate_scores[row_idx]
+        solver_scores = solver_score_rows[row_idx]
+        correct = correct_rows[row_idx]
+        topk = min(len(scores), len(solver_scores), len(correct))
+        valid_indices = [
+            rank
+            for rank in range(topk)
+            if valid_rows is None or bool(valid_rows[row_idx][rank])
+        ]
+        if not valid_indices:
+            continue
+        native_best = valid_indices[0]
+        reranked_best = max(
+            valid_indices,
+            key=lambda rank: (
+                float(scores[rank]) * float(native_weight) + float(solver_scores[rank]) * float(solver_weight),
+                -int(rank),
+            ),
+        )
+        native_hit = bool(correct[native_best])
+        reranked_hit = bool(correct[reranked_best])
+        native_top1_correct += int(native_hit)
+        reranked_top1_correct += int(reranked_hit)
+        changed_count += int(reranked_best != native_best)
+        topk_available += int(any(bool(correct[rank]) for rank in valid_indices))
+        query_count += 1
+    return {
+        "query_count": int(query_count),
+        "native_top1_correct": int(native_top1_correct),
+        "reranked_top1_correct": int(reranked_top1_correct),
+        "reranked_top1_gain": int(reranked_top1_correct - native_top1_correct),
+        "reranked_top1_changed_count": int(changed_count),
+        "topk_available": int(topk_available),
+    }
 
 
 def _median_or_none(values: Sequence[float]) -> float | None:
