@@ -34,7 +34,9 @@ def build_manifest(
     command: Sequence[str],
     render_manifest: str | Path,
     gaussian_ply: str | Path | None,
+    feature_checkpoint: str | Path | None,
     feature_map_cache: str | Path,
+    render_feature_map: bool,
     dry_run: bool,
     max_records: int | None,
 ) -> dict[str, object]:
@@ -53,10 +55,12 @@ def build_manifest(
         "external_runtime_dependency": "forbidden",
         "render_manifest": str(render_manifest),
         "gaussian_ply": None if gaussian_ply is None else str(gaussian_ply),
+        "feature_checkpoint": None if feature_checkpoint is None else str(feature_checkpoint),
         "feature_map_cache": str(feature_map_cache),
         "hyperparameters": {
             "dry_run": bool(dry_run),
             "max_records": None if max_records is None else int(max_records),
+            "render_feature_map": bool(render_feature_map),
         },
     }
 
@@ -68,11 +72,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--render_manifest", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--gaussian_ply", type=Path, default=None)
+    parser.add_argument("--feature_checkpoint", type=Path, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--latent_dim", type=int, default=16)
     parser.add_argument("--max_records", type=int, default=None)
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--feature_map_cache_name", default="render_feature_map_cache.pt")
+    parser.add_argument("--disable_feature_map", action="store_true")
     return parser
 
 
@@ -88,8 +94,10 @@ def main(argv: list[str] | None = None) -> int:
         render_fn = functools.partial(
             render_record_with_internal_3dgs,
             gaussian_ply=args.gaussian_ply,
+            feature_checkpoint=args.feature_checkpoint,
             device=str(args.device),
             latent_dim=int(args.latent_dim),
+            render_feature_map=not bool(args.disable_feature_map),
         )
     summary, updated = render_assets_from_manifest_records(
         records,
@@ -120,7 +128,9 @@ def main(argv: list[str] | None = None) -> int:
         command=command,
         render_manifest=args.render_manifest,
         gaussian_ply=args.gaussian_ply,
+        feature_checkpoint=args.feature_checkpoint,
         feature_map_cache=feature_map_cache,
+        render_feature_map=not bool(args.disable_feature_map),
         dry_run=bool(args.dry_run),
         max_records=args.max_records,
     )

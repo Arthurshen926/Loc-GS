@@ -166,8 +166,10 @@ def render_record_with_internal_3dgs(
     record: Mapping[str, Any],
     *,
     gaussian_ply: str | Path,
+    feature_checkpoint: str | Path | None = None,
     device: str = "cuda",
     latent_dim: int = 16,
+    render_feature_map: bool = True,
 ) -> dict[str, np.ndarray]:
     import torch
 
@@ -181,6 +183,8 @@ def render_record_with_internal_3dgs(
     pose_w2c = np.linalg.inv(pose_c2w)
     model = ExplicitFeatureGaussian(latent_dim=int(latent_dim))
     model.load_from_ply(str(gaussian_ply))
+    if feature_checkpoint is not None:
+        model.load_checkpoint(str(feature_checkpoint))
     target_device = torch.device(device)
     model.to(target_device)
     renderer = FeatureFieldRenderer(
@@ -192,10 +196,18 @@ def render_record_with_internal_3dgs(
         cy=float(intr["cy"]),
     ).to(target_device)
     with torch.no_grad():
-        result = renderer.render_rgb(
-            model,
-            torch.as_tensor(pose_w2c, dtype=torch.float32, device=target_device),
-        )
+        pose = torch.as_tensor(pose_w2c, dtype=torch.float32, device=target_device)
+        if bool(render_feature_map):
+            result = renderer.render_features_and_rgb(model, pose.unsqueeze(0))
+            output = {
+                "rgb": result["rgb"][0].detach().cpu().permute(1, 2, 0).numpy(),
+                "depth": result["depth_map"][0].detach().cpu().numpy(),
+                "descriptor_map": result["feature_map"][0].detach().cpu(),
+            }
+            if "alpha_map" in result:
+                output["score_map"] = result["alpha_map"][0].detach().cpu()
+            return output
+        result = renderer.render_rgb(model, pose)
     return {
         "rgb": result["rgb"].detach().cpu().permute(1, 2, 0).numpy(),
         "depth": result["depth"].detach().cpu().numpy(),

@@ -88,3 +88,32 @@ def test_render_internal_3dgs_assets_cli_dry_run_writes_auditable_bundle(tmp_pat
     assert run_manifest["external_runtime_dependency"] == "forbidden"
     assert rows[0]["render_status"] == "dry_run"
     assert (out / "command.txt").is_file()
+
+
+def test_render_internal_3dgs_assets_cli_records_feature_checkpoint_contract(tmp_path: Path):
+    manifest = tmp_path / "render_manifest.jsonl"
+    manifest.write_text(json.dumps(_record(tmp_path)) + "\n", encoding="utf-8")
+    feature_checkpoint = tmp_path / "feature_field.pth"
+    feature_checkpoint.write_bytes(b"placeholder")
+    out = tmp_path / "out"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_selfmap",
+            "--render_manifest",
+            str(manifest),
+            "--output_dir",
+            str(out),
+            "--feature_checkpoint",
+            str(feature_checkpoint),
+            "--dry_run",
+        ]
+    )
+
+    assert rc == 0
+    run_manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert run_manifest["feature_checkpoint"] == str(feature_checkpoint)
+    assert run_manifest["hyperparameters"]["render_feature_map"] is True
