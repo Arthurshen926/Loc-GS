@@ -20,6 +20,7 @@ from loc_gs.teacher.distillation_artifact import (
     build_distillation_payload_from_observations,
     load_teacher_observation_rows,
 )
+from loc_gs.teacher.geometric_observations import build_teacher_observations_from_geometry
 from loc_gs.training.sparse_candidate_scorer import CandidateScorerConfig, train_candidate_scorer
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 
@@ -66,7 +67,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--shard_id", default=None)
     parser.add_argument("--feature_map_cache", type=Path, required=True)
     parser.add_argument("--base_candidate_artifact", type=Path, required=True)
-    parser.add_argument("--teacher_observations", type=Path, required=True)
+    parser.add_argument("--teacher_observations", type=Path, default=None)
     parser.add_argument("--point_cloud", type=Path, required=True)
     parser.add_argument("--cameras_json", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
@@ -83,6 +84,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--pnp_method", choices=["epnp", "iterative"], default="epnp")
     parser.add_argument("--pnp_iterations", type=int, default=10000)
     parser.add_argument("--reprojection_error_px", type=float, default=8.0)
+    parser.add_argument("--dense_consistency_reprojection_px", type=float, default=4.0)
+    parser.add_argument("--sparse_inlier_reprojection_px", type=float, default=8.0)
+    parser.add_argument("--hard_negative_reprojection_px", type=float, default=8.0)
     parser.add_argument("--second_pnp_enabled", action="store_true")
     parser.add_argument("--second_pnp_method", choices=["epnp", "iterative"], default="iterative")
     parser.add_argument("--refine_with_inliers", action="store_true")
@@ -126,9 +130,31 @@ def main(argv: list[str] | None = None) -> int:
     candidate_payload = torch.load(candidate_shard, map_location="cpu")
     if not isinstance(candidate_payload, dict):
         raise ValueError(f"candidate shard must contain a dict payload: {candidate_shard}")
+    teacher_observation_source = "provided"
+    teacher_observations = args.teacher_observations
+    geometry_observation_summary = None
+    if teacher_observations is None:
+        teacher_observation_source = "geometry"
+        observations, geometry_observation_summary = build_teacher_observations_from_geometry(
+            candidate_artifact=candidate_shard,
+            point_cloud=args.point_cloud,
+            cameras_json=args.cameras_json,
+            scene=str(args.scene),
+            split_name=split,
+            target_width=args.image_width,
+            target_height=args.image_height,
+            missing_principal_point=str(args.missing_principal_point),
+            dense_consistency_reprojection_px=float(args.dense_consistency_reprojection_px),
+            sparse_inlier_reprojection_px=float(args.sparse_inlier_reprojection_px),
+            hard_negative_reprojection_px=float(args.hard_negative_reprojection_px),
+        )
+        teacher_observations = args.output_dir / "teacher_observations.jsonl"
+        with teacher_observations.open("w", encoding="utf-8") as handle:
+            for row in observations:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
     distilled_payload, distillation_summary = build_distillation_payload_from_observations(
         candidate_payload,
-        load_teacher_observation_rows(str(args.teacher_observations)),
+        load_teacher_observation_rows(str(teacher_observations)),
         scene=str(args.scene),
         split_name=split,
         cfg=DistillationArtifactConfig(),
@@ -181,6 +207,8 @@ def main(argv: list[str] | None = None) -> int:
         "split_name": split,
         "query_features": query_summary,
         "candidate_shard": candidate_summary,
+        "teacher_observation_source": teacher_observation_source,
+        "geometry_teacher_observations": geometry_observation_summary,
         "distillation": distillation_summary,
         "candidate_scorer": scorer_summary,
         "sparse_eval": sparse_summary,
@@ -203,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         "completion_shard": str(args.completion_shard),
         "feature_map_cache": str(args.feature_map_cache),
         "base_candidate_artifact": str(args.base_candidate_artifact),
-        "teacher_observations": str(args.teacher_observations),
+        "teacher_observations": str(teacher_observations),
         "point_cloud": str(args.point_cloud),
         "cameras_json": str(args.cameras_json),
         "outputs": {
@@ -227,6 +255,9 @@ def main(argv: list[str] | None = None) -> int:
             "pnp_method": str(args.pnp_method),
             "pnp_iterations": int(args.pnp_iterations),
             "reprojection_error_px": float(args.reprojection_error_px),
+            "dense_consistency_reprojection_px": float(args.dense_consistency_reprojection_px),
+            "sparse_inlier_reprojection_px": float(args.sparse_inlier_reprojection_px),
+            "hard_negative_reprojection_px": float(args.hard_negative_reprojection_px),
             "second_pnp_enabled": bool(args.second_pnp_enabled),
             "second_pnp_method": str(args.second_pnp_method),
             "refine_with_inliers": bool(args.refine_with_inliers),

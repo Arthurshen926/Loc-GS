@@ -210,3 +210,47 @@ def test_internal_mainline_smoke_cli_runs_completion_distillation_training_and_s
     assert manifest["inference_stage"] == "internal_mainline_smoke"
     assert manifest["dense_teacher_enabled"] is True
     assert manifest["dense_inference_enabled"] is False
+
+
+def test_internal_mainline_smoke_cli_can_generate_teacher_observations_from_geometry(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    out = tmp_path / "mainline_smoke"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train",
+            "--completion_shard",
+            str(_write_completion_shard(tmp_path / "completion_shard.json")),
+            "--feature_map_cache",
+            str(_write_feature_map_cache(tmp_path / "feature_maps.pt", cameras)),
+            "--base_candidate_artifact",
+            str(_write_base_candidate_artifact(tmp_path / "base_pairs.pt")),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--output_dir",
+            str(out),
+            "--topk",
+            "1",
+            "--max_keypoints",
+            "16",
+            "--epochs",
+            "20",
+            "--dense_consistency_reprojection_px",
+            "1.0",
+        ]
+    )
+
+    assert rc == 0
+    summary = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    rows = [json.loads(line) for line in (out / "teacher_observations.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 6
+    assert summary["teacher_observation_source"] == "geometry"
+    assert summary["distillation"]["matched_observation_count"] == 6
+    assert manifest["teacher_observations"] == str(out / "teacher_observations.jsonl")
+    assert manifest["hyperparameters"]["dense_consistency_reprojection_px"] == 1.0
