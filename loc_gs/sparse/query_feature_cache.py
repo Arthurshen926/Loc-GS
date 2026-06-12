@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
 
+from loc_gs.data.superpoint_cache import superpoint_score_map_from_logits
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 from loc_gs.sparse.audit import reject_test_split
 
@@ -197,6 +199,132 @@ def build_query_feature_cache_from_feature_map_cache(
     }
 
 
+def build_query_feature_cache_from_superpoint_dir(
+    *,
+    superpoint_dir: str | Path,
+    output_cache: str | Path,
+    scene: str,
+    split_name: str,
+    query_ids: Sequence[str] | None = None,
+    image_id_prefix: str = "",
+    max_keypoints: int = 2048,
+    score_threshold: float | None = None,
+) -> dict[str, object]:
+    split = reject_test_split(split_name, purpose="internal query feature cache from SuperPoint dir")
+    source_dir = Path(superpoint_dir)
+    manifest = _load_superpoint_frame_manifest(source_dir)
+    source_scene = str(manifest.get("scene") or "unknown")
+    if source_scene not in {"unknown", str(scene)}:
+        raise ValueError(f"SuperPoint feature dir scene mismatch: expected {scene}, got {source_scene}")
+    frames = manifest.get("frames")
+    if not isinstance(frames, Sequence) or isinstance(frames, (str, bytes)):
+        raise ValueError("SuperPoint frame_manifest.json is missing frames")
+    requested = [str(query_id) for query_id in query_ids] if query_ids is not None else None
+    requested_set = set(requested) if requested is not None else None
+    max_k = int(max_keypoints)
+    if max_k <= 0:
+        raise ValueError("max_keypoints must be positive")
+
+    rows: list[dict[str, Any]] = []
+    descriptor_dim = int(manifest.get("descriptor_dim") or 0)
+    for frame in frames:
+        if not isinstance(frame, Mapping):
+            raise ValueError("SuperPoint frame entries must be mappings")
+        image_id = _superpoint_image_id(frame, image_id_prefix=image_id_prefix)
+        if requested_set is not None and image_id not in requested_set:
+            continue
+        saved_stem = str(_required(frame, "saved_stem"))
+        descriptor_map = _load_superpoint_descriptor_map(source_dir / "descriptor" / f"{saved_stem}.pt")
+        detector_logits = _load_superpoint_detector_logits(source_dir / "detector" / f"{saved_stem}.pt")
+        descriptor_dim = descriptor_dim or int(descriptor_map.shape[0])
+        score_map = torch.as_tensor(superpoint_score_map_from_logits(detector_logits), dtype=torch.float32)
+        keypoints_yx, keypoint_scores = _select_feature_map_keypoints(
+            entry={"score_map": score_map},
+            max_keypoints=max_k,
+            score_threshold=score_threshold,
+        )
+        if keypoints_yx.numel() == 0:
+            continue
+        descriptor_grid_yx = keypoints_yx / 8.0
+        query_desc = _sample_descriptors_bilinear(descriptor_map, descriptor_grid_yx)
+        query_desc = F.normalize(query_desc, p=2, dim=1)
+        for row_idx in range(int(keypoints_yx.shape[0])):
+            rows.append(
+                {
+                    "image_id": image_id,
+                    "keypoint_id": f"kp_{row_idx:06d}",
+                    "query_yx": keypoints_yx[row_idx].cpu(),
+                    "query_desc": query_desc[row_idx].cpu(),
+                    "query_score": float(keypoint_scores[row_idx]),
+                }
+            )
+
+    covered_queries = _dedupe(row["image_id"] for row in rows)
+    missing_queries = [query_id for query_id in requested or [] if query_id not in set(covered_queries)]
+    query_yx = (
+        torch.stack([torch.as_tensor(row["query_yx"], dtype=torch.float32) for row in rows], dim=0)
+        if rows
+        else torch.zeros((0, 2), dtype=torch.float32)
+    )
+    query_desc = (
+        torch.stack([torch.as_tensor(row["query_desc"], dtype=torch.float32) for row in rows], dim=0)
+        if rows
+        else torch.zeros((0, int(descriptor_dim)), dtype=torch.float32)
+    )
+    query_score = (
+        torch.tensor([float(row["query_score"]) for row in rows], dtype=torch.float32)
+        if rows
+        else torch.zeros((0,), dtype=torch.float32)
+    )
+    split_audit = {
+        "schema_version": "internal_split_audit_v1",
+        "audit_status": "passed",
+        "split_name": split,
+        "official_test_used": False,
+        "test_split_used": False,
+    }
+    output = {
+        "metadata": {
+            "schema_version": "internal_query_feature_cache_v1",
+            "scene": str(scene),
+            "split_name": split,
+            "source": "internal_superpoint_feature_dir_sampler",
+            "source_superpoint_dir": str(source_dir),
+            "source_frame_manifest": str(source_dir / "frame_manifest.json"),
+            "image_id_prefix": str(image_id_prefix),
+            "split_audit": dict(split_audit),
+        },
+        "image_id": [str(row["image_id"]) for row in rows],
+        "keypoint_id": [str(row["keypoint_id"]) for row in rows],
+        "query_yx": query_yx.float(),
+        "query_desc": query_desc.float(),
+        "query_score": query_score.float(),
+    }
+    output_path = Path(output_cache)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(output, output_path)
+    return {
+        "schema_version": "internal_query_feature_cache_summary_v1",
+        "scene": str(scene),
+        "split_name": split,
+        "source_superpoint_dir": str(source_dir),
+        "source_frame_manifest": str(source_dir / "frame_manifest.json"),
+        "output_cache": str(output_path),
+        "requested_query_count": None if requested is None else int(len(requested)),
+        "query_count": int(len(covered_queries)),
+        "keypoint_count": int(len(rows)),
+        "missing_query_count": None if requested is None else int(len(missing_queries)),
+        "missing_query_ids_preview": missing_queries[:10],
+        "descriptor_dim": int(descriptor_dim),
+        "max_keypoints": int(max_k),
+        "score_threshold": None if score_threshold is None else float(score_threshold),
+        "image_id_prefix": str(image_id_prefix),
+        "dense_teacher_enabled": False,
+        "dense_inference_enabled": False,
+        "external_runtime_dependency": "forbidden",
+    }
+
+
 def _load_torch_mapping(path: str | Path) -> Mapping[str, Any]:
     payload = torch.load(path, map_location="cpu")
     if not isinstance(payload, Mapping):
@@ -244,6 +372,44 @@ def _feature_map_entries(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
             raise ValueError("feature map cache entries must be mappings")
         result.append(entry)
     return result
+
+
+def _load_superpoint_frame_manifest(source_dir: Path) -> Mapping[str, Any]:
+    manifest_path = source_dir / "frame_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"SuperPoint feature dir is missing frame_manifest.json: {manifest_path}")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"SuperPoint frame manifest must contain a mapping: {manifest_path}")
+    return payload
+
+
+def _superpoint_image_id(frame: Mapping[str, Any], *, image_id_prefix: str) -> str:
+    source_file = str(_required(frame, "source_file"))
+    prefix = str(image_id_prefix).strip("/")
+    return f"{prefix}/{source_file}" if prefix else source_file
+
+
+def _load_superpoint_descriptor_map(path: Path) -> torch.Tensor:
+    if not path.exists():
+        raise FileNotFoundError(f"SuperPoint descriptor file is missing: {path}")
+    descriptor = torch.as_tensor(torch.load(path, map_location="cpu"), dtype=torch.float32)
+    if descriptor.ndim == 4 and descriptor.shape[0] == 1:
+        descriptor = descriptor[0]
+    if descriptor.ndim != 3:
+        raise ValueError("SuperPoint descriptor must have shape [C,H,W] or [1,C,H,W]")
+    return descriptor.cpu()
+
+
+def _load_superpoint_detector_logits(path: Path) -> torch.Tensor:
+    if not path.exists():
+        raise FileNotFoundError(f"SuperPoint detector file is missing: {path}")
+    detector = torch.as_tensor(torch.load(path, map_location="cpu"), dtype=torch.float32)
+    if detector.ndim == 4 and detector.shape[0] == 1:
+        detector = detector[0]
+    if detector.ndim != 3 or int(detector.shape[0]) != 65:
+        raise ValueError("SuperPoint detector logits must have shape [65,H,W] or [1,65,H,W]")
+    return detector.cpu()
 
 
 def _descriptor_map(entry: Mapping[str, Any]) -> torch.Tensor:
