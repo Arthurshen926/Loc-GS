@@ -235,6 +235,31 @@ def _compact_candidate_mlp_scorer(data: dict[str, Any]) -> dict[str, Any]:
     return {key: data[key] for key in keys if key in data}
 
 
+def _compact_sparse_gate(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "sparse_gate_status",
+        "baseline_median_te_cm",
+        "candidate_median_te_cm",
+        "delta_median_te_cm",
+        "target_gap_cm",
+    )
+    return {key: data[key] for key in keys if key in data}
+
+
+def _compact_candidate_scorer_training(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "schema_version",
+        "feature_materialization",
+        "feature_input_policy",
+        "paper_safe_sparse_inference",
+        "native_top1_correct",
+        "trained_top1_correct",
+        "top1_gain",
+        "relative_top1_gain",
+    )
+    return {key: data[key] for key in keys if key in data}
+
+
 def _parse_hyperparameters(raw: str | None) -> dict[str, Any]:
     if raw is None or not str(raw).strip():
         return {}
@@ -255,12 +280,17 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
         payload["candidate_mlp_feature_cache"] = _compact_candidate_mlp_feature_cache(data)
     if data.get("schema_version") == "internal_candidate_mlp_scorer_training_summary_v1":
         payload["candidate_mlp_scorer"] = _compact_candidate_mlp_scorer(data)
+    if data.get("schema_version") == "internal_sparse_train_dev_gate_v1":
+        payload["sparse_gate"] = _compact_sparse_gate(data)
     nested_cache = data.get("candidate_mlp_feature_cache")
     if isinstance(nested_cache, dict):
         payload["candidate_mlp_feature_cache"] = _compact_candidate_mlp_feature_cache(nested_cache)
     nested_scorer = data.get("candidate_mlp_scorer")
     if isinstance(nested_scorer, dict):
         payload["candidate_mlp_scorer"] = _compact_candidate_mlp_scorer(nested_scorer)
+    nested_scorer_training = data.get("candidate_scorer_training")
+    if isinstance(nested_scorer_training, dict):
+        payload["candidate_scorer_training"] = _compact_candidate_scorer_training(nested_scorer_training)
     for stage in ("sparse", "dense"):
         stage_data = data.get(stage, {})
         if isinstance(stage_data, dict):

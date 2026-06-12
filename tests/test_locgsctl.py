@@ -154,6 +154,48 @@ def test_summarize_compacts_candidate_mlp_cache_and_training_summaries(tmp_path,
     assert scorer_payload["candidate_mlp_scorer"]["feature_materialization"] == "feature_cache"
 
 
+def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, capsys):
+    run_dir = tmp_path / "gate"
+    run_dir.mkdir()
+    (run_dir / "metrics_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_sparse_train_dev_gate_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev",
+                "sparse_gate_status": "regression",
+                "baseline_median_te_cm": 72.29,
+                "candidate_median_te_cm": 73.97,
+                "delta_median_te_cm": 1.68,
+                "target_gap_cm": 63.97,
+                "candidate_scorer_training": {
+                    "schema_version": "internal_candidate_mlp_scorer_training_summary_v1",
+                    "feature_materialization": "feature_cache",
+                    "feature_input_policy": "inference_safe",
+                    "paper_safe_sparse_inference": True,
+                    "native_top1_correct": 294,
+                    "trained_top1_correct": 573,
+                    "top1_gain": 279,
+                    "relative_top1_gain": 0.9489795918367347,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _run_cli(capsys, "summarize", str(run_dir))
+
+    assert payload["sparse_gate"] == {
+        "baseline_median_te_cm": 72.29,
+        "candidate_median_te_cm": 73.97,
+        "delta_median_te_cm": 1.68,
+        "sparse_gate_status": "regression",
+        "target_gap_cm": 63.97,
+    }
+    assert payload["candidate_scorer_training"]["top1_gain"] == 279
+    assert payload["candidate_scorer_training"]["feature_materialization"] == "feature_cache"
+
+
 def test_compare_reports_candidate_minus_baseline_deltas(tmp_path, capsys):
     baseline = tmp_path / "baseline"
     candidate = tmp_path / "candidate"
