@@ -49,6 +49,30 @@ def _write_metrics(path: Path, *, median_te_cm: float, split_name: str) -> Path:
     return path
 
 
+def _write_coverage_metrics(path: Path, *, complete: bool) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_candidate_coverage_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev_seed13_20p",
+                "candidate_artifact": "pairs.pt",
+                "requested_query_count": 7,
+                "covered_query_count": 7 if complete else 3,
+                "missing_query_count": 0 if complete else 4,
+                "coverage_ratio": 1.0 if complete else 3.0 / 7.0,
+                "complete_coverage": complete,
+                "coverage_status": "complete" if complete else "partial",
+                "missing_query_ids_preview": [] if complete else ["missing_a.png"],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_internal_sparse_gate_cli_writes_manifest_metrics_and_candidate_preview(tmp_path: Path):
     pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
     baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
@@ -96,6 +120,44 @@ def test_internal_sparse_gate_cli_writes_manifest_metrics_and_candidate_preview(
     split_audit = json.loads((out / "split_audit.json").read_text(encoding="utf-8"))
     assert split_audit["audit_status"] == "passed"
     assert (out / "git_status.txt").exists()
+
+
+def test_internal_sparse_gate_blocks_pass_when_candidate_coverage_is_incomplete(tmp_path: Path):
+    pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
+    baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
+    candidate = _write_metrics(tmp_path / "candidate.json", median_te_cm=9.0, split_name="train_dev_seed13_20p")
+    coverage = _write_coverage_metrics(tmp_path / "coverage.json", complete=False)
+    out = tmp_path / "gate_coverage"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev_seed13_20p",
+            "--candidate_artifact",
+            str(pair_cache),
+            "--baseline_metrics",
+            str(baseline),
+            "--candidate_metrics",
+            str(candidate),
+            "--candidate_coverage_metrics",
+            str(coverage),
+            "--output_dir",
+            str(out),
+            "--dense_target_cm",
+            "10.0",
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    assert metrics["sparse_gate_status"] == "blocked_candidate_coverage_incomplete"
+    assert metrics["candidate_coverage"]["complete_coverage"] is False
+    assert metrics["candidate_coverage"]["covered_query_count"] == 3
+    assert metrics["candidate_coverage"]["missing_query_count"] == 4
+    assert manifest["candidate_coverage_metrics"] == str(coverage)
 
 
 def test_internal_sparse_gate_marks_unverified_internal_pipeline_metrics_diagnostic(tmp_path: Path):

@@ -38,6 +38,7 @@ def build_gate_manifest(
     candidate_artifact: str | Path,
     baseline_metrics: str | Path,
     candidate_metrics: str | Path,
+    candidate_coverage_metrics: str | Path | None,
     hyperparameters: Mapping[str, object],
     data_root: str | Path | None = None,
     map_path: str | Path | None = None,
@@ -62,6 +63,7 @@ def build_gate_manifest(
         "candidate_artifact": str(candidate_artifact),
         "baseline_metrics": str(baseline_metrics),
         "candidate_metrics": str(candidate_metrics),
+        "candidate_coverage_metrics": None if candidate_coverage_metrics is None else str(candidate_coverage_metrics),
         "hyperparameters": dict(hyperparameters),
         "data_root": None if data_root is None else str(data_root),
         "map_path": None if map_path is None else str(map_path),
@@ -76,6 +78,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate_artifact", type=Path, required=True)
     parser.add_argument("--baseline_metrics", type=Path, required=True)
     parser.add_argument("--candidate_metrics", type=Path, required=True)
+    parser.add_argument("--candidate_coverage_metrics", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--dense_target_cm", type=float, default=10.0)
     parser.add_argument("--max_artifact_rows", type=int, default=None)
@@ -93,6 +96,9 @@ def main(argv: list[str] | None = None) -> int:
         "dense_target_cm": float(args.dense_target_cm),
         "max_artifact_rows": None if args.max_artifact_rows is None else int(args.max_artifact_rows),
         "max_export_batches": int(args.max_export_batches),
+        "candidate_coverage_metrics": None
+        if args.candidate_coverage_metrics is None
+        else str(args.candidate_coverage_metrics),
     }
     artifact = load_listwise_candidate_artifact(args.candidate_artifact, max_rows=args.max_artifact_rows)
     comparison = build_sparse_gate_comparison(
@@ -102,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate_metrics_path=args.candidate_metrics,
         dense_target_cm=float(args.dense_target_cm),
         candidate_artifact=artifact,
+        candidate_coverage_metrics_path=args.candidate_coverage_metrics,
     )
     manifest = build_gate_manifest(
         scene=str(args.scene),
@@ -110,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate_artifact=args.candidate_artifact,
         baseline_metrics=args.baseline_metrics,
         candidate_metrics=args.candidate_metrics,
+        candidate_coverage_metrics=args.candidate_coverage_metrics,
         hyperparameters=hyperparameters,
         data_root=args.data_root,
         map_path=args.map_path,

@@ -19,6 +19,7 @@ class SparseGateComparison:
     baseline_metrics: Mapping[str, Any]
     candidate_metrics: Mapping[str, Any]
     candidate_artifact: CachedCandidateArtifact
+    candidate_coverage_metrics: Mapping[str, Any] | None = None
 
     def build_metrics_summary(self) -> dict[str, object]:
         baseline_te = float(self.baseline_metrics["median_te_cm"])
@@ -37,8 +38,22 @@ class SparseGateComparison:
             or candidate_query_count is None
             or int(baseline_query_count) == int(candidate_query_count)
         )
+        coverage_metrics = self.candidate_coverage_metrics
+        coverage_split = None if coverage_metrics is None else coverage_metrics.get("split_name")
+        coverage_comparable_split = (
+            coverage_metrics is None
+            or coverage_split is None
+            or str(coverage_split) == str(self.split_name)
+            or not candidate_split
+            or str(coverage_split) == str(candidate_split)
+        )
+        coverage_complete = True if coverage_metrics is None else bool(coverage_metrics.get("complete_coverage"))
         if not comparable_split or not comparable_count:
             status = "diagnostic_split_or_query_mismatch"
+        elif not coverage_comparable_split:
+            status = "diagnostic_split_or_query_mismatch"
+        elif not coverage_complete:
+            status = "blocked_candidate_coverage_incomplete"
         elif candidate_metric_source == "internal_sparse_smoke_metrics_v1" and candidate_pose_metric_status != "verified":
             status = "diagnostic_pose_frame_unverified"
         elif candidate_te <= dense_target and candidate_te <= baseline_te:
@@ -72,6 +87,7 @@ class SparseGateComparison:
             "candidate_metric_source": candidate_metric_source,
             "candidate_pose_metric_status": candidate_pose_metric_status,
             "candidate_artifact": artifact_summary,
+            "candidate_coverage": _compact_coverage_metrics(coverage_metrics),
             "baseline_metrics_path": self.baseline_metrics_path,
             "candidate_metrics_path": self.candidate_metrics_path,
             "candidate_artifact_path": self.candidate_artifact.source_path,
@@ -90,6 +106,24 @@ def _maybe_int(value: Any) -> int | None:
     return int(value)
 
 
+def _compact_coverage_metrics(metrics: Mapping[str, Any] | None) -> dict[str, object] | None:
+    if metrics is None:
+        return None
+    keys = (
+        "schema_version",
+        "scene",
+        "split_name",
+        "requested_query_count",
+        "covered_query_count",
+        "missing_query_count",
+        "coverage_ratio",
+        "complete_coverage",
+        "coverage_status",
+        "missing_query_ids_preview",
+    )
+    return {key: metrics[key] for key in keys if key in metrics}
+
+
 def load_metrics_summary(path: str | Path) -> dict[str, Any]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict):
@@ -105,14 +139,23 @@ def build_sparse_gate_comparison(
     candidate_metrics_path: str | Path,
     dense_target_cm: float,
     candidate_artifact: CachedCandidateArtifact,
+    candidate_coverage_metrics_path: str | Path | None = None,
 ) -> SparseGateComparison:
     split = reject_test_split(split_name, purpose="internal sparse gate")
     baseline_metrics = load_metrics_summary(baseline_metrics_path)
     candidate_metrics = load_metrics_summary(candidate_metrics_path)
+    candidate_coverage_metrics = (
+        load_metrics_summary(candidate_coverage_metrics_path) if candidate_coverage_metrics_path is not None else None
+    )
     for label, metrics in (("baseline", baseline_metrics), ("candidate", candidate_metrics)):
         metric_split = metrics.get("split_name")
         if metric_split:
             reject_test_split(str(metric_split), purpose=f"internal sparse gate {label} metrics")
+    if candidate_coverage_metrics is not None and candidate_coverage_metrics.get("split_name"):
+        reject_test_split(
+            str(candidate_coverage_metrics["split_name"]),
+            purpose="internal sparse gate candidate coverage metrics",
+        )
     return SparseGateComparison(
         scene=str(scene),
         split_name=split,
@@ -122,4 +165,5 @@ def build_sparse_gate_comparison(
         baseline_metrics=baseline_metrics,
         candidate_metrics=candidate_metrics,
         candidate_artifact=candidate_artifact,
+        candidate_coverage_metrics=candidate_coverage_metrics,
     )
