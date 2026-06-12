@@ -9,6 +9,7 @@ from loc_gs.core.camera import load_camera_records
 from loc_gs.core.geometry import project_points_w2c
 from loc_gs.scripts.eval_internal_sparse_cached import main
 from loc_gs.students.descriptor_fusion import DescriptorFusionModel
+from loc_gs.students.detector_student import DetectorStudentModel
 from loc_gs.students.landmark_selector import LandmarkSelectorModel
 
 
@@ -299,3 +300,50 @@ def test_eval_internal_sparse_cached_cli_accepts_descriptor_fusion(tmp_path: Pat
     assert metrics["descriptor_fusion_enabled"] is True
     assert rows[0]["success"] is True
     assert rows[0]["te_cm"] < 1.0
+
+
+def test_eval_internal_sparse_cached_cli_accepts_detector_student(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    detector_path = tmp_path / "detector_student.json"
+    detector = DetectorStudentModel(
+        grid_size=1,
+        x_extent=120.0,
+        y_extent=90.0,
+        cell_scores={"0:0": 3.0},
+        score_scale=1.0,
+    )
+    detector_path.write_text(json.dumps(detector.to_json_dict(), sort_keys=True), encoding="utf-8")
+    out = tmp_path / "eval_detector"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt", cameras, buried_correct=True)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--detector_student",
+            str(detector_path),
+            "--rerank_prefix_fraction",
+            "0",
+            "--native_weight",
+            "0",
+            "--solver_weight",
+            "1",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    assert metrics["detector_student_enabled"] is True

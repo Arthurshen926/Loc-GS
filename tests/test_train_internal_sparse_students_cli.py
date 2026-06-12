@@ -108,6 +108,7 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     selector = json.loads((out / "landmark_selector.json").read_text(encoding="utf-8"))
     conflicts = json.loads((out / "conflict_graph.json").read_text(encoding="utf-8"))
     fusion = json.loads((out / "descriptor_fusion.json").read_text(encoding="utf-8"))
+    detector = json.loads((out / "detector_student.json").read_text(encoding="utf-8"))
     episodes = [json.loads(line) for line in (out / "online_episodes.jsonl").read_text(encoding="utf-8").splitlines()]
     artifact = load_listwise_candidate_artifact(out / "online_distilled_candidates.pt")
 
@@ -123,10 +124,12 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
         "landmark_selector",
         "conflict_graph",
         "descriptor_fusion",
+        "detector_student",
     ]
     assert model["schema_version"] == "internal_sparse_candidate_scorer_v1"
     assert selector["schema_version"] == "internal_landmark_selector_v1"
     assert conflicts["schema_version"] == "internal_conflict_graph_v1"
     assert fusion["schema_version"] == "internal_descriptor_fusion_v1"
+    assert detector["schema_version"] == "internal_detector_student_v1"
     assert episodes[0]["schema_version"] == "internal_online_sparse_dense_episode_v1"
     assert artifact.keypoint_count <= 4

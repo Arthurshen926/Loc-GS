@@ -13,6 +13,7 @@ from loc_gs.sparse.landmarks import CacheLandmarkResolver, load_gaussian_landmar
 from loc_gs.sparse.pipeline import SparseLocalizationConfig, run_sparse_localization
 from loc_gs.sparse.real_inputs import CachedSparseInputConfig, sparse_input_from_cached_batch
 from loc_gs.students.descriptor_fusion import descriptor_fusion_score_rows, load_descriptor_fusion
+from loc_gs.students.detector_student import detector_score_rows, load_detector_student
 from loc_gs.students.landmark_selector import landmark_selector_score_rows, load_landmark_selector
 from loc_gs.training.sparse_candidate_scorer import candidate_solver_score_rows, load_candidate_scorer
 
@@ -31,6 +32,8 @@ class CachedSparseEvalConfig:
     landmark_selector_weight: float = 1.0
     descriptor_fusion: str | Path | None = None
     descriptor_fusion_weight: float = 1.0
+    detector_student: str | Path | None = None
+    detector_student_weight: float = 1.0
     rerank_prefix_fraction: float = 1.0
     solver_weight: float = 1.0
     native_weight: float = 1.0
@@ -78,6 +81,7 @@ def run_cached_sparse_eval(
     scorer = load_candidate_scorer(cfg.candidate_scorer) if cfg.candidate_scorer is not None else None
     selector = load_landmark_selector(cfg.landmark_selector) if cfg.landmark_selector is not None else None
     descriptor_fusion = load_descriptor_fusion(cfg.descriptor_fusion) if cfg.descriptor_fusion is not None else None
+    detector_student = load_detector_student(cfg.detector_student) if cfg.detector_student is not None else None
     input_cfg = CachedSparseInputConfig(score_mode=cfg.score_mode, max_keypoints=int(cfg.max_keypoints))
     loc_cfg = SparseLocalizationConfig(
         rerank_prefix_fraction=float(cfg.rerank_prefix_fraction),
@@ -140,6 +144,13 @@ def run_cached_sparse_eval(
                 descriptor_rows,
                 selector_weight=float(cfg.descriptor_fusion_weight),
             )
+        if detector_student is not None:
+            detector_rows = detector_score_rows(batch, detector_student)
+            solver_score_rows = _combine_score_rows(
+                solver_score_rows,
+                detector_rows,
+                selector_weight=float(cfg.detector_student_weight),
+            )
         if solver_score_rows is not None:
             batch_input_cfg = CachedSparseInputConfig(
                 score_mode=cfg.score_mode,
@@ -197,6 +208,7 @@ def run_cached_sparse_eval(
         "candidate_scorer_enabled": bool(scorer is not None),
         "landmark_selector_enabled": bool(selector is not None),
         "descriptor_fusion_enabled": bool(descriptor_fusion is not None),
+        "detector_student_enabled": bool(detector_student is not None),
         "pnp_stage_count_median": _median_or_none(stage_counts),
         "lgcv_keep_count_median": _median_or_none(lgcv_keep_counts),
         "post_pnp_rescore_changed_count_median": _median_or_none(post_pnp_changed_counts),
