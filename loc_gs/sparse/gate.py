@@ -254,6 +254,20 @@ def _compact_student_training_metrics(metrics: Mapping[str, Any] | None) -> dict
             True,
         ),
         (
+            "inlier_precision_feedback",
+            (
+                "schema_version",
+                "input_solver_feedback_count",
+                "input_inlier_precision_feedback_count",
+                "matched_solver_feedback_count",
+                "added_solver_feedback_count",
+                "boosted_solver_feedback_count",
+                "weight_scale",
+                "max_distill_weight",
+            ),
+            False,
+        ),
+        (
             "landmark_selector",
             (
                 "schema_version",

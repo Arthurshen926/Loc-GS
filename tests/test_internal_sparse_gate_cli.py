@@ -260,6 +260,16 @@ def _write_candidate_student_training_summary(path: Path) -> Path:
                     "feature_materialization": "feature_cache",
                     "feature_cache_enabled": True,
                 },
+                "inlier_precision_feedback": {
+                    "schema_version": "internal_inlier_precision_feedback_merge_summary_v1",
+                    "input_solver_feedback_count": 25,
+                    "input_inlier_precision_feedback_count": 20,
+                    "matched_solver_feedback_count": 15,
+                    "added_solver_feedback_count": 0,
+                    "boosted_solver_feedback_count": 15,
+                    "weight_scale": 1.0,
+                    "max_distill_weight": 4.0,
+                },
                 "landmark_selector": {
                     "schema_version": "internal_landmark_selector_training_summary_v1",
                     "student_modules": ["landmark_selector", "conflict_graph"],
@@ -543,6 +553,7 @@ def test_internal_sparse_gate_includes_candidate_student_training_evidence(tmp_p
     assert evidence["render_ready_episode_count"] == 60
     assert evidence["distillation"]["protected_support_count"] == 30632
     assert evidence["candidate_mlp_scorer"]["top1_gain"] == 132
+    assert evidence["inlier_precision_feedback"]["boosted_solver_feedback_count"] == 15
     assert evidence["landmark_selector"]["conflict_edge_count"] == 63377
     assert evidence["descriptor_fusion"]["landmark_count"] == 2000
     assert evidence["detector_student"]["positive_keypoint_count"] == 120

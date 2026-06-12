@@ -464,6 +464,16 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                         "trained_top1_correct": 1198,
                         "feature_materialization": "feature_cache",
                     },
+                    "inlier_precision_feedback": {
+                        "schema_version": "internal_inlier_precision_feedback_merge_summary_v1",
+                        "input_solver_feedback_count": 25,
+                        "input_inlier_precision_feedback_count": 20,
+                        "matched_solver_feedback_count": 15,
+                        "added_solver_feedback_count": 0,
+                        "boosted_solver_feedback_count": 15,
+                        "weight_scale": 1.0,
+                        "max_distill_weight": 4.0,
+                    },
                 },
                 "candidate_failure_profile": {
                     "schema_version": "internal_sparse_failure_profile_v1",
@@ -563,6 +573,7 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
     assert payload["candidate_student_training"]["online_episode_count"] == 64
     assert payload["candidate_student_training"]["distillation"]["protected_support_count"] == 30632
     assert payload["candidate_student_training"]["candidate_mlp_scorer"]["top1_gain"] == 132
+    assert payload["candidate_student_training"]["inlier_precision_feedback"]["boosted_solver_feedback_count"] == 15
     assert payload["candidate_failure_profile"]["failure_mode_counts"]["selected_set_low_precision"] == 20
     assert payload["candidate_failure_profile"]["recommendation"] == "prioritize_set_level_selection_and_inlier_precision"
     assert payload["candidate_inlier_precision_feedback"]["hard_query_count"] == 15

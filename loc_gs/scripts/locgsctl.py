@@ -361,6 +361,22 @@ def _compact_student_training(data: dict[str, Any]) -> dict[str, Any]:
                 "dense_teacher_sample_count",
             ),
         )
+    inlier_precision_feedback = data.get("inlier_precision_feedback")
+    if isinstance(inlier_precision_feedback, dict):
+        out["inlier_precision_feedback"] = {
+            key: inlier_precision_feedback[key]
+            for key in (
+                "schema_version",
+                "input_solver_feedback_count",
+                "input_inlier_precision_feedback_count",
+                "matched_solver_feedback_count",
+                "added_solver_feedback_count",
+                "boosted_solver_feedback_count",
+                "weight_scale",
+                "max_distill_weight",
+            )
+            if key in inlier_precision_feedback
+        }
     landmark_selector = data.get("landmark_selector")
     if isinstance(landmark_selector, dict):
         out["landmark_selector"] = {
