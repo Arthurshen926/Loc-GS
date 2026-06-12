@@ -1,0 +1,55 @@
+from pathlib import Path
+
+import pytest
+
+from loc_gs.sparse.audit import (
+    ForbiddenRuntimeDependency,
+    assert_internal_mainline_sources,
+    reject_test_split,
+)
+
+
+def test_reject_test_split_blocks_training_labels():
+    for split in ("test", "official_test", "cambridge_test"):
+        with pytest.raises(ValueError, match="test split"):
+            reject_test_split(split, purpose="teacher labels")
+
+
+def test_reject_test_split_allows_non_test_and_unknown():
+    assert reject_test_split("train_selfmap", purpose="teacher labels") == "train_selfmap"
+    assert reject_test_split("", purpose="eval manifest") == "unknown"
+
+
+def test_internal_mainline_audit_finds_external_ulfloc_import(tmp_path: Path):
+    path = tmp_path / "bad.py"
+    path.write_text(
+        "import sys\n"
+        "sys.path.insert(0, '/root/ULF-Loc')\n"
+        "from ulfloc import ULFLoc\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ForbiddenRuntimeDependency) as exc:
+        assert_internal_mainline_sources([path])
+
+    assert "/root/ULF-Loc" in str(exc.value)
+    assert str(path) in str(exc.value)
+
+
+def test_internal_mainline_audit_finds_vendored_stdloc_runtime(tmp_path: Path):
+    path = tmp_path / "bad_stdloc.py"
+    path.write_text(
+        "STDLOC_ROOT = 'third_party/stdloc'\n"
+        "subprocess.run(['python', 'third_party/stdloc/stdloc.py'])\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ForbiddenRuntimeDependency, match="third_party/stdloc/stdloc.py"):
+        assert_internal_mainline_sources([path])
+
+
+def test_internal_mainline_audit_allows_reference_text_when_disabled(tmp_path: Path):
+    path = tmp_path / "doc.py"
+    path.write_text("REFERENCE = 'third_party/stdloc/configs/stdloc_cambridge.yaml'\n", encoding="utf-8")
+
+    assert_internal_mainline_sources([path])
