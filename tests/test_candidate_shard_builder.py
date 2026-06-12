@@ -37,6 +37,32 @@ def _write_base_artifact(path: Path) -> Path:
     return path
 
 
+def _write_large_base_artifact(path: Path) -> Path:
+    base_desc = torch.arange(64, dtype=torch.float32).reshape(32, 2)
+    payload = {
+        "metadata": {
+            "format": "listwise",
+            "scene": "GreatCourt",
+            "source_split_name": "train",
+            "topk": 2,
+            "split_audit": {"audit_status": "passed", "checks": {}},
+        },
+        "base_gaussian_id": torch.arange(32, dtype=torch.int64),
+        "base_landmark_desc": base_desc,
+        "query_yx": torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+        "landmark_id": torch.tensor([[0, 1]], dtype=torch.int64),
+        "cosine": torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        "label": torch.tensor([-1], dtype=torch.int64),
+        "candidate_mask": torch.ones((1, 2), dtype=torch.bool),
+        "query_id": ["seed.png::kp0"],
+        "image_id": ["seed.png"],
+        "keypoint_id": ["kp0"],
+        "source_phase": ["train"],
+    }
+    torch.save(payload, path)
+    return path
+
+
 def _write_query_feature_cache(path: Path) -> Path:
     payload = {
         "metadata": {"scene": "GreatCourt", "split_name": "train_dev_seed13_20p"},
@@ -48,6 +74,12 @@ def _write_query_feature_cache(path: Path) -> Path:
     }
     torch.save(payload, path)
     return path
+
+
+def _storage_nbytes(tensor: torch.Tensor) -> int:
+    if hasattr(tensor, "untyped_storage"):
+        return int(tensor.untyped_storage().nbytes())
+    return int(tensor.storage().size() * tensor.element_size())
 
 
 def _shard() -> dict[str, object]:
@@ -88,6 +120,29 @@ def test_candidate_shard_builder_generates_listwise_artifact_from_query_features
     assert payload["base_gaussian_id"].tolist() == [10, 20, 30]
     assert payload["label"].tolist() == [-1, -1]
     assert payload["metadata"]["source"] == "internal_candidate_shard_builder"
+
+
+def test_candidate_shard_builder_clones_limited_base_landmark_storage(tmp_path: Path):
+    output = tmp_path / "candidate_shard.pt"
+
+    build_candidate_shard_artifact(
+        completion_shard=_shard(),
+        query_feature_cache=_write_query_feature_cache(tmp_path / "query_features.pt"),
+        base_candidate_artifact=_write_large_base_artifact(tmp_path / "base.pt"),
+        output_artifact=output,
+        scene="GreatCourt",
+        split_name="train_dev_seed13_20p",
+        topk=2,
+        max_landmarks=3,
+    )
+
+    payload = torch.load(output, map_location="cpu")
+    base_desc = payload["base_landmark_desc"]
+    base_ids = payload["base_gaussian_id"]
+    assert tuple(base_desc.shape) == (3, 2)
+    assert tuple(base_ids.shape) == (3,)
+    assert _storage_nbytes(base_desc) == base_desc.numel() * base_desc.element_size()
+    assert _storage_nbytes(base_ids) == base_ids.numel() * base_ids.element_size()
 
 
 def test_candidate_shard_builder_rejects_test_split(tmp_path: Path):

@@ -51,8 +51,8 @@ def build_candidate_shard_artifact(
     base_gaussian_id = torch.as_tensor(_required(base_payload, "base_gaussian_id"), dtype=torch.long).cpu()
     if max_landmarks is not None:
         limit = min(int(max_landmarks), int(base_desc.shape[0]))
-        base_desc = base_desc[:limit]
-        base_gaussian_id = base_gaussian_id[:limit]
+        base_desc = base_desc[:limit].clone()
+        base_gaussian_id = base_gaussian_id[:limit].clone()
     if base_desc.ndim != 2:
         raise ValueError("base_landmark_desc must have shape [num_landmarks, descriptor_dim]")
     query_desc = torch.stack([row["query_desc"] for row in query_rows], dim=0).float()
