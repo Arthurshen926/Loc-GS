@@ -22,6 +22,7 @@ class SparseGateComparison:
     candidate_coverage_metrics: Mapping[str, Any] | None = None
     candidate_scorer_metrics: Mapping[str, Any] | None = None
     candidate_conflict_graph_metrics: Mapping[str, Any] | None = None
+    candidate_student_training_metrics: Mapping[str, Any] | None = None
 
     def build_metrics_summary(self) -> dict[str, object]:
         baseline_te = float(self.baseline_metrics["median_te_cm"])
@@ -99,6 +100,9 @@ class SparseGateComparison:
             "candidate_conflict_graph_training": _compact_conflict_graph_metrics(
                 self.candidate_conflict_graph_metrics
             ),
+            "candidate_student_training": _compact_student_training_metrics(
+                self.candidate_student_training_metrics
+            ),
             "baseline_metrics_path": self.baseline_metrics_path,
             "candidate_metrics_path": self.candidate_metrics_path,
             "candidate_artifact_path": self.candidate_artifact.source_path,
@@ -173,6 +177,127 @@ def _compact_conflict_graph_metrics(metrics: Mapping[str, Any] | None) -> dict[s
         "hyperparameters",
     )
     return {key: metrics[key] for key in keys if key in metrics}
+
+
+def _compact_student_training_metrics(metrics: Mapping[str, Any] | None) -> dict[str, object] | None:
+    if metrics is None:
+        return None
+    keys = (
+        "schema_version",
+        "student_modules",
+        "online_episode_count",
+        "missing_candidate_count",
+        "candidate_keypoint_count",
+        "source_image_count",
+        "dense_helped_episode_count",
+        "feedback_matched_episode_count",
+        "render_ready_episode_count",
+        "missing_render_episode_count",
+        "top1_correct",
+        "topk_available",
+        "oracle_gap",
+        "render_engine",
+    )
+    out: dict[str, object] = {key: metrics[key] for key in keys if key in metrics}
+    nested: tuple[tuple[str, tuple[str, ...], bool], ...] = (
+        (
+            "distillation",
+            (
+                "schema_version",
+                "candidate_row_count",
+                "candidate_sample_count",
+                "feedback_query_count",
+                "matched_feedback_row_count",
+                "dense_helped_query_count",
+                "protected_support_count",
+                "hard_negative_count",
+            ),
+            False,
+        ),
+        (
+            "candidate_scorer",
+            (
+                "schema_version",
+                "feature_materialization",
+                "feature_input_policy",
+                "paper_safe_sparse_inference",
+                "sample_count",
+                "label_count",
+                "native_top1_correct",
+                "trained_top1_correct",
+                "dense_teacher_sample_count",
+            ),
+            True,
+        ),
+        (
+            "candidate_mlp_scorer",
+            (
+                "schema_version",
+                "feature_materialization",
+                "feature_cache_enabled",
+                "feature_input_policy",
+                "paper_safe_sparse_inference",
+                "sample_count",
+                "label_count",
+                "native_top1_correct",
+                "trained_top1_correct",
+                "dense_teacher_sample_count",
+            ),
+            True,
+        ),
+        (
+            "landmark_selector",
+            (
+                "schema_version",
+                "student_modules",
+                "landmark_count",
+                "observed_candidate_count",
+                "protected_support_count",
+                "positive_inlier_count",
+                "hard_negative_count",
+                "conflict_edge_count",
+            ),
+            False,
+        ),
+        (
+            "descriptor_fusion",
+            (
+                "schema_version",
+                "student_modules",
+                "landmark_count",
+                "protected_support_count",
+                "positive_inlier_count",
+                "hard_negative_count",
+            ),
+            False,
+        ),
+        (
+            "detector_student",
+            (
+                "schema_version",
+                "student_modules",
+                "grid_size",
+                "cell_count",
+                "positive_keypoint_count",
+                "hard_negative_keypoint_count",
+            ),
+            False,
+        ),
+    )
+    for name, nested_keys, add_gain in nested:
+        value = metrics.get(name)
+        if not isinstance(value, Mapping):
+            continue
+        compact = {key: value[key] for key in nested_keys if key in value}
+        if add_gain:
+            native = _maybe_int(value.get("native_top1_correct"))
+            trained = _maybe_int(value.get("trained_top1_correct"))
+            if native is not None and trained is not None:
+                compact["top1_gain"] = int(trained - native)
+                compact["relative_top1_gain"] = float((trained - native) / native) if native > 0 else 0.0
+        if compact:
+            out[name] = compact
+    return out
 
 
 def _compact_rerank_diagnostic(metrics: Mapping[str, Any]) -> dict[str, object] | None:
@@ -256,6 +381,7 @@ def build_sparse_gate_comparison(
     candidate_coverage_metrics_path: str | Path | None = None,
     candidate_scorer_metrics_path: str | Path | None = None,
     candidate_conflict_graph_metrics_path: str | Path | None = None,
+    candidate_student_training_metrics_path: str | Path | None = None,
 ) -> SparseGateComparison:
     split = reject_test_split(split_name, purpose="internal sparse gate")
     baseline_metrics = load_metrics_summary(baseline_metrics_path)
@@ -269,6 +395,11 @@ def build_sparse_gate_comparison(
     candidate_conflict_graph_metrics = (
         load_metrics_summary(candidate_conflict_graph_metrics_path)
         if candidate_conflict_graph_metrics_path is not None
+        else None
+    )
+    candidate_student_training_metrics = (
+        load_metrics_summary(candidate_student_training_metrics_path)
+        if candidate_student_training_metrics_path is not None
         else None
     )
     for label, metrics in (("baseline", baseline_metrics), ("candidate", candidate_metrics)):
@@ -290,6 +421,11 @@ def build_sparse_gate_comparison(
             str(candidate_conflict_graph_metrics["split_name"]),
             purpose="internal sparse gate candidate conflict graph metrics",
         )
+    if candidate_student_training_metrics is not None and candidate_student_training_metrics.get("split_name"):
+        reject_test_split(
+            str(candidate_student_training_metrics["split_name"]),
+            purpose="internal sparse gate candidate student training metrics",
+        )
     return SparseGateComparison(
         scene=str(scene),
         split_name=split,
@@ -302,4 +438,5 @@ def build_sparse_gate_comparison(
         candidate_coverage_metrics=candidate_coverage_metrics,
         candidate_scorer_metrics=candidate_scorer_metrics,
         candidate_conflict_graph_metrics=candidate_conflict_graph_metrics,
+        candidate_student_training_metrics=candidate_student_training_metrics,
     )

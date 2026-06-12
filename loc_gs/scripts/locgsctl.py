@@ -275,6 +275,139 @@ def _compact_conflict_graph_training(data: dict[str, Any]) -> dict[str, Any]:
     return {key: data[key] for key in keys if key in data}
 
 
+def _compact_top1_training(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    out = {key: data[key] for key in keys if key in data}
+    native = _as_int(data.get("native_top1_correct"))
+    trained = _as_int(data.get("trained_top1_correct"))
+    if native is not None and trained is not None:
+        out["top1_gain"] = int(trained - native)
+        out["relative_top1_gain"] = float((trained - native) / native) if native > 0 else 0.0
+    return out
+
+
+def _as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_student_training(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "schema_version",
+        "student_modules",
+        "online_episode_count",
+        "missing_candidate_count",
+        "candidate_keypoint_count",
+        "source_image_count",
+        "dense_helped_episode_count",
+        "feedback_matched_episode_count",
+        "render_ready_episode_count",
+        "missing_render_episode_count",
+        "top1_correct",
+        "topk_available",
+        "oracle_gap",
+        "render_engine",
+    )
+    out: dict[str, Any] = {key: data[key] for key in keys if key in data}
+    distillation = data.get("distillation")
+    if isinstance(distillation, dict):
+        out["distillation"] = {
+            key: distillation[key]
+            for key in (
+                "schema_version",
+                "candidate_row_count",
+                "candidate_sample_count",
+                "feedback_query_count",
+                "matched_feedback_row_count",
+                "dense_helped_query_count",
+                "protected_support_count",
+                "hard_negative_count",
+            )
+            if key in distillation
+        }
+    candidate_scorer = data.get("candidate_scorer")
+    if isinstance(candidate_scorer, dict):
+        out["candidate_scorer"] = _compact_top1_training(
+            candidate_scorer,
+            (
+                "schema_version",
+                "feature_materialization",
+                "feature_input_policy",
+                "paper_safe_sparse_inference",
+                "sample_count",
+                "label_count",
+                "native_top1_correct",
+                "trained_top1_correct",
+                "dense_teacher_sample_count",
+            ),
+        )
+    candidate_mlp_scorer = data.get("candidate_mlp_scorer")
+    if isinstance(candidate_mlp_scorer, dict):
+        out["candidate_mlp_scorer"] = _compact_top1_training(
+            candidate_mlp_scorer,
+            (
+                "schema_version",
+                "feature_materialization",
+                "feature_cache_enabled",
+                "feature_input_policy",
+                "paper_safe_sparse_inference",
+                "sample_count",
+                "label_count",
+                "native_top1_correct",
+                "trained_top1_correct",
+                "dense_teacher_sample_count",
+            ),
+        )
+    landmark_selector = data.get("landmark_selector")
+    if isinstance(landmark_selector, dict):
+        out["landmark_selector"] = {
+            key: landmark_selector[key]
+            for key in (
+                "schema_version",
+                "student_modules",
+                "landmark_count",
+                "observed_candidate_count",
+                "protected_support_count",
+                "positive_inlier_count",
+                "hard_negative_count",
+                "conflict_edge_count",
+            )
+            if key in landmark_selector
+        }
+    descriptor_fusion = data.get("descriptor_fusion")
+    if isinstance(descriptor_fusion, dict):
+        out["descriptor_fusion"] = {
+            key: descriptor_fusion[key]
+            for key in (
+                "schema_version",
+                "student_modules",
+                "landmark_count",
+                "protected_support_count",
+                "positive_inlier_count",
+                "hard_negative_count",
+            )
+            if key in descriptor_fusion
+        }
+    detector_student = data.get("detector_student")
+    if isinstance(detector_student, dict):
+        out["detector_student"] = {
+            key: detector_student[key]
+            for key in (
+                "schema_version",
+                "student_modules",
+                "grid_size",
+                "cell_count",
+                "positive_keypoint_count",
+                "hard_negative_keypoint_count",
+            )
+            if key in detector_student
+        }
+    return out
+
+
 def _compact_rerank_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "rerank_diagnostic_enabled",
@@ -352,6 +485,11 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
         payload["candidate_mlp_scorer"] = _compact_candidate_mlp_scorer(data)
     if data.get("schema_version") == "internal_landmark_selector_training_summary_v1":
         payload["candidate_conflict_graph_training"] = _compact_conflict_graph_training(data)
+    if data.get("schema_version") in {
+        "internal_online_sparse_student_training_summary_v1",
+        "internal_online_sparse_dense_episode_summary_v1",
+    }:
+        payload["candidate_student_training"] = _compact_student_training(data)
     if data.get("schema_version") == "internal_sparse_train_dev_gate_v1":
         payload["sparse_gate"] = _compact_sparse_gate(data)
     if data.get("schema_version") == "internal_sparse_cached_eval_metrics_v1":
@@ -385,6 +523,9 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
     nested_conflict_graph_training = data.get("candidate_conflict_graph_training")
     if isinstance(nested_conflict_graph_training, dict):
         payload["candidate_conflict_graph_training"] = _compact_conflict_graph_training(nested_conflict_graph_training)
+    nested_student_training = data.get("candidate_student_training")
+    if isinstance(nested_student_training, dict):
+        payload["candidate_student_training"] = _compact_student_training(nested_student_training)
     nested_rerank = data.get("candidate_rerank_diagnostic")
     if isinstance(nested_rerank, dict):
         payload["candidate_rerank_diagnostic"] = _compact_rerank_diagnostic(nested_rerank)

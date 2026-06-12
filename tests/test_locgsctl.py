@@ -197,6 +197,114 @@ def test_summarize_compacts_landmark_selector_training_summary(tmp_path, capsys)
     }
 
 
+def test_summarize_compacts_online_sparse_student_training_summary(tmp_path, capsys):
+    train_dir = tmp_path / "online_students"
+    train_dir.mkdir()
+    (train_dir / "metrics_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_online_sparse_student_training_summary_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev",
+                "student_modules": [
+                    "correspondence_scorer",
+                    "candidate_mlp_scorer",
+                    "landmark_selector",
+                    "conflict_graph",
+                    "descriptor_fusion",
+                    "detector_student",
+                ],
+                "online_episode_count": 64,
+                "missing_candidate_count": 0,
+                "candidate_keypoint_count": 4096,
+                "source_image_count": 53,
+                "dense_helped_episode_count": 7,
+                "feedback_matched_episode_count": 7,
+                "render_ready_episode_count": 60,
+                "missing_render_episode_count": 4,
+                "top1_correct": 1066,
+                "topk_available": 2088,
+                "oracle_gap": 1022,
+                "render_engine": "3dgs",
+                "distillation": {
+                    "schema_version": "internal_distillation_artifact_summary_v1",
+                    "candidate_row_count": 65536,
+                    "candidate_sample_count": 524288,
+                    "feedback_query_count": 25,
+                    "matched_feedback_row_count": 12800,
+                    "dense_helped_query_count": 21,
+                    "protected_support_count": 30632,
+                    "hard_negative_count": 96589,
+                },
+                "candidate_scorer": {
+                    "schema_version": "internal_sparse_candidate_scorer_training_summary_v1",
+                    "sample_count": 13410,
+                    "label_count": 2088,
+                    "native_top1_correct": 1066,
+                    "trained_top1_correct": 1181,
+                    "dense_teacher_sample_count": 13410,
+                },
+                "candidate_mlp_scorer": {
+                    "schema_version": "internal_candidate_mlp_scorer_training_summary_v1",
+                    "sample_count": 13410,
+                    "label_count": 2088,
+                    "native_top1_correct": 1066,
+                    "trained_top1_correct": 1198,
+                    "feature_materialization": "feature_cache",
+                    "feature_cache_enabled": True,
+                },
+                "landmark_selector": {
+                    "schema_version": "internal_landmark_selector_training_summary_v1",
+                    "student_modules": ["landmark_selector", "conflict_graph"],
+                    "landmark_count": 105226,
+                    "observed_candidate_count": 1257472,
+                    "protected_support_count": 18830,
+                    "hard_negative_count": 1189004,
+                    "positive_inlier_count": 0,
+                    "conflict_edge_count": 63377,
+                },
+                "descriptor_fusion": {
+                    "schema_version": "internal_descriptor_fusion_training_summary_v1",
+                    "student_modules": ["descriptor_fusion"],
+                    "landmark_count": 2000,
+                    "protected_support_count": 1200,
+                    "positive_inlier_count": 300,
+                    "hard_negative_count": 500,
+                },
+                "detector_student": {
+                    "schema_version": "internal_detector_student_training_summary_v1",
+                    "student_modules": ["detector_student"],
+                    "grid_size": 8,
+                    "cell_count": 17,
+                    "positive_keypoint_count": 120,
+                    "hard_negative_keypoint_count": 44,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _run_cli(capsys, "summarize", str(train_dir))
+
+    evidence = payload["candidate_student_training"]
+    assert evidence["online_episode_count"] == 64
+    assert evidence["render_ready_episode_count"] == 60
+    assert evidence["student_modules"] == [
+        "correspondence_scorer",
+        "candidate_mlp_scorer",
+        "landmark_selector",
+        "conflict_graph",
+        "descriptor_fusion",
+        "detector_student",
+    ]
+    assert evidence["distillation"]["hard_negative_count"] == 96589
+    assert evidence["candidate_scorer"]["top1_gain"] == 115
+    assert evidence["candidate_mlp_scorer"]["top1_gain"] == 132
+    assert evidence["landmark_selector"]["conflict_edge_count"] == 63377
+    assert evidence["descriptor_fusion"]["landmark_count"] == 2000
+    assert evidence["detector_student"]["positive_keypoint_count"] == 120
+
+
 def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, capsys):
     run_dir = tmp_path / "gate"
     run_dir.mkdir()
@@ -233,6 +341,38 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                     "hyperparameters": {
                         "conflict_penalty": 0.1,
                         "protected_support_gain": 2.0,
+                    },
+                },
+                "candidate_student_training": {
+                    "schema_version": "internal_online_sparse_student_training_summary_v1",
+                    "student_modules": ["correspondence_scorer", "candidate_mlp_scorer"],
+                    "online_episode_count": 64,
+                    "missing_candidate_count": 0,
+                    "candidate_keypoint_count": 4096,
+                    "source_image_count": 53,
+                    "dense_helped_episode_count": 7,
+                    "feedback_matched_episode_count": 7,
+                    "render_ready_episode_count": 60,
+                    "missing_render_episode_count": 4,
+                    "top1_correct": 1066,
+                    "topk_available": 2088,
+                    "oracle_gap": 1022,
+                    "render_engine": "3dgs",
+                    "distillation": {
+                        "schema_version": "internal_distillation_artifact_summary_v1",
+                        "candidate_row_count": 65536,
+                        "candidate_sample_count": 524288,
+                        "feedback_query_count": 25,
+                        "matched_feedback_row_count": 12800,
+                        "dense_helped_query_count": 21,
+                        "protected_support_count": 30632,
+                        "hard_negative_count": 96589,
+                    },
+                    "candidate_mlp_scorer": {
+                        "schema_version": "internal_candidate_mlp_scorer_training_summary_v1",
+                        "native_top1_correct": 1066,
+                        "trained_top1_correct": 1198,
+                        "feature_materialization": "feature_cache",
                     },
                 },
                 "candidate_rerank_diagnostic": {
@@ -289,6 +429,9 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
     assert payload["candidate_conflict_graph_training"]["conflict_edge_count"] == 63377
     assert payload["candidate_conflict_graph_training"]["protected_support_count"] == 18830
     assert payload["candidate_conflict_graph_training"]["student_modules"] == ["landmark_selector", "conflict_graph"]
+    assert payload["candidate_student_training"]["online_episode_count"] == 64
+    assert payload["candidate_student_training"]["distillation"]["protected_support_count"] == 30632
+    assert payload["candidate_student_training"]["candidate_mlp_scorer"]["top1_gain"] == 132
     assert payload["candidate_rerank_diagnostic"]["reranked_top1_gain"] == 134
     assert payload["candidate_rerank_diagnostic"]["reranked_top1_correct"] == 225
     assert payload["candidate_selected_set_diagnostic"] == {
