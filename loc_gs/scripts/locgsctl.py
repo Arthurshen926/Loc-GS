@@ -260,6 +260,21 @@ def _compact_candidate_scorer_training(data: dict[str, Any]) -> dict[str, Any]:
     return {key: data[key] for key in keys if key in data}
 
 
+def _compact_conflict_graph_training(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "schema_version",
+        "student_modules",
+        "landmark_count",
+        "observed_candidate_count",
+        "protected_support_count",
+        "hard_negative_count",
+        "positive_inlier_count",
+        "conflict_edge_count",
+        "hyperparameters",
+    )
+    return {key: data[key] for key in keys if key in data}
+
+
 def _compact_rerank_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "rerank_diagnostic_enabled",
@@ -335,6 +350,8 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
         payload["candidate_mlp_feature_cache"] = _compact_candidate_mlp_feature_cache(data)
     if data.get("schema_version") == "internal_candidate_mlp_scorer_training_summary_v1":
         payload["candidate_mlp_scorer"] = _compact_candidate_mlp_scorer(data)
+    if data.get("schema_version") == "internal_landmark_selector_training_summary_v1":
+        payload["candidate_conflict_graph_training"] = _compact_conflict_graph_training(data)
     if data.get("schema_version") == "internal_sparse_train_dev_gate_v1":
         payload["sparse_gate"] = _compact_sparse_gate(data)
     if data.get("schema_version") == "internal_sparse_cached_eval_metrics_v1":
@@ -365,6 +382,9 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
     nested_scorer_training = data.get("candidate_scorer_training")
     if isinstance(nested_scorer_training, dict):
         payload["candidate_scorer_training"] = _compact_candidate_scorer_training(nested_scorer_training)
+    nested_conflict_graph_training = data.get("candidate_conflict_graph_training")
+    if isinstance(nested_conflict_graph_training, dict):
+        payload["candidate_conflict_graph_training"] = _compact_conflict_graph_training(nested_conflict_graph_training)
     nested_rerank = data.get("candidate_rerank_diagnostic")
     if isinstance(nested_rerank, dict):
         payload["candidate_rerank_diagnostic"] = _compact_rerank_diagnostic(nested_rerank)

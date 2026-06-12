@@ -176,6 +176,34 @@ def _write_candidate_scorer_training_summary(path: Path) -> Path:
     return path
 
 
+def _write_candidate_conflict_graph_training_summary(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_landmark_selector_training_summary_v1",
+                "student_modules": ["landmark_selector", "conflict_graph"],
+                "scene": "GreatCourt",
+                "split_name": "train_dev_seed13_20p",
+                "landmark_count": 105226,
+                "observed_candidate_count": 1257472,
+                "protected_support_count": 18830,
+                "hard_negative_count": 1189004,
+                "positive_inlier_count": 0,
+                "conflict_edge_count": 63377,
+                "hyperparameters": {
+                    "conflict_penalty": 0.1,
+                    "protected_support_gain": 2.0,
+                    "hard_negative_penalty": 1.0,
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_internal_sparse_gate_cli_writes_manifest_metrics_and_candidate_preview(tmp_path: Path):
     pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
     baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
@@ -263,6 +291,48 @@ def test_internal_sparse_gate_includes_candidate_scorer_training_evidence(tmp_pa
     assert evidence["trained_top1_correct"] == 573
     assert evidence["top1_gain"] == 279
     assert evidence["relative_top1_gain"] == 279 / 294
+
+
+def test_internal_sparse_gate_includes_candidate_conflict_graph_training_evidence(tmp_path: Path):
+    pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
+    baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
+    candidate = _write_metrics(tmp_path / "candidate.json", median_te_cm=13.0, split_name="train_dev_seed13_20p")
+    conflict_summary = _write_candidate_conflict_graph_training_summary(tmp_path / "conflict_metrics.json")
+    out = tmp_path / "gate_conflict"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev_seed13_20p",
+            "--candidate_artifact",
+            str(pair_cache),
+            "--baseline_metrics",
+            str(baseline),
+            "--candidate_metrics",
+            str(candidate),
+            "--candidate_conflict_graph_metrics",
+            str(conflict_summary),
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    evidence = metrics["candidate_conflict_graph_training"]
+    assert manifest["candidate_conflict_graph_metrics"] == str(conflict_summary)
+    assert evidence["schema_version"] == "internal_landmark_selector_training_summary_v1"
+    assert evidence["student_modules"] == ["landmark_selector", "conflict_graph"]
+    assert evidence["landmark_count"] == 105226
+    assert evidence["observed_candidate_count"] == 1257472
+    assert evidence["protected_support_count"] == 18830
+    assert evidence["hard_negative_count"] == 1189004
+    assert evidence["positive_inlier_count"] == 0
+    assert evidence["conflict_edge_count"] == 63377
+    assert evidence["hyperparameters"]["conflict_penalty"] == 0.1
 
 
 def test_internal_sparse_gate_includes_candidate_eval_rerank_diagnostic(tmp_path: Path):

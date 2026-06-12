@@ -21,6 +21,7 @@ class SparseGateComparison:
     candidate_artifact: CachedCandidateArtifact
     candidate_coverage_metrics: Mapping[str, Any] | None = None
     candidate_scorer_metrics: Mapping[str, Any] | None = None
+    candidate_conflict_graph_metrics: Mapping[str, Any] | None = None
 
     def build_metrics_summary(self) -> dict[str, object]:
         baseline_te = float(self.baseline_metrics["median_te_cm"])
@@ -95,6 +96,9 @@ class SparseGateComparison:
             "candidate_set_conflict_diagnostic": _compact_set_conflict_diagnostic(self.candidate_metrics),
             "candidate_post_pnp_rescore_diagnostic": _compact_post_pnp_rescore_diagnostic(self.candidate_metrics),
             "candidate_scorer_training": _compact_candidate_scorer_metrics(self.candidate_scorer_metrics),
+            "candidate_conflict_graph_training": _compact_conflict_graph_metrics(
+                self.candidate_conflict_graph_metrics
+            ),
             "baseline_metrics_path": self.baseline_metrics_path,
             "candidate_metrics_path": self.candidate_metrics_path,
             "candidate_artifact_path": self.candidate_artifact.source_path,
@@ -152,6 +156,23 @@ def _compact_candidate_scorer_metrics(metrics: Mapping[str, Any] | None) -> dict
         out["top1_gain"] = int(trained - native)
         out["relative_top1_gain"] = float((trained - native) / native) if native > 0 else 0.0
     return out
+
+
+def _compact_conflict_graph_metrics(metrics: Mapping[str, Any] | None) -> dict[str, object] | None:
+    if metrics is None:
+        return None
+    keys = (
+        "schema_version",
+        "student_modules",
+        "landmark_count",
+        "observed_candidate_count",
+        "protected_support_count",
+        "hard_negative_count",
+        "positive_inlier_count",
+        "conflict_edge_count",
+        "hyperparameters",
+    )
+    return {key: metrics[key] for key in keys if key in metrics}
 
 
 def _compact_rerank_diagnostic(metrics: Mapping[str, Any]) -> dict[str, object] | None:
@@ -234,6 +255,7 @@ def build_sparse_gate_comparison(
     candidate_artifact: CachedCandidateArtifact,
     candidate_coverage_metrics_path: str | Path | None = None,
     candidate_scorer_metrics_path: str | Path | None = None,
+    candidate_conflict_graph_metrics_path: str | Path | None = None,
 ) -> SparseGateComparison:
     split = reject_test_split(split_name, purpose="internal sparse gate")
     baseline_metrics = load_metrics_summary(baseline_metrics_path)
@@ -243,6 +265,11 @@ def build_sparse_gate_comparison(
     )
     candidate_scorer_metrics = (
         load_metrics_summary(candidate_scorer_metrics_path) if candidate_scorer_metrics_path is not None else None
+    )
+    candidate_conflict_graph_metrics = (
+        load_metrics_summary(candidate_conflict_graph_metrics_path)
+        if candidate_conflict_graph_metrics_path is not None
+        else None
     )
     for label, metrics in (("baseline", baseline_metrics), ("candidate", candidate_metrics)):
         metric_split = metrics.get("split_name")
@@ -258,6 +285,11 @@ def build_sparse_gate_comparison(
             str(candidate_scorer_metrics["split_name"]),
             purpose="internal sparse gate candidate scorer metrics",
         )
+    if candidate_conflict_graph_metrics is not None and candidate_conflict_graph_metrics.get("split_name"):
+        reject_test_split(
+            str(candidate_conflict_graph_metrics["split_name"]),
+            purpose="internal sparse gate candidate conflict graph metrics",
+        )
     return SparseGateComparison(
         scene=str(scene),
         split_name=split,
@@ -269,4 +301,5 @@ def build_sparse_gate_comparison(
         candidate_artifact=candidate_artifact,
         candidate_coverage_metrics=candidate_coverage_metrics,
         candidate_scorer_metrics=candidate_scorer_metrics,
+        candidate_conflict_graph_metrics=candidate_conflict_graph_metrics,
     )

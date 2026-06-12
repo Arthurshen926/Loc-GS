@@ -154,6 +154,49 @@ def test_summarize_compacts_candidate_mlp_cache_and_training_summaries(tmp_path,
     assert scorer_payload["candidate_mlp_scorer"]["feature_materialization"] == "feature_cache"
 
 
+def test_summarize_compacts_landmark_selector_training_summary(tmp_path, capsys):
+    selector_dir = tmp_path / "selector"
+    selector_dir.mkdir()
+    (selector_dir / "metrics_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_landmark_selector_training_summary_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev",
+                "student_modules": ["landmark_selector", "conflict_graph"],
+                "landmark_count": 105226,
+                "observed_candidate_count": 1257472,
+                "protected_support_count": 18830,
+                "hard_negative_count": 1189004,
+                "positive_inlier_count": 0,
+                "conflict_edge_count": 63377,
+                "hyperparameters": {
+                    "conflict_penalty": 0.1,
+                    "protected_support_gain": 2.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _run_cli(capsys, "summarize", str(selector_dir))
+
+    assert payload["candidate_conflict_graph_training"] == {
+        "conflict_edge_count": 63377,
+        "hard_negative_count": 1189004,
+        "hyperparameters": {
+            "conflict_penalty": 0.1,
+            "protected_support_gain": 2.0,
+        },
+        "landmark_count": 105226,
+        "observed_candidate_count": 1257472,
+        "positive_inlier_count": 0,
+        "protected_support_count": 18830,
+        "schema_version": "internal_landmark_selector_training_summary_v1",
+        "student_modules": ["landmark_selector", "conflict_graph"],
+    }
+
+
 def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, capsys):
     run_dir = tmp_path / "gate"
     run_dir.mkdir()
@@ -177,6 +220,20 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                     "trained_top1_correct": 573,
                     "top1_gain": 279,
                     "relative_top1_gain": 0.9489795918367347,
+                },
+                "candidate_conflict_graph_training": {
+                    "schema_version": "internal_landmark_selector_training_summary_v1",
+                    "student_modules": ["landmark_selector", "conflict_graph"],
+                    "landmark_count": 105226,
+                    "observed_candidate_count": 1257472,
+                    "protected_support_count": 18830,
+                    "hard_negative_count": 1189004,
+                    "positive_inlier_count": 0,
+                    "conflict_edge_count": 63377,
+                    "hyperparameters": {
+                        "conflict_penalty": 0.1,
+                        "protected_support_gain": 2.0,
+                    },
                 },
                 "candidate_rerank_diagnostic": {
                     "rerank_diagnostic_enabled": True,
@@ -229,6 +286,9 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
     }
     assert payload["candidate_scorer_training"]["top1_gain"] == 279
     assert payload["candidate_scorer_training"]["feature_materialization"] == "feature_cache"
+    assert payload["candidate_conflict_graph_training"]["conflict_edge_count"] == 63377
+    assert payload["candidate_conflict_graph_training"]["protected_support_count"] == 18830
+    assert payload["candidate_conflict_graph_training"]["student_modules"] == ["landmark_selector", "conflict_graph"]
     assert payload["candidate_rerank_diagnostic"]["reranked_top1_gain"] == 134
     assert payload["candidate_rerank_diagnostic"]["reranked_top1_correct"] == 225
     assert payload["candidate_selected_set_diagnostic"] == {
