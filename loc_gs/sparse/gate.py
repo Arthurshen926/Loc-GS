@@ -23,6 +23,7 @@ class SparseGateComparison:
     candidate_scorer_metrics: Mapping[str, Any] | None = None
     candidate_conflict_graph_metrics: Mapping[str, Any] | None = None
     candidate_student_training_metrics: Mapping[str, Any] | None = None
+    candidate_failure_profile_metrics: Mapping[str, Any] | None = None
 
     def build_metrics_summary(self) -> dict[str, object]:
         baseline_te = float(self.baseline_metrics["median_te_cm"])
@@ -102,6 +103,9 @@ class SparseGateComparison:
             ),
             "candidate_student_training": _compact_student_training_metrics(
                 self.candidate_student_training_metrics
+            ),
+            "candidate_failure_profile": _compact_failure_profile_metrics(
+                self.candidate_failure_profile_metrics
             ),
             "baseline_metrics_path": self.baseline_metrics_path,
             "candidate_metrics_path": self.candidate_metrics_path,
@@ -300,6 +304,25 @@ def _compact_student_training_metrics(metrics: Mapping[str, Any] | None) -> dict
     return out
 
 
+def _compact_failure_profile_metrics(metrics: Mapping[str, Any] | None) -> dict[str, object] | None:
+    if metrics is None:
+        return None
+    keys = (
+        "schema_version",
+        "query_count",
+        "success_count",
+        "median_te_cm",
+        "target_gap_cm",
+        "failure_mode_counts",
+        "dominant_failure_modes",
+        "recommendation",
+        "candidate_artifact",
+        "rerank_diagnostic",
+        "post_pnp_rescore",
+    )
+    return {key: metrics[key] for key in keys if key in metrics}
+
+
 def _compact_rerank_diagnostic(metrics: Mapping[str, Any]) -> dict[str, object] | None:
     if not bool(metrics.get("rerank_diagnostic_enabled")):
         return None
@@ -383,6 +406,7 @@ def build_sparse_gate_comparison(
     candidate_scorer_metrics_path: str | Path | None = None,
     candidate_conflict_graph_metrics_path: str | Path | None = None,
     candidate_student_training_metrics_path: str | Path | None = None,
+    candidate_failure_profile_metrics_path: str | Path | None = None,
 ) -> SparseGateComparison:
     split = reject_test_split(split_name, purpose="internal sparse gate")
     baseline_metrics = load_metrics_summary(baseline_metrics_path)
@@ -401,6 +425,11 @@ def build_sparse_gate_comparison(
     candidate_student_training_metrics = (
         load_metrics_summary(candidate_student_training_metrics_path)
         if candidate_student_training_metrics_path is not None
+        else None
+    )
+    candidate_failure_profile_metrics = (
+        load_metrics_summary(candidate_failure_profile_metrics_path)
+        if candidate_failure_profile_metrics_path is not None
         else None
     )
     for label, metrics in (("baseline", baseline_metrics), ("candidate", candidate_metrics)):
@@ -427,6 +456,11 @@ def build_sparse_gate_comparison(
             str(candidate_student_training_metrics["split_name"]),
             purpose="internal sparse gate candidate student training metrics",
         )
+    if candidate_failure_profile_metrics is not None and candidate_failure_profile_metrics.get("split_name"):
+        reject_test_split(
+            str(candidate_failure_profile_metrics["split_name"]),
+            purpose="internal sparse gate candidate failure profile metrics",
+        )
     return SparseGateComparison(
         scene=str(scene),
         split_name=split,
@@ -440,4 +474,5 @@ def build_sparse_gate_comparison(
         candidate_scorer_metrics=candidate_scorer_metrics,
         candidate_conflict_graph_metrics=candidate_conflict_graph_metrics,
         candidate_student_training_metrics=candidate_student_training_metrics,
+        candidate_failure_profile_metrics=candidate_failure_profile_metrics,
     )

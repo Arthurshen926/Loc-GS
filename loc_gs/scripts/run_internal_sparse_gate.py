@@ -42,6 +42,7 @@ def build_gate_manifest(
     candidate_scorer_metrics: str | Path | None,
     candidate_conflict_graph_metrics: str | Path | None,
     candidate_student_training_metrics: str | Path | None,
+    candidate_failure_profile_metrics: str | Path | None,
     hyperparameters: Mapping[str, object],
     data_root: str | Path | None = None,
     map_path: str | Path | None = None,
@@ -74,6 +75,9 @@ def build_gate_manifest(
         "candidate_student_training_metrics": None
         if candidate_student_training_metrics is None
         else str(candidate_student_training_metrics),
+        "candidate_failure_profile_metrics": None
+        if candidate_failure_profile_metrics is None
+        else str(candidate_failure_profile_metrics),
         "hyperparameters": dict(hyperparameters),
         "data_root": None if data_root is None else str(data_root),
         "map_path": None if map_path is None else str(map_path),
@@ -92,6 +96,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate_scorer_metrics", type=Path, default=None)
     parser.add_argument("--candidate_conflict_graph_metrics", type=Path, default=None)
     parser.add_argument("--candidate_student_training_metrics", type=Path, default=None)
+    parser.add_argument("--candidate_failure_profile_metrics", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--dense_target_cm", type=float, default=10.0)
     parser.add_argument("--max_artifact_rows", type=int, default=None)
@@ -121,6 +126,9 @@ def main(argv: list[str] | None = None) -> int:
         "candidate_student_training_metrics": None
         if args.candidate_student_training_metrics is None
         else str(args.candidate_student_training_metrics),
+        "candidate_failure_profile_metrics": None
+        if args.candidate_failure_profile_metrics is None
+        else str(args.candidate_failure_profile_metrics),
     }
     artifact = load_listwise_candidate_artifact(args.candidate_artifact, max_rows=args.max_artifact_rows)
     comparison = build_sparse_gate_comparison(
@@ -134,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate_scorer_metrics_path=args.candidate_scorer_metrics,
         candidate_conflict_graph_metrics_path=args.candidate_conflict_graph_metrics,
         candidate_student_training_metrics_path=args.candidate_student_training_metrics,
+        candidate_failure_profile_metrics_path=args.candidate_failure_profile_metrics,
     )
     manifest = build_gate_manifest(
         scene=str(args.scene),
@@ -146,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate_scorer_metrics=args.candidate_scorer_metrics,
         candidate_conflict_graph_metrics=args.candidate_conflict_graph_metrics,
         candidate_student_training_metrics=args.candidate_student_training_metrics,
+        candidate_failure_profile_metrics=args.candidate_failure_profile_metrics,
         hyperparameters=hyperparameters,
         data_root=args.data_root,
         map_path=args.map_path,

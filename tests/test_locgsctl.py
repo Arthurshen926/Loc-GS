@@ -305,6 +305,62 @@ def test_summarize_compacts_online_sparse_student_training_summary(tmp_path, cap
     assert evidence["detector_student"]["positive_keypoint_count"] == 120
 
 
+def test_summarize_compacts_internal_sparse_failure_profile(tmp_path, capsys):
+    profile_dir = tmp_path / "failure_profile"
+    profile_dir.mkdir()
+    (profile_dir / "metrics_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_sparse_failure_profile_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev",
+                "query_count": 20,
+                "success_count": 20,
+                "median_te_cm": 55.62,
+                "target_gap_cm": 45.62,
+                "failure_mode_counts": {
+                    "selected_set_low_precision": 20,
+                    "inlier_set_wrong_dominant": 19,
+                },
+                "dominant_failure_modes": [
+                    {"mode": "selected_set_low_precision", "count": 20},
+                    {"mode": "inlier_set_wrong_dominant", "count": 19},
+                ],
+                "recommendation": "prioritize_set_level_selection_and_inlier_precision",
+                "candidate_artifact": {
+                    "top1_correct": 502,
+                    "topk_available": 1453,
+                    "oracle_gap": 951,
+                },
+                "rerank_diagnostic": {
+                    "native_top1_correct": 502,
+                    "reranked_top1_correct": 977,
+                    "reranked_top1_gain": 475,
+                    "reranked_topk_available": 1453,
+                },
+                "post_pnp_rescore": {
+                    "enabled": False,
+                    "correct_delta_sum": 0,
+                    "worsened_sum": 0,
+                },
+                "per_query": [{"query_id": "q.png", "failure_modes": ["selected_set_low_precision"]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _run_cli(capsys, "summarize", str(profile_dir))
+
+    evidence = payload["sparse_failure_profile"]
+    assert evidence["query_count"] == 20
+    assert evidence["failure_mode_counts"]["selected_set_low_precision"] == 20
+    assert evidence["dominant_failure_modes"][0] == {"mode": "selected_set_low_precision", "count": 20}
+    assert evidence["recommendation"] == "prioritize_set_level_selection_and_inlier_precision"
+    assert evidence["candidate_artifact"]["oracle_gap"] == 951
+    assert evidence["rerank_diagnostic"]["reranked_top1_gain"] == 475
+    assert "per_query" not in evidence
+
+
 def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, capsys):
     run_dir = tmp_path / "gate"
     run_dir.mkdir()
@@ -375,6 +431,33 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                         "feature_materialization": "feature_cache",
                     },
                 },
+                "candidate_failure_profile": {
+                    "schema_version": "internal_sparse_failure_profile_v1",
+                    "query_count": 20,
+                    "success_count": 20,
+                    "median_te_cm": 55.62,
+                    "target_gap_cm": 45.62,
+                    "failure_mode_counts": {
+                        "selected_set_low_precision": 20,
+                        "inlier_set_wrong_dominant": 19,
+                    },
+                    "dominant_failure_modes": [
+                        {"mode": "selected_set_low_precision", "count": 20},
+                        {"mode": "inlier_set_wrong_dominant", "count": 19},
+                    ],
+                    "recommendation": "prioritize_set_level_selection_and_inlier_precision",
+                    "candidate_artifact": {
+                        "top1_correct": 502,
+                        "topk_available": 1453,
+                        "oracle_gap": 951,
+                    },
+                    "rerank_diagnostic": {
+                        "native_top1_correct": 502,
+                        "reranked_top1_correct": 977,
+                        "reranked_top1_gain": 475,
+                        "reranked_topk_available": 1453,
+                    },
+                },
                 "candidate_rerank_diagnostic": {
                     "rerank_diagnostic_enabled": True,
                     "rerank_diagnostic_query_count": 1536,
@@ -433,6 +516,8 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
     assert payload["candidate_student_training"]["online_episode_count"] == 64
     assert payload["candidate_student_training"]["distillation"]["protected_support_count"] == 30632
     assert payload["candidate_student_training"]["candidate_mlp_scorer"]["top1_gain"] == 132
+    assert payload["candidate_failure_profile"]["failure_mode_counts"]["selected_set_low_precision"] == 20
+    assert payload["candidate_failure_profile"]["recommendation"] == "prioritize_set_level_selection_and_inlier_precision"
     assert payload["candidate_rerank_diagnostic"]["reranked_top1_gain"] == 134
     assert payload["candidate_rerank_diagnostic"]["reranked_top1_correct"] == 225
     assert payload["candidate_selected_set_diagnostic"] == {

@@ -295,6 +295,53 @@ def _write_candidate_student_training_summary(path: Path) -> Path:
     return path
 
 
+def _write_candidate_failure_profile(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_sparse_failure_profile_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev_seed13_20p",
+                "query_count": 20,
+                "success_count": 20,
+                "median_te_cm": 55.62,
+                "target_gap_cm": 45.62,
+                "failure_mode_counts": {
+                    "selected_set_low_precision": 20,
+                    "inlier_set_wrong_dominant": 19,
+                    "post_pnp_rescore_harm": 0,
+                },
+                "dominant_failure_modes": [
+                    {"mode": "selected_set_low_precision", "count": 20},
+                    {"mode": "inlier_set_wrong_dominant", "count": 19},
+                ],
+                "recommendation": "prioritize_set_level_selection_and_inlier_precision",
+                "candidate_artifact": {
+                    "top1_correct": 502,
+                    "topk_available": 1453,
+                    "oracle_gap": 951,
+                },
+                "rerank_diagnostic": {
+                    "native_top1_correct": 502,
+                    "reranked_top1_correct": 977,
+                    "reranked_top1_gain": 475,
+                    "reranked_topk_available": 1453,
+                },
+                "post_pnp_rescore": {
+                    "enabled": False,
+                    "correct_delta_sum": 0,
+                    "worsened_sum": 0,
+                },
+                "per_query": [],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_internal_sparse_gate_cli_writes_manifest_metrics_and_candidate_preview(tmp_path: Path):
     pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
     baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
@@ -473,6 +520,44 @@ def test_internal_sparse_gate_includes_candidate_student_training_evidence(tmp_p
     assert evidence["landmark_selector"]["conflict_edge_count"] == 63377
     assert evidence["descriptor_fusion"]["landmark_count"] == 2000
     assert evidence["detector_student"]["positive_keypoint_count"] == 120
+
+
+def test_internal_sparse_gate_includes_candidate_failure_profile_evidence(tmp_path: Path):
+    pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
+    baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
+    candidate = _write_metrics(tmp_path / "candidate.json", median_te_cm=13.0, split_name="train_dev_seed13_20p")
+    failure_profile = _write_candidate_failure_profile(tmp_path / "failure_profile.json")
+    out = tmp_path / "gate_failure_profile"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev_seed13_20p",
+            "--candidate_artifact",
+            str(pair_cache),
+            "--baseline_metrics",
+            str(baseline),
+            "--candidate_metrics",
+            str(candidate),
+            "--candidate_failure_profile_metrics",
+            str(failure_profile),
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    evidence = metrics["candidate_failure_profile"]
+    assert manifest["candidate_failure_profile_metrics"] == str(failure_profile)
+    assert evidence["schema_version"] == "internal_sparse_failure_profile_v1"
+    assert evidence["failure_mode_counts"]["selected_set_low_precision"] == 20
+    assert evidence["dominant_failure_modes"][0]["mode"] == "selected_set_low_precision"
+    assert evidence["recommendation"] == "prioritize_set_level_selection_and_inlier_precision"
+    assert evidence["rerank_diagnostic"]["reranked_top1_gain"] == 475
 
 
 def test_internal_sparse_gate_includes_candidate_eval_rerank_diagnostic(tmp_path: Path):

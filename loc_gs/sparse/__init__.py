@@ -8,6 +8,7 @@ from .audit import (
     scan_forbidden_runtime_dependencies,
 )
 from .correspondences import SparseCandidateBatch
+from .failure_profile import SparseFailureProfileConfig, build_sparse_failure_profile
 from .pipeline import (
     SparseLocalizationConfig,
     SparseLocalizationInput,
@@ -22,11 +23,13 @@ __all__ = [
     "ForbiddenRuntimeDependency",
     "ForbiddenRuntimeHit",
     "SparseCandidateBatch",
+    "SparseFailureProfileConfig",
     "SparseLocalizationConfig",
     "SparseLocalizationInput",
     "SparseLocalizationResult",
     "SparsePipelineCandidate",
     "assert_internal_mainline_sources",
+    "build_sparse_failure_profile",
     "reject_test_split",
     "rerank_candidate_rows",
     "run_sparse_localization",
