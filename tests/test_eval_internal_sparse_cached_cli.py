@@ -8,13 +8,14 @@ import torch
 from loc_gs.core.camera import load_camera_records
 from loc_gs.core.geometry import project_points_w2c
 from loc_gs.scripts.eval_internal_sparse_cached import main
+from loc_gs.students.landmark_selector import LandmarkSelectorModel
 
 
 def _write_ply(path: Path) -> Path:
     header = (
         "ply\n"
         "format binary_little_endian 1.0\n"
-        "element vertex 6\n"
+        "element vertex 12\n"
         "property float x\n"
         "property float y\n"
         "property float z\n"
@@ -27,6 +28,12 @@ def _write_ply(path: Path) -> Path:
         (0.4, 0.5, 3.3),
         (0.0, 0.0, 2.6),
         (-0.7, 0.1, 3.4),
+        (3.5, -0.4, 3.0),
+        (4.5, -0.4, 3.1),
+        (3.6, 0.5, 2.9),
+        (4.4, 0.5, 3.3),
+        (4.0, 0.0, 2.6),
+        (3.3, 0.1, 3.4),
     ]
     with path.open("wb") as handle:
         handle.write(header.encode("ascii"))
@@ -55,7 +62,7 @@ def _write_cameras(path: Path) -> Path:
     return path
 
 
-def _write_pair_cache(path: Path, cameras: Path) -> Path:
+def _write_pair_cache(path: Path, cameras: Path, *, buried_correct: bool = False) -> Path:
     points = np.array(
         [
             (-0.5, -0.4, 3.0),
@@ -72,20 +79,35 @@ def _write_pair_cache(path: Path, cameras: Path) -> Path:
     ]
     keypoints_xy, valid = project_points_w2c(points, camera.pose_w2c, camera.intrinsics)
     assert bool(valid.all())
+    if buried_correct:
+        landmark_id = torch.tensor(
+            [[6, 0], [7, 1], [8, 2], [9, 3], [10, 4], [11, 5]],
+            dtype=torch.int64,
+        )
+        cosine = torch.tensor([[0.95, 0.1]] * 6, dtype=torch.float32)
+        label = torch.ones(6, dtype=torch.int64)
+        topk = 2
+        candidate_mask = torch.ones((6, 2), dtype=torch.bool)
+    else:
+        landmark_id = torch.arange(6, dtype=torch.int64).reshape(6, 1)
+        cosine = torch.ones((6, 1), dtype=torch.float32)
+        label = torch.zeros(6, dtype=torch.int64)
+        topk = 1
+        candidate_mask = torch.ones((6, 1), dtype=torch.bool)
     payload = {
         "metadata": {
             "format": "listwise",
             "scene": "GreatCourt",
             "source_split_name": "train_dev",
-            "topk": 1,
+            "topk": topk,
             "split_audit": {"audit_status": "passed", "checks": {}},
         },
-        "base_gaussian_id": torch.arange(6, dtype=torch.int64),
+        "base_gaussian_id": torch.arange(12 if buried_correct else 6, dtype=torch.int64),
         "query_yx": torch.tensor([[float(xy[1]), float(xy[0])] for xy in keypoints_xy], dtype=torch.float32),
-        "landmark_id": torch.arange(6, dtype=torch.int64).reshape(6, 1),
-        "cosine": torch.ones((6, 1), dtype=torch.float32),
-        "label": torch.zeros(6, dtype=torch.int64),
-        "candidate_mask": torch.ones((6, 1), dtype=torch.bool),
+        "landmark_id": landmark_id,
+        "cosine": cosine,
+        "label": label,
+        "candidate_mask": candidate_mask,
         "query_id": [f"img.png::kp{i}" for i in range(6)],
         "image_id": ["img.png"] * 6,
         "keypoint_id": [f"kp{i}" for i in range(6)],
@@ -178,3 +200,52 @@ def test_eval_internal_sparse_cached_cli_accepts_query_id_filter(tmp_path: Path)
     assert metrics["matched_query_count"] == 1
     assert metrics["missing_query_count"] == 1
     assert metrics["missing_query_ids_preview"] == ["missing.png"]
+
+
+def test_eval_internal_sparse_cached_cli_accepts_landmark_selector(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    selector_path = tmp_path / "landmark_selector.json"
+    selector = LandmarkSelectorModel(
+        landmark_scores={str(idx): 3.0 for idx in range(6)},
+        conflict_edges={},
+        conflict_degrees={},
+        score_scale=1.0,
+    )
+    selector_path.write_text(json.dumps(selector.to_json_dict(), sort_keys=True), encoding="utf-8")
+    out = tmp_path / "eval_selector"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt", cameras, buried_correct=True)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--landmark_selector",
+            str(selector_path),
+            "--rerank_prefix_fraction",
+            "0",
+            "--native_weight",
+            "0",
+            "--solver_weight",
+            "1",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert metrics["landmark_selector_enabled"] is True
+    assert rows[0]["success"] is True
+    assert rows[0]["te_cm"] < 1.0

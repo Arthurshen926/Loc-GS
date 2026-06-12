@@ -79,6 +79,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max_keypoints", type=int, default=1024)
     parser.add_argument("--score_mode", choices=["native", "teacher_oracle"], default="native")
     parser.add_argument("--candidate_scorer", type=Path, default=None)
+    parser.add_argument("--landmark_selector", type=Path, default=None)
+    parser.add_argument("--landmark_selector_weight", type=float, default=1.0)
     parser.add_argument("--rerank_prefix_fraction", type=float, default=1.0)
     parser.add_argument("--solver_weight", type=float, default=1.0)
     parser.add_argument("--native_weight", type=float, default=1.0)
@@ -112,6 +114,8 @@ def main(argv: list[str] | None = None) -> int:
         max_keypoints=int(args.max_keypoints),
         score_mode=str(args.score_mode),
         candidate_scorer=args.candidate_scorer,
+        landmark_selector=args.landmark_selector,
+        landmark_selector_weight=float(args.landmark_selector_weight),
         rerank_prefix_fraction=float(args.rerank_prefix_fraction),
         solver_weight=float(args.solver_weight),
         native_weight=float(args.native_weight),
@@ -146,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
         "max_keypoints": int(args.max_keypoints),
         "score_mode": str(args.score_mode),
         "candidate_scorer": None if args.candidate_scorer is None else str(args.candidate_scorer),
+        "landmark_selector": None if args.landmark_selector is None else str(args.landmark_selector),
+        "landmark_selector_weight": float(args.landmark_selector_weight),
         "rerank_prefix_fraction": float(args.rerank_prefix_fraction),
         "solver_weight": float(args.solver_weight),
         "native_weight": float(args.native_weight),

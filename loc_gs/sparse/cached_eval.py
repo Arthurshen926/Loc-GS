@@ -12,6 +12,7 @@ from loc_gs.sparse.audit import reject_test_split
 from loc_gs.sparse.landmarks import CacheLandmarkResolver, load_gaussian_landmark_map
 from loc_gs.sparse.pipeline import SparseLocalizationConfig, run_sparse_localization
 from loc_gs.sparse.real_inputs import CachedSparseInputConfig, sparse_input_from_cached_batch
+from loc_gs.students.landmark_selector import landmark_selector_score_rows, load_landmark_selector
 from loc_gs.training.sparse_candidate_scorer import candidate_solver_score_rows, load_candidate_scorer
 
 
@@ -25,6 +26,8 @@ class CachedSparseEvalConfig:
     max_keypoints: int = 1024
     score_mode: str = "native"
     candidate_scorer: str | Path | None = None
+    landmark_selector: str | Path | None = None
+    landmark_selector_weight: float = 1.0
     rerank_prefix_fraction: float = 1.0
     solver_weight: float = 1.0
     native_weight: float = 1.0
@@ -70,6 +73,7 @@ def run_cached_sparse_eval(
         )
         pose_metric_frame = f"camera_json_c2w_resized_{cfg.missing_principal_point}"
     scorer = load_candidate_scorer(cfg.candidate_scorer) if cfg.candidate_scorer is not None else None
+    selector = load_landmark_selector(cfg.landmark_selector) if cfg.landmark_selector is not None else None
     input_cfg = CachedSparseInputConfig(score_mode=cfg.score_mode, max_keypoints=int(cfg.max_keypoints))
     loc_cfg = SparseLocalizationConfig(
         rerank_prefix_fraction=float(cfg.rerank_prefix_fraction),
@@ -115,11 +119,21 @@ def run_cached_sparse_eval(
             rows.append({"query_id": batch.query_id, "success": False, "reason": "missing_camera"})
             continue
         batch_input_cfg = input_cfg
+        solver_score_rows = None
         if scorer is not None:
+            solver_score_rows = candidate_solver_score_rows(batch, scorer)
+        if selector is not None:
+            selector_rows = landmark_selector_score_rows(batch, selector)
+            solver_score_rows = _combine_score_rows(
+                solver_score_rows,
+                selector_rows,
+                selector_weight=float(cfg.landmark_selector_weight),
+            )
+        if solver_score_rows is not None:
             batch_input_cfg = CachedSparseInputConfig(
                 score_mode=cfg.score_mode,
                 max_keypoints=int(cfg.max_keypoints),
-                solver_score_rows=candidate_solver_score_rows(batch, scorer),
+                solver_score_rows=solver_score_rows,
             )
         data = sparse_input_from_cached_batch(batch, resolver, intrinsics=camera.intrinsics, cfg=batch_input_cfg)
         result = run_sparse_localization(data, loc_cfg)
@@ -170,6 +184,7 @@ def run_cached_sparse_eval(
         "pose_metric_status": "verified" if te_values else "missing_gt_pose",
         "pose_metric_frame": pose_metric_frame,
         "candidate_scorer_enabled": bool(scorer is not None),
+        "landmark_selector_enabled": bool(selector is not None),
         "pnp_stage_count_median": _median_or_none(stage_counts),
         "lgcv_keep_count_median": _median_or_none(lgcv_keep_counts),
         "post_pnp_rescore_changed_count_median": _median_or_none(post_pnp_changed_counts),
@@ -177,6 +192,26 @@ def run_cached_sparse_eval(
         "candidate_artifact": artifact.summarize_candidate_availability(),
     }
     return summary, rows
+
+
+def _combine_score_rows(
+    base_rows: Sequence[Sequence[float]] | None,
+    selector_rows: Sequence[Sequence[float]],
+    *,
+    selector_weight: float,
+) -> list[list[float]]:
+    if base_rows is None:
+        return [[float(selector_weight) * float(value) for value in row] for row in selector_rows]
+    if len(base_rows) != len(selector_rows):
+        raise ValueError("base score rows and selector score rows must have the same row count")
+    combined: list[list[float]] = []
+    for row_idx, (base, selector) in enumerate(zip(base_rows, selector_rows)):
+        if len(base) != len(selector):
+            raise ValueError(f"score row {row_idx} length mismatch")
+        combined.append(
+            [float(base_value) + float(selector_weight) * float(selector_value) for base_value, selector_value in zip(base, selector)]
+        )
+    return combined
 
 
 def _median_or_none(values: Sequence[float]) -> float | None:

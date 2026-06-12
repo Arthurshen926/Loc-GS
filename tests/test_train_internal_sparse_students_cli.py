@@ -92,6 +92,8 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     summary = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
     model = json.loads((out / "model.json").read_text(encoding="utf-8"))
+    selector = json.loads((out / "landmark_selector.json").read_text(encoding="utf-8"))
+    conflicts = json.loads((out / "conflict_graph.json").read_text(encoding="utf-8"))
     episodes = [json.loads(line) for line in (out / "online_episodes.jsonl").read_text(encoding="utf-8").splitlines()]
     artifact = load_listwise_candidate_artifact(out / "online_distilled_candidates.pt")
 
@@ -102,7 +104,9 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     assert summary["online_episode_count"] == 4
     assert summary["missing_candidate_count"] == 0
     assert manifest["hyperparameters"]["camera_sampling_source"] == "candidate_artifact_sources"
-    assert summary["student_modules"] == ["correspondence_scorer"]
+    assert summary["student_modules"] == ["correspondence_scorer", "landmark_selector", "conflict_graph"]
     assert model["schema_version"] == "internal_sparse_candidate_scorer_v1"
+    assert selector["schema_version"] == "internal_landmark_selector_v1"
+    assert conflicts["schema_version"] == "internal_conflict_graph_v1"
     assert episodes[0]["schema_version"] == "internal_online_sparse_dense_episode_v1"
     assert artifact.keypoint_count <= 4
