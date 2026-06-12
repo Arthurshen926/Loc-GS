@@ -40,6 +40,7 @@ def build_cached_eval_manifest(
     point_cloud: str | Path,
     cameras_json: str | Path,
     candidate_scorer: str | Path | None,
+    conflict_graph: str | Path | None,
     hyperparameters: dict[str, object],
 ) -> dict[str, object]:
     split = reject_test_split(split_name, purpose="internal sparse cached eval manifest")
@@ -59,6 +60,7 @@ def build_cached_eval_manifest(
         "point_cloud": str(point_cloud),
         "cameras_json": str(cameras_json),
         "candidate_scorer": None if candidate_scorer is None else str(candidate_scorer),
+        "conflict_graph": None if conflict_graph is None else str(conflict_graph),
         "hyperparameters": hyperparameters,
     }
 
@@ -81,6 +83,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate_scorer", type=Path, default=None)
     parser.add_argument("--landmark_selector", type=Path, default=None)
     parser.add_argument("--landmark_selector_weight", type=float, default=1.0)
+    parser.add_argument("--conflict_graph", type=Path, default=None)
     parser.add_argument("--descriptor_fusion", type=Path, default=None)
     parser.add_argument("--descriptor_fusion_weight", type=float, default=1.0)
     parser.add_argument("--detector_student", type=Path, default=None)
@@ -124,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate_scorer=args.candidate_scorer,
         landmark_selector=args.landmark_selector,
         landmark_selector_weight=float(args.landmark_selector_weight),
+        conflict_graph=args.conflict_graph,
         descriptor_fusion=args.descriptor_fusion,
         descriptor_fusion_weight=float(args.descriptor_fusion_weight),
         detector_student=args.detector_student,
@@ -168,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         "candidate_scorer": None if args.candidate_scorer is None else str(args.candidate_scorer),
         "landmark_selector": None if args.landmark_selector is None else str(args.landmark_selector),
         "landmark_selector_weight": float(args.landmark_selector_weight),
+        "conflict_graph": None if args.conflict_graph is None else str(args.conflict_graph),
         "descriptor_fusion": None if args.descriptor_fusion is None else str(args.descriptor_fusion),
         "descriptor_fusion_weight": float(args.descriptor_fusion_weight),
         "detector_student": None if args.detector_student is None else str(args.detector_student),
@@ -201,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         point_cloud=args.point_cloud,
         cameras_json=args.cameras_json,
         candidate_scorer=args.candidate_scorer,
+        conflict_graph=args.conflict_graph,
         hyperparameters=hyperparameters,
     )
     artifact = load_listwise_candidate_artifact(args.candidate_artifact, max_rows=1)

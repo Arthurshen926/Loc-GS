@@ -195,6 +195,7 @@ def _compact_set_conflict_diagnostic(metrics: Mapping[str, Any]) -> dict[str, ob
     if not bool(metrics.get("set_conflict_penalty_enabled")):
         return None
     keys = (
+        "conflict_graph_enabled",
         "set_conflict_penalty_enabled",
         "set_conflict_penalty",
         "set_conflict_edge_count",

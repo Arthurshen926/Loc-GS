@@ -65,6 +65,21 @@ class LandmarkSelectorModel:
         )
 
 
+@dataclass(frozen=True)
+class ConflictGraphModel:
+    conflict_edges: dict[str, float]
+    conflict_degrees: dict[str, float]
+
+    @classmethod
+    def from_json_dict(cls, payload: dict[str, object]) -> "ConflictGraphModel":
+        if payload.get("schema_version") != "internal_conflict_graph_v1":
+            raise ValueError(f"unsupported conflict graph schema: {payload.get('schema_version')}")
+        return cls(
+            conflict_edges={str(key): float(value) for key, value in dict(payload.get("conflict_edges", {})).items()},
+            conflict_degrees={str(key): float(value) for key, value in dict(payload.get("conflict_degrees", {})).items()},
+        )
+
+
 def train_landmark_selector(
     batches: Sequence[SparseCandidateBatch],
     cfg: LandmarkSelectorConfig | None = None,
@@ -163,6 +178,13 @@ def load_landmark_selector(path: str | Path) -> LandmarkSelectorModel:
     if not isinstance(payload, dict):
         raise ValueError(f"landmark selector JSON must contain an object: {path}")
     return LandmarkSelectorModel.from_json_dict(payload)
+
+
+def load_conflict_graph(path: str | Path) -> ConflictGraphModel:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"conflict graph JSON must contain an object: {path}")
+    return ConflictGraphModel.from_json_dict(payload)
 
 
 def _grid_value(rows: Sequence[Sequence[object]] | None, row_idx: int, rank: int, default: object) -> object:

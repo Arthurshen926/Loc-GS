@@ -15,7 +15,11 @@ from loc_gs.sparse.pose_map_frame_audit import audit_pose_map_frame
 from loc_gs.sparse.real_inputs import CachedSparseInputConfig, sparse_input_from_cached_batch
 from loc_gs.students.descriptor_fusion import descriptor_fusion_score_rows, load_descriptor_fusion
 from loc_gs.students.detector_student import detector_score_rows, load_detector_student
-from loc_gs.students.landmark_selector import landmark_selector_score_rows, load_landmark_selector
+from loc_gs.students.landmark_selector import (
+    landmark_selector_score_rows,
+    load_conflict_graph,
+    load_landmark_selector,
+)
 from loc_gs.training.sparse_candidate_scorer import candidate_solver_score_rows, load_candidate_scorer
 
 
@@ -31,6 +35,7 @@ class CachedSparseEvalConfig:
     candidate_scorer: str | Path | None = None
     landmark_selector: str | Path | None = None
     landmark_selector_weight: float = 1.0
+    conflict_graph: str | Path | None = None
     descriptor_fusion: str | Path | None = None
     descriptor_fusion_weight: float = 1.0
     detector_student: str | Path | None = None
@@ -112,11 +117,17 @@ def run_cached_sparse_eval(
             pose_metric_frame = f"camera_json_c2w_resized_{resolved_missing_principal_point}"
     scorer = load_candidate_scorer(cfg.candidate_scorer) if cfg.candidate_scorer is not None else None
     selector = load_landmark_selector(cfg.landmark_selector) if cfg.landmark_selector is not None else None
+    conflict_graph = load_conflict_graph(cfg.conflict_graph) if cfg.conflict_graph is not None else None
     descriptor_fusion = load_descriptor_fusion(cfg.descriptor_fusion) if cfg.descriptor_fusion is not None else None
     detector_student = load_detector_student(cfg.detector_student) if cfg.detector_student is not None else None
+    raw_conflict_edges = None
+    if conflict_graph is not None:
+        raw_conflict_edges = conflict_graph.conflict_edges
+    elif selector is not None:
+        raw_conflict_edges = selector.conflict_edges
     conflict_edges = (
-        _resolve_selector_conflict_edges(selector.conflict_edges, resolver)
-        if selector is not None and float(cfg.set_conflict_penalty) > 0.0
+        _resolve_selector_conflict_edges(raw_conflict_edges, resolver)
+        if raw_conflict_edges is not None and float(cfg.set_conflict_penalty) > 0.0
         else None
     )
     input_cfg = CachedSparseInputConfig(score_mode=cfg.score_mode, max_keypoints=int(cfg.max_keypoints))
@@ -312,6 +323,7 @@ def run_cached_sparse_eval(
         "frame_calibration_auto_resize_candidates": frame_calibration.get("auto_resize_candidates", []),
         "candidate_scorer_enabled": bool(scorer is not None),
         "landmark_selector_enabled": bool(selector is not None),
+        "conflict_graph_enabled": bool(conflict_graph is not None),
         "descriptor_fusion_enabled": bool(descriptor_fusion is not None),
         "detector_student_enabled": bool(detector_student is not None),
         "rerank_diagnostic_enabled": bool(rerank_diagnostic_query_count > 0),

@@ -200,6 +200,7 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                     "inlier_depth_range_m_median": 35.0,
                 },
                 "candidate_set_conflict_diagnostic": {
+                    "conflict_graph_enabled": True,
                     "set_conflict_penalty_enabled": True,
                     "set_conflict_penalty": 1.0,
                     "set_conflict_edge_count": 37,
@@ -243,6 +244,7 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
         "inlier_keypoint_bbox_area_fraction_median": 0.75,
     }
     assert payload["candidate_set_conflict_diagnostic"] == {
+        "conflict_graph_enabled": True,
         "set_conflict_edge_count": 37,
         "set_conflict_penalty": 1.0,
         "set_conflict_penalty_enabled": True,
@@ -286,6 +288,7 @@ def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, caps
                 "inlier_keypoint_bbox_area_fraction_median": 0.75,
                 "inlier_depth_range_m_median": 35.0,
                 "set_conflict_penalty_enabled": True,
+                "conflict_graph_enabled": True,
                 "set_conflict_penalty": 1.0,
                 "set_conflict_edge_count": 37,
                 "set_conflict_rerank_changed_count_median": 5.0,
@@ -325,6 +328,7 @@ def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, caps
         "inlier_keypoint_bbox_area_fraction_median": 0.75,
     }
     assert payload["set_conflict_diagnostic"] == {
+        "conflict_graph_enabled": True,
         "set_conflict_edge_count": 37,
         "set_conflict_penalty": 1.0,
         "set_conflict_penalty_enabled": True,

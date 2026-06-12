@@ -102,6 +102,7 @@ def _add_set_conflict_diagnostic(path: Path) -> Path:
     data.update(
         {
             "schema_version": "internal_sparse_cached_eval_metrics_v1",
+            "conflict_graph_enabled": True,
             "set_conflict_penalty_enabled": True,
             "set_conflict_penalty": 1.0,
             "set_conflict_edge_count": 37,
@@ -400,6 +401,7 @@ def test_internal_sparse_gate_includes_candidate_set_conflict_diagnostic(tmp_pat
     assert rc == 0
     metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
     assert metrics["candidate_set_conflict_diagnostic"] == {
+        "conflict_graph_enabled": True,
         "set_conflict_edge_count": 37,
         "set_conflict_penalty": 1.0,
         "set_conflict_penalty_enabled": True,

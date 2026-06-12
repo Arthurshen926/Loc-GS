@@ -295,6 +295,7 @@ def _compact_inlier_set_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_set_conflict_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
     keys = (
+        "conflict_graph_enabled",
         "set_conflict_penalty_enabled",
         "set_conflict_penalty",
         "set_conflict_edge_count",

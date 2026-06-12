@@ -370,6 +370,61 @@ def test_eval_internal_sparse_cached_cli_applies_set_conflict_penalty(tmp_path: 
     assert rows[0]["selected_set_diagnostics"]["selected_geometric_correct_count"] == 6
 
 
+def test_eval_internal_sparse_cached_cli_accepts_conflict_graph_without_selector(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    conflict_graph_path = tmp_path / "conflict_graph.json"
+    conflict_graph_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_conflict_graph_v1",
+                "conflict_edges": {"0::11": 2.0},
+                "conflict_degrees": {"0": 2.0, "11": 2.0},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "eval_conflict_graph"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt", cameras, single_buried_correct=True)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--conflict_graph",
+            str(conflict_graph_path),
+            "--set_conflict_penalty",
+            "1.0",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert metrics["conflict_graph_enabled"] is True
+    assert metrics["landmark_selector_enabled"] is False
+    assert metrics["set_conflict_penalty_enabled"] is True
+    assert metrics["set_conflict_rerank_changed_count_median"] == 1
+    assert metrics["selected_geometric_correct_count_median"] == 6
+    assert manifest["conflict_graph"] == str(conflict_graph_path)
+    assert manifest["hyperparameters"]["conflict_graph"] == str(conflict_graph_path)
+    assert rows[0]["set_conflict_rerank_changed_count"] == 1
+
+
 def test_eval_internal_sparse_cached_cli_accepts_descriptor_fusion(tmp_path: Path):
     cameras = _write_cameras(tmp_path / "cameras.json")
     fusion_path = tmp_path / "descriptor_fusion.pt"
