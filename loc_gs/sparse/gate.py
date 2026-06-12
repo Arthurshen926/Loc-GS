@@ -90,6 +90,7 @@ class SparseGateComparison:
             "candidate_artifact": artifact_summary,
             "candidate_coverage": _compact_coverage_metrics(coverage_metrics),
             "candidate_rerank_diagnostic": _compact_rerank_diagnostic(self.candidate_metrics),
+            "candidate_selected_set_diagnostic": _compact_selected_set_diagnostic(self.candidate_metrics),
             "candidate_scorer_training": _compact_candidate_scorer_metrics(self.candidate_scorer_metrics),
             "baseline_metrics_path": self.baseline_metrics_path,
             "candidate_metrics_path": self.candidate_metrics_path,
@@ -163,6 +164,17 @@ def _compact_rerank_diagnostic(metrics: Mapping[str, Any]) -> dict[str, object] 
         "reranked_topk_available",
     )
     return {key: metrics[key] for key in keys if key in metrics}
+
+
+def _compact_selected_set_diagnostic(metrics: Mapping[str, Any]) -> dict[str, object] | None:
+    keys = (
+        "selected_geometric_correct_count_median",
+        "selected_geometric_correct_ratio_median",
+        "selected_keypoint_bbox_area_fraction_median",
+        "selected_depth_range_m_median",
+    )
+    out = {key: metrics[key] for key in keys if key in metrics}
+    return out or None
 
 
 def load_metrics_summary(path: str | Path) -> dict[str, Any]:

@@ -187,6 +187,12 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                     "reranked_top1_changed_count": 1065,
                     "reranked_topk_available": 259,
                 },
+                "candidate_selected_set_diagnostic": {
+                    "selected_geometric_correct_count_median": 32.0,
+                    "selected_geometric_correct_ratio_median": 0.0625,
+                    "selected_keypoint_bbox_area_fraction_median": 0.9497,
+                    "selected_depth_range_m_median": 46.5,
+                },
             }
         ),
         encoding="utf-8",
@@ -205,6 +211,12 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
     assert payload["candidate_scorer_training"]["feature_materialization"] == "feature_cache"
     assert payload["candidate_rerank_diagnostic"]["reranked_top1_gain"] == 134
     assert payload["candidate_rerank_diagnostic"]["reranked_top1_correct"] == 225
+    assert payload["candidate_selected_set_diagnostic"] == {
+        "selected_depth_range_m_median": 46.5,
+        "selected_geometric_correct_count_median": 32.0,
+        "selected_geometric_correct_ratio_median": 0.0625,
+        "selected_keypoint_bbox_area_fraction_median": 0.9497,
+    }
 
 
 def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, capsys):
@@ -227,6 +239,10 @@ def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, caps
                 "reranked_top1_gain": 134,
                 "reranked_top1_changed_count": 1065,
                 "reranked_topk_available": 259,
+                "selected_geometric_correct_count_median": 32.0,
+                "selected_geometric_correct_ratio_median": 0.0625,
+                "selected_keypoint_bbox_area_fraction_median": 0.9497,
+                "selected_depth_range_m_median": 46.5,
             }
         ),
         encoding="utf-8",
@@ -244,6 +260,12 @@ def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, caps
         "reranked_top1_correct": 225,
         "reranked_top1_gain": 134,
         "reranked_topk_available": 259,
+    }
+    assert payload["selected_set_diagnostic"] == {
+        "selected_depth_range_m_median": 46.5,
+        "selected_geometric_correct_count_median": 32.0,
+        "selected_geometric_correct_ratio_median": 0.0625,
+        "selected_keypoint_bbox_area_fraction_median": 0.9497,
     }
 
 

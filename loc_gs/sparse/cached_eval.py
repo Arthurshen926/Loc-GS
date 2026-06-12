@@ -140,6 +140,10 @@ def run_cached_sparse_eval(
     stage_counts: list[float] = []
     lgcv_keep_counts: list[float] = []
     post_pnp_changed_counts: list[float] = []
+    selected_correct_counts: list[float] = []
+    selected_correct_ratios: list[float] = []
+    selected_bbox_area_fractions: list[float] = []
+    selected_depth_ranges: list[float] = []
     rerank_native_top1_correct = 0
     rerank_top1_correct = 0
     rerank_top1_changed_count = 0
@@ -222,6 +226,14 @@ def run_cached_sparse_eval(
         if result.lgcv_keep_count is not None:
             lgcv_keep_counts.append(float(result.lgcv_keep_count))
         post_pnp_changed_counts.append(float(result.post_pnp_rescore_changed_count))
+        selected_set_diagnostics = dict(result.selected_set_diagnostics or {})
+        if selected_set_diagnostics:
+            selected_correct_counts.append(float(selected_set_diagnostics.get("selected_geometric_correct_count", 0.0)))
+            selected_correct_ratios.append(float(selected_set_diagnostics.get("selected_geometric_correct_ratio", 0.0)))
+            selected_bbox_area_fractions.append(
+                float(selected_set_diagnostics.get("selected_keypoint_bbox_area_fraction", 0.0))
+            )
+            selected_depth_ranges.append(float(selected_set_diagnostics.get("selected_depth_range_m", 0.0)))
         rows.append(
             {
                 "query_id": batch.query_id,
@@ -235,6 +247,7 @@ def run_cached_sparse_eval(
                 "te_cm": te_cm,
                 "re_deg": re_deg,
                 "availability_summary": result.availability_summary,
+                "selected_set_diagnostics": selected_set_diagnostics,
                 **({} if rerank_diagnostic is None else {"rerank_diagnostic": rerank_diagnostic}),
             }
         )
@@ -275,6 +288,10 @@ def run_cached_sparse_eval(
         "reranked_top1_gain": int(rerank_top1_correct - rerank_native_top1_correct),
         "reranked_top1_changed_count": int(rerank_top1_changed_count),
         "reranked_topk_available": int(rerank_topk_available),
+        "selected_geometric_correct_count_median": _median_or_none(selected_correct_counts),
+        "selected_geometric_correct_ratio_median": _median_or_none(selected_correct_ratios),
+        "selected_keypoint_bbox_area_fraction_median": _median_or_none(selected_bbox_area_fractions),
+        "selected_depth_range_m_median": _median_or_none(selected_depth_ranges),
         "pnp_stage_count_median": _median_or_none(stage_counts),
         "lgcv_keep_count_median": _median_or_none(lgcv_keep_counts),
         "post_pnp_rescore_changed_count_median": _median_or_none(post_pnp_changed_counts),

@@ -273,6 +273,16 @@ def _compact_rerank_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
     return {key: data[key] for key in keys if key in data}
 
 
+def _compact_selected_set_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "selected_geometric_correct_count_median",
+        "selected_geometric_correct_ratio_median",
+        "selected_keypoint_bbox_area_fraction_median",
+        "selected_depth_range_m_median",
+    )
+    return {key: data[key] for key in keys if key in data}
+
+
 def _parse_hyperparameters(raw: str | None) -> dict[str, Any]:
     if raw is None or not str(raw).strip():
         return {}
@@ -302,6 +312,9 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
         rerank = _compact_rerank_diagnostic(data)
         if rerank:
             payload["rerank_diagnostic"] = rerank
+        selected_set = _compact_selected_set_diagnostic(data)
+        if selected_set:
+            payload["selected_set_diagnostic"] = selected_set
     nested_cache = data.get("candidate_mlp_feature_cache")
     if isinstance(nested_cache, dict):
         payload["candidate_mlp_feature_cache"] = _compact_candidate_mlp_feature_cache(nested_cache)
@@ -314,6 +327,9 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
     nested_rerank = data.get("candidate_rerank_diagnostic")
     if isinstance(nested_rerank, dict):
         payload["candidate_rerank_diagnostic"] = _compact_rerank_diagnostic(nested_rerank)
+    nested_selected_set = data.get("candidate_selected_set_diagnostic")
+    if isinstance(nested_selected_set, dict):
+        payload["candidate_selected_set_diagnostic"] = _compact_selected_set_diagnostic(nested_selected_set)
     for stage in ("sparse", "dense"):
         stage_data = data.get(stage, {})
         if isinstance(stage_data, dict):

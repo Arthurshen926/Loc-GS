@@ -67,6 +67,21 @@ def _add_rerank_diagnostic(path: Path) -> Path:
     return path
 
 
+def _add_selected_set_diagnostic(path: Path) -> Path:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(
+        {
+            "schema_version": "internal_sparse_cached_eval_metrics_v1",
+            "selected_geometric_correct_count_median": 32.0,
+            "selected_geometric_correct_ratio_median": 0.0625,
+            "selected_keypoint_bbox_area_fraction_median": 0.9497,
+            "selected_depth_range_m_median": 46.5,
+        }
+    )
+    path.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def _write_coverage_metrics(path: Path, *, complete: bool) -> Path:
     path.write_text(
         json.dumps(
@@ -238,6 +253,41 @@ def test_internal_sparse_gate_includes_candidate_eval_rerank_diagnostic(tmp_path
         "reranked_top1_correct": 225,
         "reranked_top1_gain": 134,
         "reranked_topk_available": 259,
+    }
+
+
+def test_internal_sparse_gate_includes_candidate_selected_set_diagnostic(tmp_path: Path):
+    pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
+    baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
+    candidate = _add_selected_set_diagnostic(
+        _write_metrics(tmp_path / "candidate.json", median_te_cm=13.0, split_name="train_dev_seed13_20p")
+    )
+    out = tmp_path / "gate_eval_selected_set"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev_seed13_20p",
+            "--candidate_artifact",
+            str(pair_cache),
+            "--baseline_metrics",
+            str(baseline),
+            "--candidate_metrics",
+            str(candidate),
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    assert metrics["candidate_selected_set_diagnostic"] == {
+        "selected_depth_range_m_median": 46.5,
+        "selected_geometric_correct_count_median": 32.0,
+        "selected_geometric_correct_ratio_median": 0.0625,
+        "selected_keypoint_bbox_area_fraction_median": 0.9497,
     }
 
 

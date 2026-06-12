@@ -94,6 +94,7 @@ class SparseLocalizationResult:
     post_pnp_rescore_changed_count: int = 0
     pnp_method: str = "epnp"
     second_pnp_method: str | None = None
+    selected_set_diagnostics: dict[str, float | int] | None = None
 
     @property
     def inlier_count(self) -> int:
@@ -124,6 +125,48 @@ def _match_scores(rows: Sequence[dict[str, object]], cfg: SparseLocalizationConf
         ],
         dtype=np.float64,
     )
+
+
+def _selected_set_diagnostics(
+    data: SparseLocalizationInput,
+    selected_rows: Sequence[dict[str, object]],
+) -> dict[str, float | int]:
+    selected_count = int(len(selected_rows))
+    correct_values = [
+        row.get("geometric_correct")
+        for row in selected_rows
+        if row.get("geometric_correct") is not None
+    ]
+    correct_count = int(sum(1 for value in correct_values if bool(value)))
+    keypoints = np.asarray(data.keypoints_xy, dtype=np.float64).reshape(-1, 2)
+    selected_indices = [
+        int(row.get("keypoint_index", idx))
+        for idx, row in enumerate(selected_rows)
+        if 0 <= int(row.get("keypoint_index", idx)) < keypoints.shape[0]
+    ]
+    bbox_area_fraction = 0.0
+    if selected_indices:
+        selected_xy = keypoints[np.asarray(selected_indices, dtype=np.int64)]
+        min_xy = selected_xy.min(axis=0)
+        max_xy = selected_xy.max(axis=0)
+        area = max(0.0, float(max_xy[0] - min_xy[0])) * max(0.0, float(max_xy[1] - min_xy[1]))
+        denom = max(1.0, float(data.intrinsics.width) * float(data.intrinsics.height))
+        bbox_area_fraction = float(area / denom)
+    points = np.asarray([row.get("point3d", [np.nan, np.nan, np.nan]) for row in selected_rows], dtype=np.float64)
+    depth_range = 0.0
+    if points.size and points.ndim == 2 and points.shape[1] >= 3:
+        z = points[:, 2]
+        finite = z[np.isfinite(z)]
+        if finite.size:
+            depth_range = float(finite.max() - finite.min())
+    return {
+        "selected_count": selected_count,
+        "selected_geometric_correct_count": correct_count,
+        "selected_geometric_label_count": int(len(correct_values)),
+        "selected_geometric_correct_ratio": float(correct_count / max(1, len(correct_values))),
+        "selected_keypoint_bbox_area_fraction": float(bbox_area_fraction),
+        "selected_depth_range_m": float(depth_range),
+    }
 
 
 def _post_pnp_rescore_rows(
@@ -210,6 +253,7 @@ def run_sparse_localization(
     points = np.asarray([row["point3d"] for row in selected_rows], dtype=np.float64).reshape(-1, 3)
     keypoints_xy = np.asarray(data.keypoints_xy, dtype=np.float64).reshape(-1, 2)
     scores = _match_scores(selected_rows, cfg)
+    selected_diagnostics = _selected_set_diagnostics(data, selected_rows)
     if points.shape[0] < int(cfg.min_correspondences):
         return SparseLocalizationResult(
             success=False,
@@ -219,6 +263,7 @@ def run_sparse_localization(
             selected_keypoint_indices=selected_keypoint_indices,
             availability_summary=availability,
             pnp_method=str(cfg.pnp_method),
+            selected_set_diagnostics=selected_diagnostics,
         )
 
     pnp = solve_pnp_ransac(
@@ -253,6 +298,7 @@ def run_sparse_localization(
             selected_landmark_ids = [int(row["landmark_id"]) for row in selected_rows]
             points = np.asarray([row["point3d"] for row in selected_rows], dtype=np.float64).reshape(-1, 3)
             scores = _match_scores(selected_rows, cfg)
+            selected_diagnostics = _selected_set_diagnostics(data, selected_rows)
         lgcv = filter_correspondences_by_reprojection(
             points,
             keypoints_xy,
@@ -296,4 +342,5 @@ def run_sparse_localization(
         post_pnp_rescore_changed_count=int(post_pnp_changed_count),
         pnp_method=str(cfg.pnp_method),
         second_pnp_method=second_method,
+        selected_set_diagnostics=selected_diagnostics,
     )
