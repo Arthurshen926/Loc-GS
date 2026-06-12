@@ -15,6 +15,7 @@ from loc_gs.core.camera import load_camera_records
 from loc_gs.simulation.query_sampler import SimulationSamplerConfig, sample_simulated_queries
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 from loc_gs.sparse.audit import reject_test_split
+from loc_gs.students.descriptor_fusion import DescriptorFusionConfig, train_descriptor_fusion_from_payload
 from loc_gs.students.landmark_selector import LandmarkSelectorConfig, train_landmark_selector
 from loc_gs.teacher.distillation_artifact import (
     DistillationArtifactConfig,
@@ -69,6 +70,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--learning_rate", type=float, default=0.1)
     parser.add_argument("--rank_feature_scale", type=float, default=1.0)
     parser.add_argument("--landmark_conflict_penalty", type=float, default=0.1)
+    parser.add_argument("--descriptor_trust_region", type=float, default=0.25)
     return parser
 
 
@@ -132,9 +134,13 @@ def main(argv: list[str] | None = None) -> int:
         online_artifact.batches,
         LandmarkSelectorConfig(conflict_penalty=float(args.landmark_conflict_penalty)),
     )
+    descriptor_model, descriptor_summary = train_descriptor_fusion_from_payload(
+        online_payload,
+        DescriptorFusionConfig(trust_region=float(args.descriptor_trust_region)),
+    )
 
     episode_summary = summarize_online_sparse_dense_episodes(episodes)
-    student_modules = ["correspondence_scorer", "landmark_selector", "conflict_graph"]
+    student_modules = ["correspondence_scorer", "landmark_selector", "conflict_graph", "descriptor_fusion"]
     summary = {
         "schema_version": "internal_online_sparse_student_training_summary_v1",
         "scene": str(args.scene),
@@ -144,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         "distillation": distillation_summary,
         "candidate_scorer": scorer_summary,
         "landmark_selector": selector_summary,
+        "descriptor_fusion": descriptor_summary,
     }
     manifest = {
         "schema_version": "internal_online_sparse_student_training_manifest_v1",
@@ -177,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
             "learning_rate": float(args.learning_rate),
             "rank_feature_scale": float(args.rank_feature_scale),
             "landmark_conflict_penalty": float(args.landmark_conflict_penalty),
+            "descriptor_trust_region": float(args.descriptor_trust_region),
             "feature_names": list(scorer_cfg.feature_names),
             "camera_sampling_source": "candidate_artifact_sources",
             "candidate_source_image_count": int(len(candidate_source_ids)),
@@ -198,6 +206,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     (args.output_dir / "conflict_graph.json").write_text(
         json.dumps(selector_model.to_conflict_graph_json_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (args.output_dir / "descriptor_fusion.json").write_text(
+        json.dumps(descriptor_model.to_json_dict(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     (args.output_dir / "metrics_summary.json").write_text(

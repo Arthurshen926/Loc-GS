@@ -81,6 +81,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate_scorer", type=Path, default=None)
     parser.add_argument("--landmark_selector", type=Path, default=None)
     parser.add_argument("--landmark_selector_weight", type=float, default=1.0)
+    parser.add_argument("--descriptor_fusion", type=Path, default=None)
+    parser.add_argument("--descriptor_fusion_weight", type=float, default=1.0)
     parser.add_argument("--rerank_prefix_fraction", type=float, default=1.0)
     parser.add_argument("--solver_weight", type=float, default=1.0)
     parser.add_argument("--native_weight", type=float, default=1.0)
@@ -116,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         candidate_scorer=args.candidate_scorer,
         landmark_selector=args.landmark_selector,
         landmark_selector_weight=float(args.landmark_selector_weight),
+        descriptor_fusion=args.descriptor_fusion,
+        descriptor_fusion_weight=float(args.descriptor_fusion_weight),
         rerank_prefix_fraction=float(args.rerank_prefix_fraction),
         solver_weight=float(args.solver_weight),
         native_weight=float(args.native_weight),
@@ -152,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
         "candidate_scorer": None if args.candidate_scorer is None else str(args.candidate_scorer),
         "landmark_selector": None if args.landmark_selector is None else str(args.landmark_selector),
         "landmark_selector_weight": float(args.landmark_selector_weight),
+        "descriptor_fusion": None if args.descriptor_fusion is None else str(args.descriptor_fusion),
+        "descriptor_fusion_weight": float(args.descriptor_fusion_weight),
         "rerank_prefix_fraction": float(args.rerank_prefix_fraction),
         "solver_weight": float(args.solver_weight),
         "native_weight": float(args.native_weight),

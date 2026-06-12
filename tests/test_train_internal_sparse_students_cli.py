@@ -24,6 +24,19 @@ def _write_cameras(path: Path) -> Path:
 def _write_pair_cache(path: Path) -> Path:
     payload = {
         "metadata": {"format": "listwise", "scene": "GreatCourt", "source_split_name": "train", "topk": 2},
+        "query_desc": torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]],
+            dtype=torch.float32,
+        ),
+        "landmark_desc": torch.tensor(
+            [
+                [[0.0, 1.0], [1.0, 0.0]],
+                [[0.0, 1.0], [1.0, 0.0]],
+                [[0.0, 1.0], [1.0, 0.0]],
+                [[0.0, 1.0], [1.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        ),
         "query_yx": torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]], dtype=torch.float32),
         "landmark_id": torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]], dtype=torch.int64),
         "cosine": torch.tensor([[0.95, 0.10], [0.90, 0.20], [0.85, 0.30], [0.80, 0.40]], dtype=torch.float32),
@@ -94,6 +107,7 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     model = json.loads((out / "model.json").read_text(encoding="utf-8"))
     selector = json.loads((out / "landmark_selector.json").read_text(encoding="utf-8"))
     conflicts = json.loads((out / "conflict_graph.json").read_text(encoding="utf-8"))
+    fusion = json.loads((out / "descriptor_fusion.json").read_text(encoding="utf-8"))
     episodes = [json.loads(line) for line in (out / "online_episodes.jsonl").read_text(encoding="utf-8").splitlines()]
     artifact = load_listwise_candidate_artifact(out / "online_distilled_candidates.pt")
 
@@ -104,9 +118,15 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     assert summary["online_episode_count"] == 4
     assert summary["missing_candidate_count"] == 0
     assert manifest["hyperparameters"]["camera_sampling_source"] == "candidate_artifact_sources"
-    assert summary["student_modules"] == ["correspondence_scorer", "landmark_selector", "conflict_graph"]
+    assert summary["student_modules"] == [
+        "correspondence_scorer",
+        "landmark_selector",
+        "conflict_graph",
+        "descriptor_fusion",
+    ]
     assert model["schema_version"] == "internal_sparse_candidate_scorer_v1"
     assert selector["schema_version"] == "internal_landmark_selector_v1"
     assert conflicts["schema_version"] == "internal_conflict_graph_v1"
+    assert fusion["schema_version"] == "internal_descriptor_fusion_v1"
     assert episodes[0]["schema_version"] == "internal_online_sparse_dense_episode_v1"
     assert artifact.keypoint_count <= 4

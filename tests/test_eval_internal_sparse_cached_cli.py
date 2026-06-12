@@ -8,6 +8,7 @@ import torch
 from loc_gs.core.camera import load_camera_records
 from loc_gs.core.geometry import project_points_w2c
 from loc_gs.scripts.eval_internal_sparse_cached import main
+from loc_gs.students.descriptor_fusion import DescriptorFusionModel
 from loc_gs.students.landmark_selector import LandmarkSelectorModel
 
 
@@ -247,5 +248,54 @@ def test_eval_internal_sparse_cached_cli_accepts_landmark_selector(tmp_path: Pat
     metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
     rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
     assert metrics["landmark_selector_enabled"] is True
+    assert rows[0]["success"] is True
+    assert rows[0]["te_cm"] < 1.0
+
+
+def test_eval_internal_sparse_cached_cli_accepts_descriptor_fusion(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    fusion_path = tmp_path / "descriptor_fusion.json"
+    fusion = DescriptorFusionModel(
+        fused_descriptors={str(idx): [1.0, 0.0] for idx in range(6)},
+        landmark_scores={str(idx): 3.0 for idx in range(6)},
+        negative_scores={},
+        score_scale=1.0,
+    )
+    fusion_path.write_text(json.dumps(fusion.to_json_dict(), sort_keys=True), encoding="utf-8")
+    out = tmp_path / "eval_fusion"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt", cameras, buried_correct=True)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--descriptor_fusion",
+            str(fusion_path),
+            "--rerank_prefix_fraction",
+            "0",
+            "--native_weight",
+            "0",
+            "--solver_weight",
+            "1",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert metrics["descriptor_fusion_enabled"] is True
     assert rows[0]["success"] is True
     assert rows[0]["te_cm"] < 1.0
