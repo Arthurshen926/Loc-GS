@@ -123,6 +123,7 @@ def _add_post_pnp_rescore_diagnostic(path: Path) -> Path:
             "post_pnp_rescore_corrected_count_median": 12.0,
             "post_pnp_rescore_worsened_count_median": 3.0,
             "post_pnp_rescore_correct_delta_median": 9.0,
+            "post_pnp_rescore_max_score_drop": 0.2,
         }
     )
     path.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
@@ -650,6 +651,7 @@ def test_internal_sparse_gate_includes_candidate_post_pnp_rescore_diagnostic(tmp
         "post_pnp_rescore_changed_count_median": 44.0,
         "post_pnp_rescore_correct_delta_median": 9.0,
         "post_pnp_rescore_corrected_count_median": 12.0,
+        "post_pnp_rescore_max_score_drop": 0.2,
         "post_pnp_rescore_worsened_count_median": 3.0,
     }
 

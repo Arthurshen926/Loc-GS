@@ -359,6 +359,7 @@ def _compact_post_pnp_rescore_diagnostic(metrics: Mapping[str, Any]) -> dict[str
         "post_pnp_rescore_corrected_count_median",
         "post_pnp_rescore_worsened_count_median",
         "post_pnp_rescore_correct_delta_median",
+        "post_pnp_rescore_max_score_drop",
     )
     return {key: metrics[key] for key in keys if key in metrics}
 

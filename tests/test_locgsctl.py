@@ -409,6 +409,7 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                     "post_pnp_rescore_corrected_count_median": 12.0,
                     "post_pnp_rescore_worsened_count_median": 3.0,
                     "post_pnp_rescore_correct_delta_median": 9.0,
+                    "post_pnp_rescore_max_score_drop": 0.2,
                 },
             }
         ),
@@ -458,6 +459,7 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
         "post_pnp_rescore_changed_count_median": 44.0,
         "post_pnp_rescore_correct_delta_median": 9.0,
         "post_pnp_rescore_corrected_count_median": 12.0,
+        "post_pnp_rescore_max_score_drop": 0.2,
         "post_pnp_rescore_worsened_count_median": 3.0,
     }
 
@@ -500,6 +502,7 @@ def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, caps
                 "post_pnp_rescore_corrected_count_median": 12.0,
                 "post_pnp_rescore_worsened_count_median": 3.0,
                 "post_pnp_rescore_correct_delta_median": 9.0,
+                "post_pnp_rescore_max_score_drop": 0.2,
             }
         ),
         encoding="utf-8",
@@ -542,6 +545,7 @@ def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, caps
         "post_pnp_rescore_changed_count_median": 44.0,
         "post_pnp_rescore_correct_delta_median": 9.0,
         "post_pnp_rescore_corrected_count_median": 12.0,
+        "post_pnp_rescore_max_score_drop": 0.2,
         "post_pnp_rescore_worsened_count_median": 3.0,
     }
 

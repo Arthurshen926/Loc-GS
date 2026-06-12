@@ -459,6 +459,7 @@ def _compact_post_pnp_rescore_diagnostic(data: dict[str, Any]) -> dict[str, Any]
         "post_pnp_rescore_corrected_count_median",
         "post_pnp_rescore_worsened_count_median",
         "post_pnp_rescore_correct_delta_median",
+        "post_pnp_rescore_max_score_drop",
     )
     return {key: data[key] for key in keys if key in data}
 

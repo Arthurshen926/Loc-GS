@@ -77,6 +77,7 @@ class SparseLocalizationConfig:
     post_pnp_reprojection_score_scale_px: float = 4.0
     post_pnp_rescore_min_improvement_px: float = 2.0
     post_pnp_rescore_max_residual_px: float = 4.0
+    post_pnp_rescore_max_score_drop: float | None = None
     post_pnp_rescore_only_initial_outliers: bool = True
     conflict_edges: Mapping[str, float] | None = None
     set_conflict_penalty: float = 0.0
@@ -271,21 +272,31 @@ def _post_pnp_rescore_rows(
             )
             enriched = dict(row)
             enriched["post_pnp_reprojection_error_px"] = residual
+            enriched["post_pnp_base_score"] = base_score
             enriched["post_pnp_runtime_score"] = runtime_score
             enriched["post_pnp_rescore_candidate_index"] = candidate_idx
             rescored.append((runtime_score, -candidate_idx, enriched))
         best = max(rescored, key=lambda item: (item[0], item[1]))[2]
         initial = dict(ranked[0])
+        initial_base_score = (
+            float(initial.get("native_score", 0.0)) * float(cfg.native_weight)
+            + float(initial.get("solver_score", 0.0)) * float(cfg.solver_weight)
+        )
         initial_residual = (
             float(residuals[0]) if bool(valid[0]) and np.isfinite(residuals[0]) else float("inf")
         )
         initial["post_pnp_reprojection_error_px"] = initial_residual
+        initial["post_pnp_base_score"] = initial_base_score
         initial["post_pnp_runtime_score"] = rescored[0][0]
         initial["post_pnp_rescore_candidate_index"] = 0
         best_residual = float(best["post_pnp_reprojection_error_px"])
         improved_enough = initial_residual - best_residual >= float(cfg.post_pnp_rescore_min_improvement_px)
         low_residual = best_residual <= float(cfg.post_pnp_rescore_max_residual_px)
-        if not (improved_enough and low_residual):
+        score_drop_allowed = True
+        if cfg.post_pnp_rescore_max_score_drop is not None:
+            score_drop = initial_base_score - float(best.get("post_pnp_base_score", initial_base_score))
+            score_drop_allowed = score_drop <= float(cfg.post_pnp_rescore_max_score_drop)
+        if not (improved_enough and low_residual and score_drop_allowed):
             best = initial
         if int(best["landmark_id"]) != int(ranked[0]["landmark_id"]):
             changed_count += 1

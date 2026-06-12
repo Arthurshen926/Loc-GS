@@ -56,6 +56,7 @@ class CachedSparseEvalConfig:
     post_pnp_reprojection_score_scale_px: float = 4.0
     post_pnp_rescore_min_improvement_px: float = 2.0
     post_pnp_rescore_max_residual_px: float = 4.0
+    post_pnp_rescore_max_score_drop: float | None = None
     post_pnp_rescore_only_initial_outliers: bool = True
     frame_auto_calibration: bool = True
     frame_calibration_max_rows: int = 2048
@@ -147,6 +148,7 @@ def run_cached_sparse_eval(
         post_pnp_reprojection_score_scale_px=float(cfg.post_pnp_reprojection_score_scale_px),
         post_pnp_rescore_min_improvement_px=float(cfg.post_pnp_rescore_min_improvement_px),
         post_pnp_rescore_max_residual_px=float(cfg.post_pnp_rescore_max_residual_px),
+        post_pnp_rescore_max_score_drop=cfg.post_pnp_rescore_max_score_drop,
         post_pnp_rescore_only_initial_outliers=bool(cfg.post_pnp_rescore_only_initial_outliers),
         conflict_edges=conflict_edges,
         set_conflict_penalty=float(cfg.set_conflict_penalty),
@@ -348,6 +350,9 @@ def run_cached_sparse_eval(
         "post_pnp_rescore_worsened_count_median": _median_or_none(post_pnp_worsened_counts),
         "post_pnp_rescore_correct_delta_median": _median_or_none(post_pnp_correct_deltas),
         "post_pnp_candidate_rescore_enabled": bool(cfg.post_pnp_candidate_rescore),
+        "post_pnp_rescore_max_score_drop": None
+        if cfg.post_pnp_rescore_max_score_drop is None
+        else float(cfg.post_pnp_rescore_max_score_drop),
         "set_conflict_penalty_enabled": bool(conflict_edges) and float(cfg.set_conflict_penalty) > 0.0,
         "set_conflict_penalty": float(cfg.set_conflict_penalty),
         "set_conflict_edge_count": 0 if not conflict_edges else int(len(conflict_edges)),

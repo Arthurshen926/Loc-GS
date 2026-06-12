@@ -585,6 +585,48 @@ def test_eval_internal_sparse_cached_cli_reports_post_pnp_rescore_label_flow(tmp
     assert rows[0]["post_pnp_rescore_correct_delta"] == 1
 
 
+def test_eval_internal_sparse_cached_cli_limits_post_pnp_rescore_score_drop(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    out = tmp_path / "eval_post_pnp_score_drop"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt", cameras, single_buried_correct=True)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--second_pnp_enabled",
+            "--post_pnp_candidate_rescore",
+            "--post_pnp_reprojection_weight",
+            "4.0",
+            "--post_pnp_rescore_max_score_drop",
+            "0.2",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert manifest["hyperparameters"]["post_pnp_rescore_max_score_drop"] == 0.2
+    assert metrics["post_pnp_rescore_max_score_drop"] == 0.2
+    assert metrics["post_pnp_rescore_changed_count_median"] == 0
+    assert metrics["post_pnp_rescore_correct_delta_median"] == 0
+    assert rows[0]["post_pnp_rescore_changed_count"] == 0
+
+
 def test_eval_internal_sparse_cached_cli_accepts_cache_trained_mlp_candidate_scorer(tmp_path: Path):
     cameras = _write_cameras(tmp_path / "cameras.json")
     pairs = _write_pair_cache(tmp_path / "pairs.pt", cameras, buried_correct=True, descriptor_signals=True)

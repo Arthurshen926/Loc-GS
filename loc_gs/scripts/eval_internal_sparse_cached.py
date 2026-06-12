@@ -104,6 +104,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--post_pnp_reprojection_score_scale_px", type=float, default=4.0)
     parser.add_argument("--post_pnp_rescore_min_improvement_px", type=float, default=2.0)
     parser.add_argument("--post_pnp_rescore_max_residual_px", type=float, default=4.0)
+    parser.add_argument("--post_pnp_rescore_max_score_drop", type=float, default=None)
     parser.add_argument("--post_pnp_rescore_all_matches", action="store_true")
     parser.add_argument("--disable_frame_auto_calibration", action="store_true")
     parser.add_argument("--frame_calibration_max_rows", type=int, default=2048)
@@ -148,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         post_pnp_reprojection_score_scale_px=float(args.post_pnp_reprojection_score_scale_px),
         post_pnp_rescore_min_improvement_px=float(args.post_pnp_rescore_min_improvement_px),
         post_pnp_rescore_max_residual_px=float(args.post_pnp_rescore_max_residual_px),
+        post_pnp_rescore_max_score_drop=args.post_pnp_rescore_max_score_drop,
         post_pnp_rescore_only_initial_outliers=not bool(args.post_pnp_rescore_all_matches),
         frame_auto_calibration=not bool(args.disable_frame_auto_calibration),
         frame_calibration_max_rows=int(args.frame_calibration_max_rows),
@@ -193,6 +195,9 @@ def main(argv: list[str] | None = None) -> int:
         "post_pnp_reprojection_score_scale_px": float(args.post_pnp_reprojection_score_scale_px),
         "post_pnp_rescore_min_improvement_px": float(args.post_pnp_rescore_min_improvement_px),
         "post_pnp_rescore_max_residual_px": float(args.post_pnp_rescore_max_residual_px),
+        "post_pnp_rescore_max_score_drop": None
+        if args.post_pnp_rescore_max_score_drop is None
+        else float(args.post_pnp_rescore_max_score_drop),
         "post_pnp_rescore_only_initial_outliers": not bool(args.post_pnp_rescore_all_matches),
         "frame_auto_calibration": not bool(args.disable_frame_auto_calibration),
         "frame_calibration_max_rows": int(args.frame_calibration_max_rows),
