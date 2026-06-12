@@ -26,11 +26,13 @@ INTERNAL_MAINLINE_RELATIVE_PATHS: tuple[str, ...] = (
     "simulation/query_sampler.py",
     "teacher/labels.py",
     "teacher/solver_feedback.py",
+    "training/sparse_candidate_scorer.py",
     "scripts/build_internal_solver_feedback_labels.py",
     "scripts/build_internal_simulation_plan.py",
     "scripts/eval_sparse_distilled_cambridge.py",
     "scripts/run_internal_sparse_gate.py",
     "scripts/run_internal_sparse_smoke.py",
+    "scripts/train_internal_sparse_candidate_scorer.py",
 )
 
 

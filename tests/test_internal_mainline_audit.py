@@ -74,6 +74,8 @@ def test_internal_mainline_audit_cli_source_set_is_clean():
     assert any(str(path).endswith("build_internal_solver_feedback_labels.py") for path in paths)
     assert any(str(path).endswith("simulation/query_sampler.py") for path in paths)
     assert any(str(path).endswith("build_internal_simulation_plan.py") for path in paths)
+    assert any(str(path).endswith("training/sparse_candidate_scorer.py") for path in paths)
+    assert any(str(path).endswith("train_internal_sparse_candidate_scorer.py") for path in paths)
 
     assert run_internal_mainline_audit(paths) == {
         "checked_file_count": len(paths),
