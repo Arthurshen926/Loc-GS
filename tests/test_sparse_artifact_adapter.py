@@ -28,6 +28,12 @@ def _write_pair_cache(path: Path, *, split_name: str = "train") -> Path:
         "query_yx": torch.tensor([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]], dtype=torch.float32),
         "landmark_id": torch.tensor([[101, 102, 103], [201, 202, 203], [301, 302, 303]], dtype=torch.int64),
         "cosine": torch.tensor([[0.9, 0.8, 0.7], [0.6, 0.5, 0.4], [0.3, 0.2, 0.1]], dtype=torch.float32),
+        "margin": torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+        "query_score": torch.tensor([0.95, 0.85, 0.75], dtype=torch.float32),
+        "landmark_prior": torch.tensor(
+            [[0.1, 0.9, 0.2], [0.3, 0.4, 0.5], [0.8, 0.2, 0.1]],
+            dtype=torch.float32,
+        ),
         "label": torch.tensor([1, 3, 0], dtype=torch.int64),
         "candidate_mask": torch.tensor(
             [[True, True, True], [True, False, True], [True, True, False]],
@@ -82,6 +88,12 @@ def test_listwise_artifact_adapter_groups_rows_into_internal_candidate_batches(t
     assert first.candidate_solver_weight is not None
     assert first.candidate_solver_weight[0] == pytest.approx([0.1, 2.0, 0.1])
     assert first.candidate_solver_weight[1] == pytest.approx([0.1, 0.1, 0.1])
+    assert first.candidate_margin[0] == pytest.approx([0.1, 0.1, 0.1])
+    assert first.candidate_margin[1] == pytest.approx([0.2, 0.2, 0.2])
+    assert first.candidate_query_score[0] == pytest.approx([0.95, 0.95, 0.95])
+    assert first.candidate_query_score[1] == pytest.approx([0.85, 0.85, 0.85])
+    assert first.candidate_landmark_prior[0] == pytest.approx([0.1, 0.9, 0.2])
+    assert first.candidate_landmark_prior[1] == pytest.approx([0.3, 0.4, 0.5])
 
     summary = artifact.summarize_candidate_availability()
     assert summary["keypoint_count"] == 3
@@ -108,3 +120,4 @@ def test_candidate_batches_jsonl_exports_internal_input_preview(tmp_path: Path):
     text = output.read_text(encoding="utf-8")
     assert '"query_id": "img_a.png"' in text
     assert '"candidate_landmark_ids": [[101, 102, 103], [201, 202, 203]]' in text
+    assert '"candidate_landmark_prior": [[0.10000000149011612, 0.8999999761581421, 0.20000000298023224]' in text

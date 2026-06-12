@@ -10,7 +10,11 @@ from pathlib import Path
 
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 from loc_gs.sparse.audit import reject_test_split
-from loc_gs.training.sparse_candidate_scorer import CandidateScorerConfig, train_candidate_scorer
+from loc_gs.training.sparse_candidate_scorer import (
+    CandidateScorerConfig,
+    classify_feature_input_policy,
+    train_candidate_scorer,
+)
 
 
 def _git_commit() -> str:
@@ -56,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         rank_feature_scale=float(args.rank_feature_scale),
         feature_names=_feature_names(str(args.feature_names)),
     )
+    feature_policy = classify_feature_input_policy(cfg.feature_names)
     model, summary = train_candidate_scorer(artifact, cfg)
     manifest = {
         "schema_version": "internal_sparse_candidate_scorer_manifest_v1",
@@ -69,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         "dense_teacher_enabled": bool(summary.get("dense_teacher_sample_count", 0)),
         "dense_inference_enabled": False,
         "external_runtime_dependency": "forbidden",
+        **feature_policy,
         "candidate_artifact": str(args.candidate_artifact),
         "hyperparameters": {
             "max_rows": None if args.max_rows is None else int(args.max_rows),

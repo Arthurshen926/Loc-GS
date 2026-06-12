@@ -20,6 +20,9 @@ class SparseCandidateBatch:
     candidate_reprojection_error_px: Sequence[Sequence[float]] | None = None
     candidate_solver_weight: Sequence[Sequence[float]] | None = None
     candidate_label_roles: Sequence[Sequence[str]] | None = None
+    candidate_margin: Sequence[Sequence[float]] | None = None
+    candidate_query_score: Sequence[Sequence[float]] | None = None
+    candidate_landmark_prior: Sequence[Sequence[float]] | None = None
     source_keypoint_ids: Sequence[str] | None = None
     source_phases: Sequence[str] | None = None
     metadata: Mapping[str, object] | None = None
@@ -53,6 +56,12 @@ class SparseCandidateBatch:
             raise ValueError("candidate_solver_weight must have the same keypoint count")
         if self.candidate_label_roles is not None and len(self.candidate_label_roles) != len(self.keypoint_xy):
             raise ValueError("candidate_label_roles must have the same keypoint count")
+        if self.candidate_margin is not None and len(self.candidate_margin) != len(self.keypoint_xy):
+            raise ValueError("candidate_margin must have the same keypoint count")
+        if self.candidate_query_score is not None and len(self.candidate_query_score) != len(self.keypoint_xy):
+            raise ValueError("candidate_query_score must have the same keypoint count")
+        if self.candidate_landmark_prior is not None and len(self.candidate_landmark_prior) != len(self.keypoint_xy):
+            raise ValueError("candidate_landmark_prior must have the same keypoint count")
         if self.source_keypoint_ids is not None and len(self.source_keypoint_ids) != len(self.keypoint_xy):
             raise ValueError("source_keypoint_ids must have the same keypoint count")
         if self.source_phases is not None and len(self.source_phases) != len(self.keypoint_xy):
@@ -79,6 +88,9 @@ class SparseCandidateBatch:
             ("reprojection errors", self.candidate_reprojection_error_px),
             ("solver weights", self.candidate_solver_weight),
             ("label roles", self.candidate_label_roles),
+            ("margins", self.candidate_margin),
+            ("query scores", self.candidate_query_score),
+            ("landmark priors", self.candidate_landmark_prior),
         )
         for name, grid in optional_grids:
             if grid is None:

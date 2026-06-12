@@ -11,6 +11,14 @@ from loc_gs.sparse.artifact_adapter import CachedCandidateArtifact
 from loc_gs.sparse.correspondences import SparseCandidateBatch
 
 
+TEACHER_ONLY_FEATURE_NAMES = (
+    "dense_consistent",
+    "sparse_inlier",
+    "negative_reprojection_error",
+    "solver_weight",
+)
+
+
 @dataclass(frozen=True)
 class CandidateScorerConfig:
     epochs: int = 100
@@ -35,9 +43,11 @@ class LinearCandidateScorer:
     feature_names: tuple[str, ...] = CandidateScorerConfig.feature_names
 
     def to_json_dict(self) -> dict[str, object]:
+        feature_policy = classify_feature_input_policy(self.feature_names)
         return {
             "schema_version": "internal_sparse_candidate_scorer_v1",
             **asdict(self),
+            **feature_policy,
         }
 
     @classmethod
@@ -56,6 +66,17 @@ class LinearCandidateScorer:
             bias=float(payload.get("bias", 0.0)),
             feature_names=feature_names,
         )
+
+
+def classify_feature_input_policy(feature_names: Sequence[str]) -> dict[str, object]:
+    names = tuple(str(name) for name in feature_names)
+    teacher_only = [name for name in TEACHER_ONLY_FEATURE_NAMES if name in names]
+    inference_safe = not teacher_only
+    return {
+        "feature_input_policy": "inference_safe" if inference_safe else "teacher_oracle_diagnostic",
+        "paper_safe_sparse_inference": bool(inference_safe),
+        "teacher_only_feature_names": teacher_only,
+    }
 
 
 def _sigmoid(values: np.ndarray) -> np.ndarray:
@@ -84,6 +105,9 @@ def _candidate_feature(
     sparse_inlier = bool(_grid_value(batch.candidate_sparse_inlier, row_idx, rank, False))
     reprojection = float(_grid_value(batch.candidate_reprojection_error_px, row_idx, rank, 0.0))
     solver_weight = float(_grid_value(batch.candidate_solver_weight, row_idx, rank, 1.0))
+    margin = float(_grid_value(batch.candidate_margin, row_idx, rank, 0.0))
+    query_score = float(_grid_value(batch.candidate_query_score, row_idx, rank, 1.0))
+    landmark_prior = float(_grid_value(batch.candidate_landmark_prior, row_idx, rank, 0.0))
     scale = max(1.0e-9, float(reprojection_error_scale_px))
     feature_values = {
         "native_score": float(native_score),
@@ -93,6 +117,9 @@ def _candidate_feature(
         "sparse_inlier": 1.0 if sparse_inlier else 0.0,
         "negative_reprojection_error": -float(reprojection) / scale,
         "solver_weight": float(solver_weight),
+        "margin": float(margin),
+        "query_score": float(query_score),
+        "landmark_prior": float(landmark_prior),
     }
     try:
         return [float(feature_values[str(name)]) for name in feature_names]
@@ -208,6 +235,7 @@ def train_candidate_scorer(
         "trained_top1_correct": int(trained_top1),
         "epochs": int(cfg.epochs),
         "learning_rate": float(cfg.learning_rate),
+        **classify_feature_input_policy(cfg.feature_names),
         **training_stats,
     }
     return model, summary

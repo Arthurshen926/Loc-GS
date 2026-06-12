@@ -210,6 +210,16 @@ def test_internal_mainline_smoke_cli_runs_completion_distillation_training_and_s
     assert manifest["inference_stage"] == "internal_mainline_smoke"
     assert manifest["dense_teacher_enabled"] is True
     assert manifest["dense_inference_enabled"] is False
+    assert manifest["feature_input_policy"] == "inference_safe"
+    assert manifest["paper_safe_sparse_inference"] is True
+    assert manifest["hyperparameters"]["feature_names"] == [
+        "native_score",
+        "negative_rank",
+        "valid",
+        "margin",
+        "query_score",
+        "landmark_prior",
+    ]
 
 
 def test_internal_mainline_smoke_cli_can_generate_teacher_observations_from_geometry(tmp_path: Path):

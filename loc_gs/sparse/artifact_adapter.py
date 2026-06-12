@@ -110,6 +110,19 @@ def _safe_metadata_value(value: Any) -> object:
     return str(value)
 
 
+def _candidate_feature_row(value: Any, *, topk: int, default: float) -> list[float]:
+    if isinstance(value, (str, bytes)):
+        return [float(default)] * int(topk)
+    if isinstance(value, Sequence):
+        values = list(value)
+        if len(values) == int(topk):
+            return [float(item) for item in values]
+        if len(values) == 1:
+            return [float(values[0])] * int(topk)
+        raise ValueError(f"candidate feature row length must be 1 or topk={topk}, got {len(values)}")
+    return [float(value)] * int(topk)
+
+
 def _sanitized_metadata(meta: Mapping[str, Any]) -> dict[str, object]:
     return {str(key): _safe_metadata_value(value) for key, value in meta.items()}
 
@@ -175,6 +188,9 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
     )
     solver_weight_field = _first_field(payload, ("solver_weight", "distill_weight", "candidate_solver_weight"))
     label_roles_field = _first_field(payload, ("label_roles", "label_role", "candidate_label_roles"))
+    margin_field = _first_field(payload, ("margin", "descriptor_margin", "candidate_margin"))
+    query_score_field = _first_field(payload, ("query_score", "detector_score", "candidate_query_score"))
+    landmark_prior_field = _first_field(payload, ("landmark_prior", "candidate_landmark_prior"))
     image_ids = (
         [str(v) for v in _rows(image_ids_field, max_rows=max_rows)]
         if image_ids_field is not None
@@ -196,6 +212,9 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
     )
     solver_weight = _rows(solver_weight_field, max_rows=max_rows) if solver_weight_field is not None else None
     label_roles = _rows(label_roles_field, max_rows=max_rows) if label_roles_field is not None else None
+    margin = _rows(margin_field, max_rows=max_rows) if margin_field is not None else None
+    query_score = _rows(query_score_field, max_rows=max_rows) if query_score_field is not None else None
+    landmark_prior = _rows(landmark_prior_field, max_rows=max_rows) if landmark_prior_field is not None else None
 
     row_count = len(query_yx)
     lengths = {
@@ -216,6 +235,9 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
         "reprojection_error": reprojection_error,
         "solver_weight": solver_weight,
         "label_roles": label_roles,
+        "margin": margin,
+        "query_score": query_score,
+        "landmark_prior": landmark_prior,
     }
     for name, value in optional_row_fields.items():
         if value is not None and len(value) != row_count:
@@ -249,6 +271,9 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
                 "candidate_reprojection_error_px": [],
                 "candidate_solver_weight": [],
                 "candidate_label_roles": [],
+                "candidate_margin": [],
+                "candidate_query_score": [],
+                "candidate_landmark_prior": [],
                 "source_keypoint_ids": [],
                 "source_phases": [],
             },
@@ -269,6 +294,16 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
             bucket["candidate_solver_weight"].append([float(v) for v in solver_weight[row_idx]])
         if label_roles is not None:
             bucket["candidate_label_roles"].append([str(v) for v in label_roles[row_idx]])
+        if margin is not None:
+            bucket["candidate_margin"].append(_candidate_feature_row(margin[row_idx], topk=len(ids), default=0.0))
+        if query_score is not None:
+            bucket["candidate_query_score"].append(
+                _candidate_feature_row(query_score[row_idx], topk=len(ids), default=1.0)
+            )
+        if landmark_prior is not None:
+            bucket["candidate_landmark_prior"].append(
+                _candidate_feature_row(landmark_prior[row_idx], topk=len(ids), default=0.0)
+            )
         bucket["source_keypoint_ids"].append(keypoint_ids[row_idx])
         bucket["source_phases"].append(phases[row_idx])
 
@@ -289,6 +324,9 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
             candidate_reprojection_error_px=bucket["candidate_reprojection_error_px"] or None,
             candidate_solver_weight=bucket["candidate_solver_weight"] or None,
             candidate_label_roles=bucket["candidate_label_roles"] or None,
+            candidate_margin=bucket["candidate_margin"] or None,
+            candidate_query_score=bucket["candidate_query_score"] or None,
+            candidate_landmark_prior=bucket["candidate_landmark_prior"] or None,
             source_keypoint_ids=bucket["source_keypoint_ids"],
             source_phases=bucket["source_phases"],
             metadata={"source_path": str(source_path), "artifact_format": artifact_format},
@@ -325,6 +363,9 @@ def _batch_to_json_dict(batch: SparseCandidateBatch) -> dict[str, object]:
         "candidate_reprojection_error_px": batch.candidate_reprojection_error_px,
         "candidate_solver_weight": batch.candidate_solver_weight,
         "candidate_label_roles": batch.candidate_label_roles,
+        "candidate_margin": batch.candidate_margin,
+        "candidate_query_score": batch.candidate_query_score,
+        "candidate_landmark_prior": batch.candidate_landmark_prior,
         "source_keypoint_ids": list(batch.source_keypoint_ids) if batch.source_keypoint_ids is not None else None,
         "source_phases": list(batch.source_phases) if batch.source_phases is not None else None,
         "metadata": dict(batch.metadata or {}),

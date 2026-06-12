@@ -21,18 +21,21 @@ from loc_gs.teacher.distillation_artifact import (
     load_teacher_observation_rows,
 )
 from loc_gs.teacher.geometric_observations import build_teacher_observations_from_geometry
-from loc_gs.training.sparse_candidate_scorer import CandidateScorerConfig, train_candidate_scorer
+from loc_gs.training.sparse_candidate_scorer import (
+    CandidateScorerConfig,
+    classify_feature_input_policy,
+    train_candidate_scorer,
+)
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 
 
-SOLVER_AWARE_FEATURES = (
+SPARSE_ONLY_SAFE_FEATURES = (
     "native_score",
     "negative_rank",
     "valid",
-    "dense_consistent",
-    "sparse_inlier",
-    "negative_reprojection_error",
-    "solver_weight",
+    "margin",
+    "query_score",
+    "landmark_prior",
 )
 
 
@@ -77,7 +80,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--score_threshold", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--learning_rate", type=float, default=0.1)
-    parser.add_argument("--feature_names", default=",".join(SOLVER_AWARE_FEATURES))
+    parser.add_argument("--feature_names", default=",".join(SPARSE_ONLY_SAFE_FEATURES))
     parser.add_argument("--image_width", type=int, default=None)
     parser.add_argument("--image_height", type=int, default=None)
     parser.add_argument("--missing_principal_point", choices=["half_extent", "pixel_center"], default="pixel_center")
@@ -162,12 +165,14 @@ def main(argv: list[str] | None = None) -> int:
     torch.save(distilled_payload, distilled_artifact)
 
     distilled = load_listwise_candidate_artifact(distilled_artifact)
+    feature_names = _feature_names(str(args.feature_names))
+    feature_policy = classify_feature_input_policy(feature_names)
     model, scorer_summary = train_candidate_scorer(
         distilled,
         CandidateScorerConfig(
             epochs=int(args.epochs),
             learning_rate=float(args.learning_rate),
-            feature_names=_feature_names(str(args.feature_names)),
+            feature_names=feature_names,
         ),
     )
     candidate_scorer_path.write_text(
@@ -215,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
         "dense_teacher_enabled": True,
         "dense_inference_enabled": False,
         "external_runtime_dependency": "forbidden",
+        **feature_policy,
     }
     manifest = {
         "schema_version": "internal_mainline_smoke_manifest_v1",
@@ -228,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
         "dense_teacher_enabled": True,
         "dense_inference_enabled": False,
         "external_runtime_dependency": "forbidden",
+        **feature_policy,
         "completion_shard": str(args.completion_shard),
         "feature_map_cache": str(args.feature_map_cache),
         "base_candidate_artifact": str(args.base_candidate_artifact),
@@ -248,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
             "score_threshold": None if args.score_threshold is None else float(args.score_threshold),
             "epochs": int(args.epochs),
             "learning_rate": float(args.learning_rate),
-            "feature_names": list(_feature_names(str(args.feature_names))),
+            "feature_names": list(feature_names),
             "image_width": args.image_width,
             "image_height": args.image_height,
             "missing_principal_point": str(args.missing_principal_point),

@@ -103,6 +103,45 @@ def test_candidate_scorer_training_uses_dense_teacher_consistency():
     assert all(row[0]["candidate_rank"] == 1 for row in scored)
 
 
+def test_candidate_scorer_training_uses_inference_safe_match_context_features():
+    batch = SparseCandidateBatch(
+        scene="GreatCourt",
+        split_name="train",
+        query_id="img.png",
+        keypoint_xy=[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+        candidate_landmark_ids=[[1, 2], [3, 4], [5, 6]],
+        candidate_scores=[[0.95, 0.10], [0.90, 0.20], [0.85, 0.30]],
+        candidate_valid_mask=[[True, True], [True, True], [True, True]],
+        candidate_geometric_correct=[[False, True], [False, True], [False, True]],
+        candidate_landmark_prior=[[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]],
+        candidate_margin=[[0.85, 0.85], [0.70, 0.70], [0.55, 0.55]],
+        candidate_query_score=[[0.9, 0.9], [0.8, 0.8], [0.7, 0.7]],
+    )
+    artifact = CachedCandidateArtifact(
+        scene="GreatCourt",
+        split_name="train",
+        source_path="memory",
+        artifact_format="listwise",
+        topk=2,
+        batches=[batch],
+        metadata={},
+    )
+
+    model, summary = train_candidate_scorer(
+        artifact,
+        CandidateScorerConfig(
+            epochs=120,
+            learning_rate=0.5,
+            feature_names=("native_score", "negative_rank", "valid", "landmark_prior", "margin", "query_score"),
+        ),
+    )
+
+    scored = score_candidate_rows(batch, model)
+    assert summary["feature_input_policy"] == "inference_safe"
+    assert summary["paper_safe_sparse_inference"] is True
+    assert all(row[0]["candidate_rank"] == 1 for row in scored)
+
+
 def test_candidate_scorer_training_cli_writes_model_manifest_and_summary(tmp_path: Path):
     out = tmp_path / "model"
 
@@ -126,8 +165,11 @@ def test_candidate_scorer_training_cli_writes_model_manifest_and_summary(tmp_pat
     summary = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert model["schema_version"] == "internal_sparse_candidate_scorer_v1"
+    assert model["feature_input_policy"] == "inference_safe"
     assert summary["label_count"] == 3
     assert manifest["inference_stage"] == "sparse_candidate_scorer_training"
+    assert manifest["feature_input_policy"] == "inference_safe"
+    assert manifest["paper_safe_sparse_inference"] is True
 
 
 def test_candidate_scorer_training_cli_accepts_solver_aware_feature_names(tmp_path: Path):
@@ -165,4 +207,12 @@ def test_candidate_scorer_training_cli_accepts_solver_aware_feature_names(tmp_pa
     ]
     assert summary["dense_teacher_sample_count"] == 4
     assert manifest["dense_teacher_enabled"] is True
+    assert manifest["feature_input_policy"] == "teacher_oracle_diagnostic"
+    assert manifest["paper_safe_sparse_inference"] is False
+    assert manifest["teacher_only_feature_names"] == [
+        "dense_consistent",
+        "sparse_inlier",
+        "negative_reprojection_error",
+        "solver_weight",
+    ]
     assert manifest["hyperparameters"]["feature_names"] == model["feature_names"]
