@@ -89,6 +89,7 @@ class SparseGateComparison:
             "candidate_pose_metric_status": candidate_pose_metric_status,
             "candidate_artifact": artifact_summary,
             "candidate_coverage": _compact_coverage_metrics(coverage_metrics),
+            "candidate_rerank_diagnostic": _compact_rerank_diagnostic(self.candidate_metrics),
             "candidate_scorer_training": _compact_candidate_scorer_metrics(self.candidate_scorer_metrics),
             "baseline_metrics_path": self.baseline_metrics_path,
             "candidate_metrics_path": self.candidate_metrics_path,
@@ -147,6 +148,21 @@ def _compact_candidate_scorer_metrics(metrics: Mapping[str, Any] | None) -> dict
         out["top1_gain"] = int(trained - native)
         out["relative_top1_gain"] = float((trained - native) / native) if native > 0 else 0.0
     return out
+
+
+def _compact_rerank_diagnostic(metrics: Mapping[str, Any]) -> dict[str, object] | None:
+    if not bool(metrics.get("rerank_diagnostic_enabled")):
+        return None
+    keys = (
+        "rerank_diagnostic_enabled",
+        "rerank_diagnostic_query_count",
+        "native_top1_correct",
+        "reranked_top1_correct",
+        "reranked_top1_gain",
+        "reranked_top1_changed_count",
+        "reranked_topk_available",
+    )
+    return {key: metrics[key] for key in keys if key in metrics}
 
 
 def load_metrics_summary(path: str | Path) -> dict[str, Any]:

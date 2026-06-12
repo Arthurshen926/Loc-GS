@@ -49,6 +49,24 @@ def _write_metrics(path: Path, *, median_te_cm: float, split_name: str) -> Path:
     return path
 
 
+def _add_rerank_diagnostic(path: Path) -> Path:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(
+        {
+            "schema_version": "internal_sparse_cached_eval_metrics_v1",
+            "rerank_diagnostic_enabled": True,
+            "rerank_diagnostic_query_count": 1536,
+            "native_top1_correct": 91,
+            "reranked_top1_correct": 225,
+            "reranked_top1_gain": 134,
+            "reranked_top1_changed_count": 1065,
+            "reranked_topk_available": 259,
+        }
+    )
+    path.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def _write_coverage_metrics(path: Path, *, complete: bool) -> Path:
     path.write_text(
         json.dumps(
@@ -183,6 +201,44 @@ def test_internal_sparse_gate_includes_candidate_scorer_training_evidence(tmp_pa
     assert evidence["trained_top1_correct"] == 573
     assert evidence["top1_gain"] == 279
     assert evidence["relative_top1_gain"] == 279 / 294
+
+
+def test_internal_sparse_gate_includes_candidate_eval_rerank_diagnostic(tmp_path: Path):
+    pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
+    baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev_seed13_20p")
+    candidate = _add_rerank_diagnostic(
+        _write_metrics(tmp_path / "candidate.json", median_te_cm=13.0, split_name="train_dev_seed13_20p")
+    )
+    out = tmp_path / "gate_eval_rerank"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev_seed13_20p",
+            "--candidate_artifact",
+            str(pair_cache),
+            "--baseline_metrics",
+            str(baseline),
+            "--candidate_metrics",
+            str(candidate),
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    assert metrics["candidate_rerank_diagnostic"] == {
+        "native_top1_correct": 91,
+        "rerank_diagnostic_enabled": True,
+        "rerank_diagnostic_query_count": 1536,
+        "reranked_top1_changed_count": 1065,
+        "reranked_top1_correct": 225,
+        "reranked_top1_gain": 134,
+        "reranked_topk_available": 259,
+    }
 
 
 def test_internal_sparse_gate_blocks_pass_when_candidate_coverage_is_incomplete(tmp_path: Path):
