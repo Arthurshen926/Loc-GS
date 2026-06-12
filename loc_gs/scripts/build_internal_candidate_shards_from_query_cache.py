@@ -40,6 +40,7 @@ def build_manifest(
     output_dir: str | Path,
     topk: int,
     max_landmarks: int | None,
+    landmark_chunk_size: int | None,
     max_shards: int | None,
     skip_empty_shards: bool,
 ) -> dict[str, object]:
@@ -63,6 +64,7 @@ def build_manifest(
         "hyperparameters": {
             "topk": int(topk),
             "max_landmarks": None if max_landmarks is None else int(max_landmarks),
+            "landmark_chunk_size": None if landmark_chunk_size is None else int(landmark_chunk_size),
             "max_shards": None if max_shards is None else int(max_shards),
             "skip_empty_shards": bool(skip_empty_shards),
         },
@@ -81,6 +83,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--topk", type=int, required=True)
     parser.add_argument("--max_landmarks", type=int, default=None)
+    parser.add_argument("--landmark_chunk_size", type=int, default=None)
     parser.add_argument("--max_shards", type=int, default=None)
     parser.add_argument("--skip_empty_shards", action="store_true")
     return parser
@@ -105,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         split_name=split,
         topk=int(args.topk),
         max_landmarks=args.max_landmarks,
+        landmark_chunk_size=args.landmark_chunk_size,
         max_shards=args.max_shards,
         skip_empty_shards=bool(args.skip_empty_shards),
     )
@@ -118,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=args.output_dir,
         topk=int(args.topk),
         max_landmarks=args.max_landmarks,
+        landmark_chunk_size=args.landmark_chunk_size,
         max_shards=args.max_shards,
         skip_empty_shards=bool(args.skip_empty_shards),
     )

@@ -33,6 +33,7 @@ def build_manifest(
     output_artifact: str | Path,
     topk: int,
     max_landmarks: int | None,
+    landmark_chunk_size: int | None,
 ) -> dict[str, object]:
     split = reject_test_split(split_name, purpose="internal candidate shard artifact manifest")
     return {
@@ -54,6 +55,7 @@ def build_manifest(
         "hyperparameters": {
             "topk": int(topk),
             "max_landmarks": None if max_landmarks is None else int(max_landmarks),
+            "landmark_chunk_size": None if landmark_chunk_size is None else int(landmark_chunk_size),
         },
     }
 
@@ -70,6 +72,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--output_name", default="candidate_shard.pt")
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--max_landmarks", type=int, default=None)
+    parser.add_argument("--landmark_chunk_size", type=int, default=None)
     parser.add_argument("--max_export_batches", type=int, default=2)
     return parser
 
@@ -89,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
         split_name=split,
         topk=int(args.topk),
         max_landmarks=args.max_landmarks,
+        landmark_chunk_size=args.landmark_chunk_size,
     )
     command = [
         sys.executable,
@@ -106,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         output_artifact=output_artifact,
         topk=int(args.topk),
         max_landmarks=args.max_landmarks,
+        landmark_chunk_size=args.landmark_chunk_size,
     )
     artifact = load_listwise_candidate_artifact(output_artifact, max_rows=1)
     split_audit = artifact.metadata.get("split_audit")

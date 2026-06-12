@@ -18,6 +18,7 @@ def build_candidate_shards_from_completion_plan(
     split_name: str,
     topk: int,
     max_landmarks: int | None = None,
+    landmark_chunk_size: int | None = None,
     max_shards: int | None = None,
     skip_empty_shards: bool = False,
 ) -> dict[str, object]:
@@ -47,6 +48,7 @@ def build_candidate_shards_from_completion_plan(
                 split_name=split,
                 topk=int(topk),
                 max_landmarks=max_landmarks,
+                landmark_chunk_size=landmark_chunk_size,
             )
         except ValueError as exc:
             if not skip_empty_shards or "does not contain any requested completion shard queries" not in str(exc):
@@ -74,6 +76,7 @@ def build_candidate_shards_from_completion_plan(
         "missing_feature_query_count": int(missing_feature_query_count),
         "topk": int(topk),
         "max_landmarks": None if max_landmarks is None else int(max_landmarks),
+        "landmark_chunk_size": None if landmark_chunk_size is None else int(landmark_chunk_size),
         "max_shards": None if max_shards is None else int(max_shards),
         "skip_empty_shards": bool(skip_empty_shards),
         "output_artifacts": output_artifacts,

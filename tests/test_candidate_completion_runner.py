@@ -114,6 +114,8 @@ def test_candidate_completion_runner_cli_writes_paths_and_audit_material(tmp_pat
             str(out),
             "--topk",
             "2",
+            "--landmark_chunk_size",
+            "2",
         ]
     )
 
@@ -123,7 +125,9 @@ def test_candidate_completion_runner_cli_writes_paths_and_audit_material(tmp_pat
     split_audit = json.loads((out / "split_audit.json").read_text(encoding="utf-8"))
     shard_paths = (out / "candidate_shard_paths.txt").read_text(encoding="utf-8").strip().splitlines()
     assert summary["built_shard_count"] == 2
+    assert summary["landmark_chunk_size"] == 2
     assert len(shard_paths) == 2
     assert manifest["schema_version"] == "internal_candidate_completion_runner_manifest_v1"
+    assert manifest["hyperparameters"]["landmark_chunk_size"] == 2
     assert manifest["external_runtime_dependency"] == "forbidden"
     assert split_audit["audit_status"] == "passed"

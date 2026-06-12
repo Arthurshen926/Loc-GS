@@ -77,6 +77,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--topk", type=int, required=True)
     parser.add_argument("--max_keypoints", type=int, default=2048)
     parser.add_argument("--max_landmarks", type=int, default=None)
+    parser.add_argument("--landmark_chunk_size", type=int, default=None)
     parser.add_argument("--score_threshold", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--learning_rate", type=float, default=0.1)
@@ -129,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         split_name=split,
         topk=int(args.topk),
         max_landmarks=args.max_landmarks,
+        landmark_chunk_size=args.landmark_chunk_size,
     )
     candidate_payload = torch.load(candidate_shard, map_location="cpu")
     if not isinstance(candidate_payload, dict):
@@ -252,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
             "topk": int(args.topk),
             "max_keypoints": int(args.max_keypoints),
             "max_landmarks": None if args.max_landmarks is None else int(args.max_landmarks),
+            "landmark_chunk_size": None if args.landmark_chunk_size is None else int(args.landmark_chunk_size),
             "score_threshold": None if args.score_threshold is None else float(args.score_threshold),
             "epochs": int(args.epochs),
             "learning_rate": float(args.learning_rate),

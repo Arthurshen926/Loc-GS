@@ -21,6 +21,7 @@ def build_candidate_shard_artifact(
     split_name: str,
     topk: int,
     max_landmarks: int | None = None,
+    landmark_chunk_size: int | None = None,
 ) -> dict[str, object]:
     split = reject_test_split(split_name, purpose="internal candidate shard artifact")
     shard_split = reject_test_split(
@@ -61,8 +62,12 @@ def build_candidate_shard_artifact(
     k = min(int(topk), int(base_desc.shape[0]))
     if k <= 0:
         raise ValueError("topk must be positive and base_landmark_desc must be non-empty")
-    scores = F.normalize(query_desc, p=2, dim=-1) @ F.normalize(base_desc, p=2, dim=-1).T
-    top_scores, top_indices = torch.topk(scores, k=k, dim=1)
+    top_scores, top_indices = _compute_topk_scores(
+        query_desc=query_desc,
+        base_desc=base_desc,
+        topk=k,
+        landmark_chunk_size=landmark_chunk_size,
+    )
     output = _build_listwise_payload(
         query_rows=query_rows,
         top_indices=top_indices.cpu(),
@@ -74,6 +79,7 @@ def build_candidate_shard_artifact(
         completion_shard=completion_shard,
         base_candidate_artifact=base_candidate_artifact,
         query_feature_cache=query_feature_cache,
+        landmark_chunk_size=landmark_chunk_size,
         split_audit=_split_audit(split, base_split_audit),
     )
     output_path = Path(output_artifact)
@@ -92,6 +98,7 @@ def build_candidate_shard_artifact(
         "keypoint_count": int(artifact.keypoint_count),
         "topk": int(k),
         "base_landmark_count": int(base_desc.shape[0]),
+        "landmark_chunk_size": None if landmark_chunk_size is None else int(landmark_chunk_size),
         "output_artifact": str(output_path),
         "dense_teacher_enabled": False,
         "dense_inference_enabled": False,
@@ -174,6 +181,45 @@ def _select_query_feature_rows(payload: Mapping[str, Any], requested_query_ids: 
     return rows
 
 
+def _compute_topk_scores(
+    *,
+    query_desc: torch.Tensor,
+    base_desc: torch.Tensor,
+    topk: int,
+    landmark_chunk_size: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    query = F.normalize(query_desc, p=2, dim=-1)
+    landmark_count = int(base_desc.shape[0])
+    k = min(int(topk), landmark_count)
+    chunk_size = landmark_count if landmark_chunk_size is None else int(landmark_chunk_size)
+    if chunk_size <= 0:
+        raise ValueError("landmark_chunk_size must be positive when provided")
+    if chunk_size >= landmark_count:
+        scores = query @ F.normalize(base_desc, p=2, dim=-1).T
+        return torch.topk(scores, k=k, dim=1)
+
+    best_scores: torch.Tensor | None = None
+    best_indices: torch.Tensor | None = None
+    for start in range(0, landmark_count, chunk_size):
+        end = min(start + chunk_size, landmark_count)
+        chunk = F.normalize(base_desc[start:end], p=2, dim=-1)
+        scores = query @ chunk.T
+        local_k = min(k, int(scores.shape[1]))
+        chunk_scores, chunk_indices = torch.topk(scores, k=local_k, dim=1)
+        chunk_indices = chunk_indices + int(start)
+        if best_scores is None or best_indices is None:
+            best_scores = chunk_scores
+            best_indices = chunk_indices
+            continue
+        combined_scores = torch.cat([best_scores, chunk_scores], dim=1)
+        combined_indices = torch.cat([best_indices, chunk_indices], dim=1)
+        best_scores, order = torch.topk(combined_scores, k=k, dim=1)
+        best_indices = combined_indices.gather(1, order)
+    if best_scores is None or best_indices is None:
+        raise ValueError("base_landmark_desc must be non-empty")
+    return best_scores, best_indices
+
+
 def _build_listwise_payload(
     *,
     query_rows: Sequence[Mapping[str, Any]],
@@ -186,6 +232,7 @@ def _build_listwise_payload(
     completion_shard: Mapping[str, Any],
     base_candidate_artifact: str | Path,
     query_feature_cache: str | Path,
+    landmark_chunk_size: int | None,
     split_audit: Mapping[str, object],
 ) -> dict[str, Any]:
     image_ids = [str(row["image_id"]) for row in query_rows]
@@ -208,6 +255,7 @@ def _build_listwise_payload(
             "completion_shard_id": str(completion_shard.get("shard_id") or "unknown"),
             "base_candidate_artifact": str(base_candidate_artifact),
             "query_feature_cache": str(query_feature_cache),
+            "landmark_chunk_size": None if landmark_chunk_size is None else int(landmark_chunk_size),
             "split_audit": dict(split_audit),
         },
         "base_gaussian_id": base_gaussian_id.long(),

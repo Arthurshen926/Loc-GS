@@ -35,6 +35,7 @@ def build_manifest(
     topk: int,
     max_keypoints: int,
     max_landmarks: int | None,
+    landmark_chunk_size: int | None,
     score_threshold: float | None,
 ) -> dict[str, object]:
     split = reject_test_split(split_name, purpose="candidate shard from feature maps manifest")
@@ -59,6 +60,7 @@ def build_manifest(
             "topk": int(topk),
             "max_keypoints": int(max_keypoints),
             "max_landmarks": None if max_landmarks is None else int(max_landmarks),
+            "landmark_chunk_size": None if landmark_chunk_size is None else int(landmark_chunk_size),
             "score_threshold": None if score_threshold is None else float(score_threshold),
         },
     }
@@ -80,6 +82,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--topk", type=int, required=True)
     parser.add_argument("--max_keypoints", type=int, default=2048)
     parser.add_argument("--max_landmarks", type=int, default=None)
+    parser.add_argument("--landmark_chunk_size", type=int, default=None)
     parser.add_argument("--score_threshold", type=float, default=None)
     return parser
 
@@ -110,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         split_name=split,
         topk=int(args.topk),
         max_landmarks=args.max_landmarks,
+        landmark_chunk_size=args.landmark_chunk_size,
     )
     command = [
         sys.executable,
@@ -129,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         topk=int(args.topk),
         max_keypoints=int(args.max_keypoints),
         max_landmarks=args.max_landmarks,
+        landmark_chunk_size=args.landmark_chunk_size,
         score_threshold=args.score_threshold,
     )
     summary = {
