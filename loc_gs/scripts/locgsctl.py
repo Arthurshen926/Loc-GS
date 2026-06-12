@@ -207,6 +207,34 @@ def _compact_stage(data: dict[str, Any]) -> dict[str, float]:
     return out
 
 
+def _compact_candidate_mlp_feature_cache(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "feature_materialization",
+        "feature_input_policy",
+        "paper_safe_sparse_inference",
+        "sample_count",
+        "label_count",
+        "group_count",
+        "native_top1_correct",
+        "dense_teacher_sample_count",
+    )
+    return {key: data[key] for key in keys if key in data}
+
+
+def _compact_candidate_mlp_scorer(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "feature_materialization",
+        "feature_input_policy",
+        "paper_safe_sparse_inference",
+        "sample_count",
+        "label_count",
+        "native_top1_correct",
+        "trained_top1_correct",
+        "dense_teacher_sample_count",
+    )
+    return {key: data[key] for key in keys if key in data}
+
+
 def _parse_hyperparameters(raw: str | None) -> dict[str, Any]:
     if raw is None or not str(raw).strip():
         return {}
@@ -220,9 +248,19 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
     source = _summary_path(path)
     data = _load_json(source)
     payload: dict[str, Any] = {"source": str(source)}
-    for key in ("model_path", "scene", "run_name", "tag"):
+    for key in ("schema_version", "model_path", "scene", "split_name", "run_name", "tag"):
         if key in data:
             payload[key] = data[key]
+    if data.get("schema_version") == "internal_candidate_mlp_feature_cache_summary_v1":
+        payload["candidate_mlp_feature_cache"] = _compact_candidate_mlp_feature_cache(data)
+    if data.get("schema_version") == "internal_candidate_mlp_scorer_training_summary_v1":
+        payload["candidate_mlp_scorer"] = _compact_candidate_mlp_scorer(data)
+    nested_cache = data.get("candidate_mlp_feature_cache")
+    if isinstance(nested_cache, dict):
+        payload["candidate_mlp_feature_cache"] = _compact_candidate_mlp_feature_cache(nested_cache)
+    nested_scorer = data.get("candidate_mlp_scorer")
+    if isinstance(nested_scorer, dict):
+        payload["candidate_mlp_scorer"] = _compact_candidate_mlp_scorer(nested_scorer)
     for stage in ("sparse", "dense"):
         stage_data = data.get(stage, {})
         if isinstance(stage_data, dict):

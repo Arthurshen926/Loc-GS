@@ -90,6 +90,70 @@ def test_summarize_prefers_metrics_summary_for_audit_bundle_directories(tmp_path
     assert payload["dense"]["median_te_cm"] == 2.25
 
 
+def test_summarize_compacts_candidate_mlp_cache_and_training_summaries(tmp_path, capsys):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / "metrics_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_candidate_mlp_feature_cache_summary_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev",
+                "sample_count": 40000,
+                "label_count": 1073,
+                "group_count": 5000,
+                "native_top1_correct": 294,
+                "dense_teacher_sample_count": 40000,
+                "feature_materialization": "feature_cache",
+                "feature_input_policy": "inference_safe",
+                "paper_safe_sparse_inference": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cache_payload = _run_cli(capsys, "summarize", str(cache_dir))
+
+    assert cache_payload["scene"] == "GreatCourt"
+    assert cache_payload["split_name"] == "train_dev"
+    assert cache_payload["candidate_mlp_feature_cache"] == {
+        "dense_teacher_sample_count": 40000,
+        "feature_input_policy": "inference_safe",
+        "feature_materialization": "feature_cache",
+        "group_count": 5000,
+        "label_count": 1073,
+        "native_top1_correct": 294,
+        "paper_safe_sparse_inference": True,
+        "sample_count": 40000,
+    }
+
+    scorer_dir = tmp_path / "scorer"
+    scorer_dir.mkdir()
+    (scorer_dir / "metrics_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_candidate_mlp_scorer_training_summary_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev",
+                "sample_count": 40000,
+                "label_count": 1073,
+                "native_top1_correct": 294,
+                "trained_top1_correct": 573,
+                "dense_teacher_sample_count": 40000,
+                "feature_materialization": "feature_cache",
+                "feature_input_policy": "inference_safe",
+                "paper_safe_sparse_inference": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    scorer_payload = _run_cli(capsys, "summarize", str(scorer_dir))
+
+    assert scorer_payload["candidate_mlp_scorer"]["trained_top1_correct"] == 573
+    assert scorer_payload["candidate_mlp_scorer"]["feature_materialization"] == "feature_cache"
+
+
 def test_compare_reports_candidate_minus_baseline_deltas(tmp_path, capsys):
     baseline = tmp_path / "baseline"
     candidate = tmp_path / "candidate"
