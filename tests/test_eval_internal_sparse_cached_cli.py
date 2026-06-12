@@ -8,7 +8,12 @@ import torch
 from loc_gs.core.camera import load_camera_records
 from loc_gs.core.geometry import project_points_w2c
 from loc_gs.scripts.eval_internal_sparse_cached import main
-from loc_gs.students.candidate_mlp_scorer import CandidateMLPScorerConfig, train_candidate_mlp_scorer
+from loc_gs.students.candidate_mlp_scorer import (
+    CandidateMLPScorerConfig,
+    build_candidate_mlp_feature_cache,
+    train_candidate_mlp_scorer,
+    train_candidate_mlp_scorer_from_feature_cache,
+)
 from loc_gs.students.descriptor_fusion import DescriptorFusionModel
 from loc_gs.students.detector_student import DetectorStudentModel
 from loc_gs.students.landmark_selector import LandmarkSelectorModel
@@ -395,6 +400,59 @@ def test_eval_internal_sparse_cached_cli_accepts_mlp_candidate_scorer(tmp_path: 
     assert rc == 0
     metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
     rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert metrics["candidate_scorer_enabled"] is True
+    assert rows[0]["success"] is True
+    assert rows[0]["te_cm"] < 1.0
+
+
+def test_eval_internal_sparse_cached_cli_accepts_cache_trained_mlp_candidate_scorer(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    pairs = _write_pair_cache(tmp_path / "pairs.pt", cameras, buried_correct=True, descriptor_signals=True)
+    artifact = load_listwise_candidate_artifact(pairs)
+    cfg = CandidateMLPScorerConfig(epochs=100, learning_rate=0.03, hidden_dim=8, seed=11)
+    feature_cache = build_candidate_mlp_feature_cache(artifact, cfg)
+    model, summary = train_candidate_mlp_scorer_from_feature_cache(feature_cache, cfg)
+    assert summary["feature_materialization"] == "feature_cache"
+    assert summary["trained_top1_correct"] == 6
+    scorer_path = tmp_path / "candidate_mlp_from_cache.pt"
+    torch.save(model.to_torch_dict(), scorer_path)
+    out = tmp_path / "eval_mlp_scorer_from_cache"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(pairs),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--candidate_scorer",
+            str(scorer_path),
+            "--rerank_prefix_fraction",
+            "0",
+            "--native_weight",
+            "0",
+            "--solver_weight",
+            "1",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert manifest["dense_inference_enabled"] is False
+    assert manifest["inference_stage"] == "sparse_only"
     assert metrics["candidate_scorer_enabled"] is True
     assert rows[0]["success"] is True
     assert rows[0]["te_cm"] < 1.0
