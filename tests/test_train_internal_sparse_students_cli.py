@@ -115,7 +115,7 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
             "20",
             "--candidate_mlp_batch_size",
             "2",
-            "--candidate_mlp_stream_features",
+            "--candidate_mlp_cache_features",
         ]
     )
 
@@ -124,6 +124,7 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     summary = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
     model = json.loads((out / "model.json").read_text(encoding="utf-8"))
     candidate_mlp = torch.load(out / "candidate_mlp_scorer.pt", map_location="cpu")
+    candidate_mlp_cache = torch.load(out / "candidate_mlp_feature_cache.pt", map_location="cpu")
     selector = json.loads((out / "landmark_selector.json").read_text(encoding="utf-8"))
     conflicts = json.loads((out / "conflict_graph.json").read_text(encoding="utf-8"))
     fusion = json.loads((out / "descriptor_fusion.json").read_text(encoding="utf-8"))
@@ -155,9 +156,14 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     assert candidate_mlp["score_calibration"] == "train_logit_zscore"
     assert summary["candidate_mlp_scorer"]["student_modules"] == ["candidate_mlp_scorer"]
     assert summary["candidate_mlp_scorer"]["batch_size"] == 2
-    assert summary["candidate_mlp_scorer"]["feature_materialization"] == "streaming"
+    assert summary["candidate_mlp_scorer"]["feature_materialization"] == "feature_cache"
+    assert summary["candidate_mlp_scorer"]["feature_cache_enabled"] is True
+    assert summary["candidate_mlp_feature_cache"]["schema_version"] == "internal_candidate_mlp_feature_cache_summary_v1"
+    assert candidate_mlp_cache["schema_version"] == "internal_candidate_mlp_feature_cache_v1"
+    assert manifest["candidate_mlp_feature_cache"] == str(out / "candidate_mlp_feature_cache.pt")
     assert manifest["hyperparameters"]["candidate_mlp_batch_size"] == 2
-    assert manifest["hyperparameters"]["candidate_mlp_stream_features"] is True
+    assert manifest["hyperparameters"]["candidate_mlp_stream_features"] is False
+    assert manifest["hyperparameters"]["candidate_mlp_cache_features"] is True
     assert selector["schema_version"] == "internal_landmark_selector_v1"
     assert conflicts["schema_version"] == "internal_conflict_graph_v1"
     assert fusion["schema_version"] == "internal_descriptor_fusion_v1"

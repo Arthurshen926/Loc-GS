@@ -16,7 +16,13 @@ from loc_gs.simulation.render_manifest import load_simulation_plan_rows
 from loc_gs.simulation.query_sampler import SimulationSamplerConfig, sample_simulated_queries
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 from loc_gs.sparse.audit import reject_test_split
-from loc_gs.students.candidate_mlp_scorer import CandidateMLPScorerConfig, train_candidate_mlp_scorer
+from loc_gs.students.candidate_mlp_scorer import (
+    CandidateMLPScorerConfig,
+    build_candidate_mlp_feature_cache,
+    save_candidate_mlp_feature_cache,
+    train_candidate_mlp_scorer,
+    train_candidate_mlp_scorer_from_feature_cache,
+)
 from loc_gs.students.descriptor_fusion import DescriptorFusionConfig, train_descriptor_fusion_from_payload
 from loc_gs.students.detector_student import DetectorStudentConfig, train_detector_student
 from loc_gs.students.landmark_selector import LandmarkSelectorConfig, train_landmark_selector
@@ -79,6 +85,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate_mlp_listwise_loss_weight", type=float, default=1.0)
     parser.add_argument("--candidate_mlp_batch_size", type=int, default=0)
     parser.add_argument("--candidate_mlp_stream_features", action="store_true")
+    parser.add_argument(
+        "--candidate_mlp_cache_features",
+        action="store_true",
+        help="Materialize candidate MLP features from the generated online artifact and train from that cache.",
+    )
     parser.add_argument("--landmark_conflict_penalty", type=float, default=0.1)
     parser.add_argument("--descriptor_trust_region", type=float, default=0.25)
     parser.add_argument("--detector_grid_size", type=int, default=8)
@@ -86,7 +97,10 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_argparser().parse_args(argv)
+    parser = build_argparser()
+    args = parser.parse_args(argv)
+    if bool(args.candidate_mlp_cache_features) and bool(args.candidate_mlp_stream_features):
+        parser.error("--candidate_mlp_cache_features and --candidate_mlp_stream_features are mutually exclusive")
     split = reject_test_split(str(args.split_name), purpose="online sparse student training")
     sim_cfg = SimulationSamplerConfig(
         sample_count=int(args.sample_count),
@@ -144,19 +158,31 @@ def main(argv: list[str] | None = None) -> int:
         rank_feature_scale=float(args.rank_feature_scale),
     )
     model, scorer_summary = train_candidate_scorer(online_artifact, scorer_cfg)
-    candidate_mlp_model, candidate_mlp_summary = train_candidate_mlp_scorer(
-        online_artifact,
-        CandidateMLPScorerConfig(
-            epochs=int(args.epochs),
-            learning_rate=float(args.candidate_mlp_learning_rate),
-            hidden_dim=int(args.candidate_mlp_hidden_dim),
-            seed=int(args.seed),
-            listwise_loss_weight=float(args.candidate_mlp_listwise_loss_weight),
-            batch_size=int(args.candidate_mlp_batch_size),
-            stream_features=bool(args.candidate_mlp_stream_features),
-            rank_feature_scale=float(args.rank_feature_scale),
-        ),
+    candidate_mlp_cfg = CandidateMLPScorerConfig(
+        epochs=int(args.epochs),
+        learning_rate=float(args.candidate_mlp_learning_rate),
+        hidden_dim=int(args.candidate_mlp_hidden_dim),
+        seed=int(args.seed),
+        listwise_loss_weight=float(args.candidate_mlp_listwise_loss_weight),
+        batch_size=int(args.candidate_mlp_batch_size),
+        stream_features=bool(args.candidate_mlp_stream_features),
+        rank_feature_scale=float(args.rank_feature_scale),
     )
+    candidate_mlp_feature_cache_path: Path | None = None
+    candidate_mlp_feature_cache_summary: dict[str, object] | None = None
+    if bool(args.candidate_mlp_cache_features):
+        candidate_mlp_feature_cache = build_candidate_mlp_feature_cache(online_artifact, candidate_mlp_cfg)
+        candidate_mlp_feature_cache_path = save_candidate_mlp_feature_cache(
+            candidate_mlp_feature_cache,
+            args.output_dir / "candidate_mlp_feature_cache.pt",
+        )
+        candidate_mlp_feature_cache_summary = candidate_mlp_feature_cache.summarize()
+        candidate_mlp_model, candidate_mlp_summary = train_candidate_mlp_scorer_from_feature_cache(
+            candidate_mlp_feature_cache,
+            candidate_mlp_cfg,
+        )
+    else:
+        candidate_mlp_model, candidate_mlp_summary = train_candidate_mlp_scorer(online_artifact, candidate_mlp_cfg)
     selector_model, selector_summary = train_landmark_selector(
         online_artifact.batches,
         LandmarkSelectorConfig(conflict_penalty=float(args.landmark_conflict_penalty)),
@@ -188,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         "distillation": distillation_summary,
         "candidate_scorer": scorer_summary,
         "candidate_mlp_scorer": candidate_mlp_summary,
+        "candidate_mlp_feature_cache": candidate_mlp_feature_cache_summary,
         "landmark_selector": selector_summary,
         "descriptor_fusion": descriptor_summary,
         "detector_student": detector_summary,
@@ -210,6 +237,9 @@ def main(argv: list[str] | None = None) -> int:
         "render_manifest": None if args.render_manifest is None else str(args.render_manifest),
         "online_distilled_candidate_artifact": str(online_artifact_path),
         "candidate_mlp_scorer": str(args.output_dir / "candidate_mlp_scorer.pt"),
+        "candidate_mlp_feature_cache": None
+        if candidate_mlp_feature_cache_path is None
+        else str(candidate_mlp_feature_cache_path),
         "hyperparameters": {
             "sample_count": int(args.sample_count),
             "seed": int(args.seed),
@@ -231,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
             "candidate_mlp_listwise_loss_weight": float(args.candidate_mlp_listwise_loss_weight),
             "candidate_mlp_batch_size": int(args.candidate_mlp_batch_size),
             "candidate_mlp_stream_features": bool(args.candidate_mlp_stream_features),
+            "candidate_mlp_cache_features": bool(args.candidate_mlp_cache_features),
             "landmark_conflict_penalty": float(args.landmark_conflict_penalty),
             "descriptor_trust_region": float(args.descriptor_trust_region),
             "detector_grid_size": int(args.detector_grid_size),
