@@ -71,7 +71,14 @@ def _write_cameras(path: Path) -> Path:
     return path
 
 
-def _write_pair_cache(path: Path, cameras: Path, *, buried_correct: bool = False, descriptor_signals: bool = False) -> Path:
+def _write_pair_cache(
+    path: Path,
+    cameras: Path,
+    *,
+    buried_correct: bool = False,
+    single_buried_correct: bool = False,
+    descriptor_signals: bool = False,
+) -> Path:
     points = np.array(
         [
             (-0.5, -0.4, 3.0),
@@ -88,7 +95,16 @@ def _write_pair_cache(path: Path, cameras: Path, *, buried_correct: bool = False
     ]
     keypoints_xy, valid = project_points_w2c(points, camera.pose_w2c, camera.intrinsics)
     assert bool(valid.all())
-    if buried_correct:
+    if single_buried_correct:
+        landmark_id = torch.tensor(
+            [[0, 6], [1, 7], [2, 8], [3, 9], [4, 10], [11, 5]],
+            dtype=torch.int64,
+        )
+        cosine = torch.tensor([[0.95, 0.1]] * 6, dtype=torch.float32)
+        label = torch.tensor([0, 0, 0, 0, 0, 1], dtype=torch.int64)
+        topk = 2
+        candidate_mask = torch.ones((6, 2), dtype=torch.bool)
+    elif buried_correct:
         landmark_id = torch.tensor(
             [[6, 0], [7, 1], [8, 2], [9, 3], [10, 4], [11, 5]],
             dtype=torch.int64,
@@ -111,7 +127,7 @@ def _write_pair_cache(path: Path, cameras: Path, *, buried_correct: bool = False
             "topk": topk,
             "split_audit": {"audit_status": "passed", "checks": {}},
         },
-        "base_gaussian_id": torch.arange(12 if buried_correct else 6, dtype=torch.int64),
+        "base_gaussian_id": torch.arange(12 if (buried_correct or single_buried_correct) else 6, dtype=torch.int64),
         "query_yx": torch.tensor([[float(xy[1]), float(xy[0])] for xy in keypoints_xy], dtype=torch.float32),
         "landmark_id": landmark_id,
         "cosine": cosine,
@@ -416,6 +432,48 @@ def test_eval_internal_sparse_cached_cli_accepts_mlp_candidate_scorer(tmp_path: 
     assert rows[0]["selected_set_diagnostics"]["selected_geometric_correct_ratio"] == 1.0
     assert rows[0]["success"] is True
     assert rows[0]["te_cm"] < 1.0
+
+
+def test_eval_internal_sparse_cached_cli_reports_post_pnp_rescore_label_flow(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    out = tmp_path / "eval_post_pnp_flow"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt", cameras, single_buried_correct=True)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--second_pnp_enabled",
+            "--post_pnp_candidate_rescore",
+            "--post_pnp_reprojection_weight",
+            "4.0",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert metrics["post_pnp_rescore_changed_count_median"] == 1
+    assert metrics["post_pnp_rescore_corrected_count_median"] == 1
+    assert metrics["post_pnp_rescore_worsened_count_median"] == 0
+    assert metrics["post_pnp_rescore_correct_delta_median"] == 1
+    assert rows[0]["post_pnp_rescore_changed_count"] == 1
+    assert rows[0]["post_pnp_rescore_corrected_count"] == 1
+    assert rows[0]["post_pnp_rescore_worsened_count"] == 0
+    assert rows[0]["post_pnp_rescore_correct_delta"] == 1
 
 
 def test_eval_internal_sparse_cached_cli_accepts_cache_trained_mlp_candidate_scorer(tmp_path: Path):

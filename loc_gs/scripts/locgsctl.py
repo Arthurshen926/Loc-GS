@@ -283,6 +283,17 @@ def _compact_selected_set_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
     return {key: data[key] for key in keys if key in data}
 
 
+def _compact_post_pnp_rescore_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "post_pnp_candidate_rescore_enabled",
+        "post_pnp_rescore_changed_count_median",
+        "post_pnp_rescore_corrected_count_median",
+        "post_pnp_rescore_worsened_count_median",
+        "post_pnp_rescore_correct_delta_median",
+    )
+    return {key: data[key] for key in keys if key in data}
+
+
 def _parse_hyperparameters(raw: str | None) -> dict[str, Any]:
     if raw is None or not str(raw).strip():
         return {}
@@ -315,6 +326,9 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
         selected_set = _compact_selected_set_diagnostic(data)
         if selected_set:
             payload["selected_set_diagnostic"] = selected_set
+        post_pnp_rescore = _compact_post_pnp_rescore_diagnostic(data)
+        if post_pnp_rescore:
+            payload["post_pnp_rescore_diagnostic"] = post_pnp_rescore
     nested_cache = data.get("candidate_mlp_feature_cache")
     if isinstance(nested_cache, dict):
         payload["candidate_mlp_feature_cache"] = _compact_candidate_mlp_feature_cache(nested_cache)
@@ -330,6 +344,11 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
     nested_selected_set = data.get("candidate_selected_set_diagnostic")
     if isinstance(nested_selected_set, dict):
         payload["candidate_selected_set_diagnostic"] = _compact_selected_set_diagnostic(nested_selected_set)
+    nested_post_pnp_rescore = data.get("candidate_post_pnp_rescore_diagnostic")
+    if isinstance(nested_post_pnp_rescore, dict):
+        payload["candidate_post_pnp_rescore_diagnostic"] = _compact_post_pnp_rescore_diagnostic(
+            nested_post_pnp_rescore
+        )
     for stage in ("sparse", "dense"):
         stage_data = data.get(stage, {})
         if isinstance(stage_data, dict):

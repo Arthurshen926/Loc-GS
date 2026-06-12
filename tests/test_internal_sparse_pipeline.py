@@ -260,6 +260,9 @@ def test_sparse_pipeline_post_pnp_rescore_recovers_buried_candidate():
 
     assert result.success is True
     assert result.post_pnp_rescore_changed_count == 1
+    assert result.post_pnp_rescore_corrected_count == 1
+    assert result.post_pnp_rescore_worsened_count == 0
+    assert result.post_pnp_rescore_correct_delta == 1
     assert result.selected_landmark_ids[-1] == len(correct_points) - 1
     assert result.lgcv_keep_count == 6
     te_cm, re_deg = pose_error_cm_deg(result.pose_w2c, gt_pose)

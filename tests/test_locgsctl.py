@@ -193,6 +193,13 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
                     "selected_keypoint_bbox_area_fraction_median": 0.9497,
                     "selected_depth_range_m_median": 46.5,
                 },
+                "candidate_post_pnp_rescore_diagnostic": {
+                    "post_pnp_candidate_rescore_enabled": True,
+                    "post_pnp_rescore_changed_count_median": 44.0,
+                    "post_pnp_rescore_corrected_count_median": 12.0,
+                    "post_pnp_rescore_worsened_count_median": 3.0,
+                    "post_pnp_rescore_correct_delta_median": 9.0,
+                },
             }
         ),
         encoding="utf-8",
@@ -216,6 +223,13 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
         "selected_geometric_correct_count_median": 32.0,
         "selected_geometric_correct_ratio_median": 0.0625,
         "selected_keypoint_bbox_area_fraction_median": 0.9497,
+    }
+    assert payload["candidate_post_pnp_rescore_diagnostic"] == {
+        "post_pnp_candidate_rescore_enabled": True,
+        "post_pnp_rescore_changed_count_median": 44.0,
+        "post_pnp_rescore_correct_delta_median": 9.0,
+        "post_pnp_rescore_corrected_count_median": 12.0,
+        "post_pnp_rescore_worsened_count_median": 3.0,
     }
 
 
@@ -243,6 +257,11 @@ def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, caps
                 "selected_geometric_correct_ratio_median": 0.0625,
                 "selected_keypoint_bbox_area_fraction_median": 0.9497,
                 "selected_depth_range_m_median": 46.5,
+                "post_pnp_candidate_rescore_enabled": True,
+                "post_pnp_rescore_changed_count_median": 44.0,
+                "post_pnp_rescore_corrected_count_median": 12.0,
+                "post_pnp_rescore_worsened_count_median": 3.0,
+                "post_pnp_rescore_correct_delta_median": 9.0,
             }
         ),
         encoding="utf-8",
@@ -266,6 +285,13 @@ def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, caps
         "selected_geometric_correct_count_median": 32.0,
         "selected_geometric_correct_ratio_median": 0.0625,
         "selected_keypoint_bbox_area_fraction_median": 0.9497,
+    }
+    assert payload["post_pnp_rescore_diagnostic"] == {
+        "post_pnp_candidate_rescore_enabled": True,
+        "post_pnp_rescore_changed_count_median": 44.0,
+        "post_pnp_rescore_correct_delta_median": 9.0,
+        "post_pnp_rescore_corrected_count_median": 12.0,
+        "post_pnp_rescore_worsened_count_median": 3.0,
     }
 
 

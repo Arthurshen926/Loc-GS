@@ -92,6 +92,9 @@ class SparseLocalizationResult:
     initial_inlier_count: int = 0
     lgcv_keep_count: int | None = None
     post_pnp_rescore_changed_count: int = 0
+    post_pnp_rescore_corrected_count: int = 0
+    post_pnp_rescore_worsened_count: int = 0
+    post_pnp_rescore_correct_delta: int = 0
     pnp_method: str = "epnp"
     second_pnp_method: str | None = None
     selected_set_diagnostics: dict[str, float | int] | None = None
@@ -228,6 +231,38 @@ def _post_pnp_rescore_rows(
     return selected_rows, changed_count
 
 
+def _post_pnp_rescore_label_flow(
+    before_rows: Sequence[dict[str, object]],
+    after_rows: Sequence[dict[str, object]],
+) -> dict[str, int]:
+    corrected_count = 0
+    worsened_count = 0
+    before_correct_count = 0
+    after_correct_count = 0
+    for before, after in zip(before_rows, after_rows):
+        before_value = before.get("geometric_correct")
+        after_value = after.get("geometric_correct")
+        before_known = before_value is not None
+        after_known = after_value is not None
+        if before_known and bool(before_value):
+            before_correct_count += 1
+        if after_known and bool(after_value):
+            after_correct_count += 1
+        if not (before_known and after_known):
+            continue
+        before_correct = bool(before_value)
+        after_correct = bool(after_value)
+        if not before_correct and after_correct:
+            corrected_count += 1
+        elif before_correct and not after_correct:
+            worsened_count += 1
+    return {
+        "corrected_count": int(corrected_count),
+        "worsened_count": int(worsened_count),
+        "correct_delta": int(after_correct_count - before_correct_count),
+    }
+
+
 def run_sparse_localization(
     data: SparseLocalizationInput,
     cfg: SparseLocalizationConfig | None = None,
@@ -284,17 +319,25 @@ def run_sparse_localization(
     lgcv_keep_count = None
     second_method = None
     post_pnp_changed_count = 0
+    post_pnp_corrected_count = 0
+    post_pnp_worsened_count = 0
+    post_pnp_correct_delta = 0
     if bool(pnp.success) and bool(cfg.second_pnp_enabled) and pnp.pose_w2c is not None:
         if bool(cfg.post_pnp_candidate_rescore):
             eligible = None
             if bool(cfg.post_pnp_rescore_only_initial_outliers):
                 eligible = ~np.asarray(pnp.inlier_mask, dtype=bool)
+            pre_rescore_rows = [dict(row) for row in selected_rows]
             selected_rows, post_pnp_changed_count = _post_pnp_rescore_rows(
                 data,
                 pnp.pose_w2c,
                 cfg,
                 eligible_mask=eligible,
             )
+            label_flow = _post_pnp_rescore_label_flow(pre_rescore_rows, selected_rows)
+            post_pnp_corrected_count = int(label_flow["corrected_count"])
+            post_pnp_worsened_count = int(label_flow["worsened_count"])
+            post_pnp_correct_delta = int(label_flow["correct_delta"])
             selected_landmark_ids = [int(row["landmark_id"]) for row in selected_rows]
             points = np.asarray([row["point3d"] for row in selected_rows], dtype=np.float64).reshape(-1, 3)
             scores = _match_scores(selected_rows, cfg)
@@ -340,6 +383,9 @@ def run_sparse_localization(
         initial_inlier_count=int(pnp.inlier_count),
         lgcv_keep_count=lgcv_keep_count,
         post_pnp_rescore_changed_count=int(post_pnp_changed_count),
+        post_pnp_rescore_corrected_count=int(post_pnp_corrected_count),
+        post_pnp_rescore_worsened_count=int(post_pnp_worsened_count),
+        post_pnp_rescore_correct_delta=int(post_pnp_correct_delta),
         pnp_method=str(cfg.pnp_method),
         second_pnp_method=second_method,
         selected_set_diagnostics=selected_diagnostics,

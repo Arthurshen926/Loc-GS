@@ -91,6 +91,7 @@ class SparseGateComparison:
             "candidate_coverage": _compact_coverage_metrics(coverage_metrics),
             "candidate_rerank_diagnostic": _compact_rerank_diagnostic(self.candidate_metrics),
             "candidate_selected_set_diagnostic": _compact_selected_set_diagnostic(self.candidate_metrics),
+            "candidate_post_pnp_rescore_diagnostic": _compact_post_pnp_rescore_diagnostic(self.candidate_metrics),
             "candidate_scorer_training": _compact_candidate_scorer_metrics(self.candidate_scorer_metrics),
             "baseline_metrics_path": self.baseline_metrics_path,
             "candidate_metrics_path": self.candidate_metrics_path,
@@ -175,6 +176,19 @@ def _compact_selected_set_diagnostic(metrics: Mapping[str, Any]) -> dict[str, ob
     )
     out = {key: metrics[key] for key in keys if key in metrics}
     return out or None
+
+
+def _compact_post_pnp_rescore_diagnostic(metrics: Mapping[str, Any]) -> dict[str, object] | None:
+    if not bool(metrics.get("post_pnp_candidate_rescore_enabled")):
+        return None
+    keys = (
+        "post_pnp_candidate_rescore_enabled",
+        "post_pnp_rescore_changed_count_median",
+        "post_pnp_rescore_corrected_count_median",
+        "post_pnp_rescore_worsened_count_median",
+        "post_pnp_rescore_correct_delta_median",
+    )
+    return {key: metrics[key] for key in keys if key in metrics}
 
 
 def load_metrics_summary(path: str | Path) -> dict[str, Any]:

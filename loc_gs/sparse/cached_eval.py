@@ -140,6 +140,9 @@ def run_cached_sparse_eval(
     stage_counts: list[float] = []
     lgcv_keep_counts: list[float] = []
     post_pnp_changed_counts: list[float] = []
+    post_pnp_corrected_counts: list[float] = []
+    post_pnp_worsened_counts: list[float] = []
+    post_pnp_correct_deltas: list[float] = []
     selected_correct_counts: list[float] = []
     selected_correct_ratios: list[float] = []
     selected_bbox_area_fractions: list[float] = []
@@ -226,6 +229,9 @@ def run_cached_sparse_eval(
         if result.lgcv_keep_count is not None:
             lgcv_keep_counts.append(float(result.lgcv_keep_count))
         post_pnp_changed_counts.append(float(result.post_pnp_rescore_changed_count))
+        post_pnp_corrected_counts.append(float(result.post_pnp_rescore_corrected_count))
+        post_pnp_worsened_counts.append(float(result.post_pnp_rescore_worsened_count))
+        post_pnp_correct_deltas.append(float(result.post_pnp_rescore_correct_delta))
         selected_set_diagnostics = dict(result.selected_set_diagnostics or {})
         if selected_set_diagnostics:
             selected_correct_counts.append(float(selected_set_diagnostics.get("selected_geometric_correct_count", 0.0)))
@@ -242,6 +248,9 @@ def run_cached_sparse_eval(
                 "initial_inlier_count": int(result.initial_inlier_count),
                 "lgcv_keep_count": result.lgcv_keep_count,
                 "post_pnp_rescore_changed_count": int(result.post_pnp_rescore_changed_count),
+                "post_pnp_rescore_corrected_count": int(result.post_pnp_rescore_corrected_count),
+                "post_pnp_rescore_worsened_count": int(result.post_pnp_rescore_worsened_count),
+                "post_pnp_rescore_correct_delta": int(result.post_pnp_rescore_correct_delta),
                 "pnp_stage_count": int(result.pnp_stage_count),
                 "selected_count": int(len(result.selected_landmark_ids)),
                 "te_cm": te_cm,
@@ -295,6 +304,9 @@ def run_cached_sparse_eval(
         "pnp_stage_count_median": _median_or_none(stage_counts),
         "lgcv_keep_count_median": _median_or_none(lgcv_keep_counts),
         "post_pnp_rescore_changed_count_median": _median_or_none(post_pnp_changed_counts),
+        "post_pnp_rescore_corrected_count_median": _median_or_none(post_pnp_corrected_counts),
+        "post_pnp_rescore_worsened_count_median": _median_or_none(post_pnp_worsened_counts),
+        "post_pnp_rescore_correct_delta_median": _median_or_none(post_pnp_correct_deltas),
         "post_pnp_candidate_rescore_enabled": bool(cfg.post_pnp_candidate_rescore),
         "candidate_artifact": artifact.summarize_candidate_availability(),
     }
