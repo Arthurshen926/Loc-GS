@@ -10,6 +10,7 @@ from loc_gs.core.camera import load_camera_records
 from loc_gs.core.geometry import project_points_w2c
 from loc_gs.sparse.audit import reject_test_split
 from loc_gs.sparse.landmarks import CacheLandmarkResolver, load_gaussian_landmark_map
+from loc_gs.sparse.pose_map_frame_audit import audit_pose_map_frame
 
 
 def build_teacher_observations_from_geometry(
@@ -27,6 +28,9 @@ def build_teacher_observations_from_geometry(
     hard_negative_reprojection_px: float = 8.0,
     max_solver_weight: float = 4.0,
     max_rows: int | None = None,
+    auto_calibrate_frame: bool = True,
+    frame_calibration_max_rows: int = 2048,
+    frame_calibration_agreement_threshold_px: float = 0.05,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     split = reject_test_split(split_name, purpose="geometry teacher observations")
     payload = _load_torch_mapping(candidate_artifact)
@@ -47,11 +51,30 @@ def build_teacher_observations_from_geometry(
 
     if (target_width is None) != (target_height is None):
         raise ValueError("target_width and target_height must be provided together")
+    resolved_target_width = target_width
+    resolved_target_height = target_height
+    resolved_missing_principal_point = str(missing_principal_point)
+    frame_calibration = _frame_calibration_summary(
+        candidate_artifact=candidate_artifact,
+        point_cloud=point_cloud,
+        cameras_json=cameras_json,
+        enabled=bool(auto_calibrate_frame) and target_width is None,
+        max_rows=int(frame_calibration_max_rows),
+        agreement_threshold_px=float(frame_calibration_agreement_threshold_px),
+    )
+    if frame_calibration.get("status") == "passed":
+        resolved_target_width = int(frame_calibration["best_frame_width"])
+        resolved_target_height = int(frame_calibration["best_frame_height"])
+        best_frame = str(frame_calibration.get("best_frame", ""))
+        if best_frame.endswith("_pixel_center"):
+            resolved_missing_principal_point = "pixel_center"
+        elif best_frame.endswith("_half_extent"):
+            resolved_missing_principal_point = "half_extent"
     cameras = load_camera_records(
         cameras_json,
-        target_width=target_width,
-        target_height=target_height,
-        missing_principal_point=str(missing_principal_point),
+        target_width=resolved_target_width,
+        target_height=resolved_target_height,
+        missing_principal_point=resolved_missing_principal_point,
     )
     landmark_map = load_gaussian_landmark_map(point_cloud)
     resolver = CacheLandmarkResolver.from_pair_cache(candidate_artifact, landmark_map)
@@ -143,11 +166,55 @@ def build_teacher_observations_from_geometry(
         "hard_negative_count": int(hard_negative_count),
         "missing_camera_count": int(missing_camera_count),
         "invalid_projection_count": int(invalid_projection_count),
+        "resolved_target_width": None if resolved_target_width is None else int(resolved_target_width),
+        "resolved_target_height": None if resolved_target_height is None else int(resolved_target_height),
+        "resolved_missing_principal_point": resolved_missing_principal_point,
+        "frame_calibration_status": str(frame_calibration.get("status", "disabled")),
+        "frame_calibration_best_frame": frame_calibration.get("best_frame"),
+        "frame_calibration_auto_resize_candidates": frame_calibration.get("auto_resize_candidates", []),
         "dense_teacher_enabled": True,
         "dense_inference_enabled": False,
         "external_runtime_dependency": "forbidden",
     }
     return observations, summary
+
+
+def _frame_calibration_summary(
+    *,
+    candidate_artifact: str | Path,
+    point_cloud: str | Path,
+    cameras_json: str | Path,
+    enabled: bool,
+    max_rows: int,
+    agreement_threshold_px: float,
+) -> dict[str, object]:
+    if not enabled:
+        return {"status": "disabled"}
+    try:
+        audit = audit_pose_map_frame(
+            candidate_artifact=candidate_artifact,
+            point_cloud=point_cloud,
+            cameras_json=cameras_json,
+            max_rows=max_rows,
+            agreement_threshold_px=agreement_threshold_px,
+        )
+    except Exception as exc:
+        return {"status": "failed", "reason": str(exc)}
+    best_width = audit.get("best_frame_width")
+    best_height = audit.get("best_frame_height")
+    if audit.get("status") == "passed" and best_width is not None and best_height is not None:
+        return {
+            "status": "passed",
+            "best_frame": audit.get("best_frame"),
+            "best_frame_width": int(best_width),
+            "best_frame_height": int(best_height),
+            "auto_resize_candidates": audit.get("auto_resize_candidates", []),
+        }
+    return {
+        "status": str(audit.get("status", "failed")),
+        "best_frame": audit.get("best_frame"),
+        "auto_resize_candidates": audit.get("auto_resize_candidates", []),
+    }
 
 
 def _load_torch_mapping(path: str | Path) -> Mapping[str, Any]:

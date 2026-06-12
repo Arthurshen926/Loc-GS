@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import struct
 from pathlib import Path
@@ -61,8 +63,20 @@ def _write_cameras(path: Path, *, split_name: str = "train") -> Path:
     return path
 
 
-def _write_candidate_artifact(path: Path, cameras: Path, *, split_name: str = "train") -> Path:
-    camera = load_camera_records(cameras)["img.png"]
+def _write_candidate_artifact(
+    path: Path,
+    cameras: Path,
+    *,
+    split_name: str = "train",
+    target_width: int | None = None,
+    target_height: int | None = None,
+) -> Path:
+    camera = load_camera_records(
+        cameras,
+        target_width=target_width,
+        target_height=target_height,
+        missing_principal_point="pixel_center",
+    )["img.png"]
     projected_xy, valid = project_points_w2c(POINTS, camera.pose_w2c, camera.intrinsics)
     assert bool(valid.all())
     query_yx = np.stack([projected_xy[:, 1], projected_xy[:, 0]], axis=1)
@@ -78,7 +92,16 @@ def _write_candidate_artifact(path: Path, cameras: Path, *, split_name: str = "t
         "query_yx": torch.tensor(query_yx, dtype=torch.float32),
         "landmark_id": torch.tensor([[0, 1], [1, 0], [2, 3], [3, 2]], dtype=torch.int64),
         "cosine": torch.tensor([[0.1, 0.9], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3]], dtype=torch.float32),
-        "label": torch.full((4,), -1, dtype=torch.int64),
+        "label": torch.zeros((4,), dtype=torch.int64),
+        "reprojection_error": torch.tensor(
+            [
+                [0.0, 1.0e3],
+                [0.0, 1.0e3],
+                [0.0, 1.0e3],
+                [0.0, 1.0e3],
+            ],
+            dtype=torch.float32,
+        ),
         "candidate_mask": torch.ones((4, 2), dtype=torch.bool),
         "query_id": [f"img.png::kp_{idx:06d}" for idx in range(4)],
         "image_id": ["img.png"] * 4,
@@ -113,6 +136,31 @@ def test_build_teacher_observations_from_geometry_projects_candidates_and_assign
     assert first_row[0]["label_role"] == "protected_support"
     assert first_row[1]["dense_consistent"] is False
     assert first_row[1]["label_role"] == "hard_negative"
+
+
+def test_build_teacher_observations_from_geometry_auto_calibrates_resized_cache_frame(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    observations, summary = build_teacher_observations_from_geometry(
+        candidate_artifact=_write_candidate_artifact(
+            tmp_path / "pairs.pt",
+            cameras,
+            target_width=120,
+            target_height=90,
+        ),
+        point_cloud=_write_ply(tmp_path / "point_cloud.ply"),
+        cameras_json=cameras,
+        scene="GreatCourt",
+        split_name="train",
+        dense_consistency_reprojection_px=1.0,
+        sparse_inlier_reprojection_px=2.0,
+    )
+
+    assert summary["frame_calibration_status"] == "passed"
+    assert summary["resolved_target_width"] == 120
+    assert summary["resolved_target_height"] == 90
+    assert summary["resolved_missing_principal_point"] == "pixel_center"
+    assert summary["dense_consistent_count"] == 4
+    assert len(observations) == 8
 
 
 def test_build_teacher_observations_from_geometry_rejects_test_split(tmp_path: Path):

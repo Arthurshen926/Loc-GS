@@ -124,6 +124,23 @@ def test_pose_map_frame_audit_identifies_resized_pixel_center_cache_frame(tmp_pa
     assert native["median_reprojection_error_px"] > 20.0
 
 
+def test_pose_map_frame_audit_auto_tests_common_resized_camera_frames(tmp_path: Path):
+    pair_cache, point_cloud, cameras = _synthetic_fixture(tmp_path)
+
+    summary = audit_pose_map_frame(
+        candidate_artifact=pair_cache,
+        point_cloud=point_cloud,
+        cameras_json=cameras,
+        max_rows=64,
+    )
+
+    assert summary["status"] == "passed"
+    assert summary["best_frame"] == "auto_120x90_pixel_center"
+    assert [120, 90] in summary["auto_resize_candidates"]
+    resized = summary["frame_hypotheses"]["auto_120x90_pixel_center"]
+    assert resized["median_abs_delta_to_stored_error_px"] < 1.0e-4
+
+
 def test_pose_map_frame_audit_rejects_test_split(tmp_path: Path):
     pair_cache, point_cloud, cameras = _synthetic_fixture(tmp_path)
     payload = torch.load(pair_cache, map_location="cpu")

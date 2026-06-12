@@ -59,10 +59,12 @@ def _audit_pose_map_frame(
     split_name = _safe_split_name(payload, meta)
     landmark_map = load_gaussian_landmark_map(point_cloud)
     resolver = CacheLandmarkResolver.from_pair_cache(candidate_artifact, landmark_map)
+    auto_resize_candidates = _auto_resize_candidates(cameras_json) if cfg.target_width is None else []
     frame_records = _camera_frame_hypotheses(
         cameras_json,
         target_width=cfg.target_width,
         target_height=cfg.target_height,
+        auto_resize_candidates=auto_resize_candidates,
     )
 
     rows = _positive_rows(payload, resolver, max_rows=cfg.max_rows)
@@ -120,6 +122,9 @@ def _audit_pose_map_frame(
         "evaluated_positive_count": int(len(rows)),
         "missing_camera_count": int(missing_camera_count),
         "best_frame": best_frame,
+        "best_frame_width": best_stats.get("width"),
+        "best_frame_height": best_stats.get("height"),
+        "auto_resize_candidates": [[int(width), int(height)] for width, height in auto_resize_candidates],
         "frame_hypotheses": frame_hypotheses,
     }
 
@@ -183,6 +188,7 @@ def _camera_frame_hypotheses(
     *,
     target_width: int | None,
     target_height: int | None,
+    auto_resize_candidates: Sequence[tuple[int, int]] = (),
 ) -> OrderedDict[str, dict[str, CameraRecord]]:
     frames: OrderedDict[str, dict[str, CameraRecord]] = OrderedDict()
     frames["native_half_extent"] = load_camera_records(cameras_json, missing_principal_point="half_extent")
@@ -200,7 +206,40 @@ def _camera_frame_hypotheses(
             target_height=target_height,
             missing_principal_point="pixel_center",
         )
+    else:
+        for width, height in auto_resize_candidates:
+            frames[f"auto_{int(width)}x{int(height)}_half_extent"] = load_camera_records(
+                cameras_json,
+                target_width=int(width),
+                target_height=int(height),
+                missing_principal_point="half_extent",
+            )
+            frames[f"auto_{int(width)}x{int(height)}_pixel_center"] = load_camera_records(
+                cameras_json,
+                target_width=int(width),
+                target_height=int(height),
+                missing_principal_point="pixel_center",
+            )
     return frames
+
+
+def _auto_resize_candidates(cameras_json: Path) -> list[tuple[int, int]]:
+    native_records = load_camera_records(cameras_json, missing_principal_point="half_extent")
+    source_sizes: OrderedDict[tuple[int, int], None] = OrderedDict()
+    for record in native_records.values():
+        source_sizes[(int(record.intrinsics.width), int(record.intrinsics.height))] = None
+
+    candidates: OrderedDict[tuple[int, int], None] = OrderedDict()
+    for source_width, source_height in source_sizes:
+        for divisor in (2, 3, 4, 6, 8):
+            if source_width % divisor != 0 or source_height % divisor != 0:
+                continue
+            width = source_width // divisor
+            height = source_height // divisor
+            if width < 16 or height < 16 or (width, height) == (source_width, source_height):
+                continue
+            candidates[(int(width), int(height))] = None
+    return list(candidates.keys())
 
 
 def _positive_rows(payload: Mapping[str, Any], resolver: CacheLandmarkResolver, *, max_rows: int) -> list[_AuditRow]:

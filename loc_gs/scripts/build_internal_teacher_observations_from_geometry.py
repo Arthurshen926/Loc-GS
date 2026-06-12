@@ -70,6 +70,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--hard_negative_reprojection_px", type=float, default=8.0)
     parser.add_argument("--max_solver_weight", type=float, default=4.0)
     parser.add_argument("--max_rows", type=int, default=None)
+    parser.add_argument("--disable_frame_auto_calibration", action="store_true")
+    parser.add_argument("--frame_calibration_max_rows", type=int, default=2048)
+    parser.add_argument("--frame_calibration_agreement_threshold_px", type=float, default=0.05)
     return parser
 
 
@@ -90,6 +93,9 @@ def main(argv: list[str] | None = None) -> int:
         hard_negative_reprojection_px=float(args.hard_negative_reprojection_px),
         max_solver_weight=float(args.max_solver_weight),
         max_rows=args.max_rows,
+        auto_calibrate_frame=not bool(args.disable_frame_auto_calibration),
+        frame_calibration_max_rows=int(args.frame_calibration_max_rows),
+        frame_calibration_agreement_threshold_px=float(args.frame_calibration_agreement_threshold_px),
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_observations = args.output_dir / str(args.output_name)
@@ -105,6 +111,9 @@ def main(argv: list[str] | None = None) -> int:
         "hard_negative_reprojection_px": float(args.hard_negative_reprojection_px),
         "max_solver_weight": float(args.max_solver_weight),
         "max_rows": None if args.max_rows is None else int(args.max_rows),
+        "frame_auto_calibration": not bool(args.disable_frame_auto_calibration),
+        "frame_calibration_max_rows": int(args.frame_calibration_max_rows),
+        "frame_calibration_agreement_threshold_px": float(args.frame_calibration_agreement_threshold_px),
     }
     command = [
         sys.executable,
