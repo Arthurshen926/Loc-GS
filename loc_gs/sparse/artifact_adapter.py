@@ -180,6 +180,8 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
     keypoint_ids_field = _field(payload, "keypoint_id", required=False)
     phase_field = _field(payload, "source_phase", required=False)
     masks_field = _field(payload, "candidate_mask", required=False)
+    query_desc_field = _first_field(payload, ("query_desc", "query_descriptor", "candidate_query_desc"))
+    landmark_desc_field = _first_field(payload, ("landmark_desc", "landmark_descriptor", "candidate_landmark_desc"))
     dense_consistent_field = _first_field(payload, ("dense_consistent", "candidate_dense_consistent"))
     sparse_inlier_field = _first_field(payload, ("sparse_inlier", "candidate_sparse_inlier"))
     reprojection_error_field = _first_field(
@@ -205,6 +207,8 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
         [str(v) for v in _rows(phase_field, max_rows=max_rows)] if phase_field is not None else [split_name] * len(query_ids)
     )
     masks = _rows(masks_field, max_rows=max_rows) if masks_field is not None else None
+    query_descriptors = _rows(query_desc_field, max_rows=max_rows) if query_desc_field is not None else None
+    landmark_descriptors = _rows(landmark_desc_field, max_rows=max_rows) if landmark_desc_field is not None else None
     dense_consistent = _rows(dense_consistent_field, max_rows=max_rows) if dense_consistent_field is not None else None
     sparse_inlier = _rows(sparse_inlier_field, max_rows=max_rows) if sparse_inlier_field is not None else None
     reprojection_error = (
@@ -230,6 +234,8 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
         raise ValueError(f"candidate artifact field length mismatch: query_yx={row_count}, lengths={lengths}")
     optional_row_fields = {
         "candidate_mask": masks,
+        "query_desc": query_descriptors,
+        "landmark_desc": landmark_descriptors,
         "dense_consistent": dense_consistent,
         "sparse_inlier": sparse_inlier,
         "reprojection_error": reprojection_error,
@@ -261,8 +267,10 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
             image_id,
             {
                 "keypoint_xy": [],
+                "query_descriptors": [],
                 "candidate_landmark_ids": [],
                 "candidate_scores": [],
+                "candidate_landmark_descriptors": [],
                 "teacher_labels": [],
                 "candidate_valid_mask": [],
                 "candidate_geometric_correct": [],
@@ -279,8 +287,14 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
             },
         )
         bucket["keypoint_xy"].append([float(yx[1]), float(yx[0])])
+        if query_descriptors is not None:
+            bucket["query_descriptors"].append([float(v) for v in query_descriptors[row_idx]])
         bucket["candidate_landmark_ids"].append(ids)
         bucket["candidate_scores"].append(row_scores)
+        if landmark_descriptors is not None:
+            bucket["candidate_landmark_descriptors"].append(
+                [[float(v) for v in descriptor] for descriptor in landmark_descriptors[row_idx]]
+            )
         bucket["teacher_labels"].append(teacher_label)
         bucket["candidate_valid_mask"].append(valid_mask)
         bucket["candidate_geometric_correct"].append(correct)
@@ -314,8 +328,10 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
             split_name=split_name,
             query_id=image_id,
             keypoint_xy=bucket["keypoint_xy"],
+            query_descriptors=bucket["query_descriptors"] or None,
             candidate_landmark_ids=bucket["candidate_landmark_ids"],
             candidate_scores=bucket["candidate_scores"],
+            candidate_landmark_descriptors=bucket["candidate_landmark_descriptors"] or None,
             teacher_labels=bucket["teacher_labels"],
             candidate_valid_mask=bucket["candidate_valid_mask"],
             candidate_geometric_correct=bucket["candidate_geometric_correct"],
@@ -353,8 +369,21 @@ def _batch_to_json_dict(batch: SparseCandidateBatch) -> dict[str, object]:
         "split_name": batch.split_name,
         "query_id": batch.query_id,
         "keypoint_xy": [[float(v) for v in xy[:2]] for xy in batch.keypoint_xy],
+        "query_descriptors": (
+            [[float(v) for v in desc] for desc in batch.query_descriptors]
+            if batch.query_descriptors is not None
+            else None
+        ),
         "candidate_landmark_ids": [[int(v) for v in row] for row in batch.candidate_landmark_ids],
         "candidate_scores": [[float(v) for v in row] for row in batch.candidate_scores],
+        "candidate_landmark_descriptors": (
+            [
+                [[float(v) for v in descriptor] for descriptor in row]
+                for row in batch.candidate_landmark_descriptors
+            ]
+            if batch.candidate_landmark_descriptors is not None
+            else None
+        ),
         "teacher_labels": list(batch.teacher_labels) if batch.teacher_labels is not None else None,
         "candidate_valid_mask": batch.candidate_valid_mask,
         "candidate_geometric_correct": batch.candidate_geometric_correct,

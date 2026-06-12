@@ -294,14 +294,14 @@ def test_eval_internal_sparse_cached_cli_accepts_landmark_selector(tmp_path: Pat
 
 def test_eval_internal_sparse_cached_cli_accepts_descriptor_fusion(tmp_path: Path):
     cameras = _write_cameras(tmp_path / "cameras.json")
-    fusion_path = tmp_path / "descriptor_fusion.json"
+    fusion_path = tmp_path / "descriptor_fusion.pt"
     fusion = DescriptorFusionModel(
         fused_descriptors={str(idx): [1.0, 0.0] for idx in range(6)},
         landmark_scores={str(idx): 3.0 for idx in range(6)},
         negative_scores={},
         score_scale=1.0,
     )
-    fusion_path.write_text(json.dumps(fusion.to_json_dict(), sort_keys=True), encoding="utf-8")
+    torch.save(fusion.to_torch_dict(), fusion_path)
     out = tmp_path / "eval_fusion"
 
     rc = main(

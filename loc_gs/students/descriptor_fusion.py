@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import torch
 
 from loc_gs.sparse.correspondences import SparseCandidateBatch
 from loc_gs.sparse.audit import reject_test_split
@@ -45,6 +46,26 @@ class DescriptorFusionModel:
             "score_scale": float(self.score_scale),
         }
 
+    def to_torch_dict(self) -> dict[str, object]:
+        keys = sorted(
+            self.fused_descriptors,
+            key=lambda value: (0, int(value)) if value.lstrip("-").isdigit() else (1, value),
+        )
+        descriptor_dim = len(self.fused_descriptors[keys[0]]) if keys else 0
+        fused = (
+            torch.tensor([self.fused_descriptors[key] for key in keys], dtype=torch.float32)
+            if keys
+            else torch.zeros((0, descriptor_dim), dtype=torch.float32)
+        )
+        return {
+            "schema_version": "internal_descriptor_fusion_v1",
+            "landmark_ids": keys,
+            "fused_descriptors": fused,
+            "landmark_scores": torch.tensor([float(self.landmark_scores.get(key, 0.0)) for key in keys], dtype=torch.float32),
+            "negative_scores": torch.tensor([float(self.negative_scores.get(key, 0.0)) for key in keys], dtype=torch.float32),
+            "score_scale": float(self.score_scale),
+        }
+
     @classmethod
     def from_json_dict(cls, payload: dict[str, object]) -> "DescriptorFusionModel":
         if payload.get("schema_version") != "internal_descriptor_fusion_v1":
@@ -56,6 +77,25 @@ class DescriptorFusionModel:
             },
             landmark_scores={str(key): float(value) for key, value in dict(payload.get("landmark_scores", {})).items()},
             negative_scores={str(key): float(value) for key, value in dict(payload.get("negative_scores", {})).items()},
+            score_scale=float(payload.get("score_scale", 1.0)),
+        )
+
+    @classmethod
+    def from_torch_dict(cls, payload: Mapping[str, object]) -> "DescriptorFusionModel":
+        if payload.get("schema_version") != "internal_descriptor_fusion_v1":
+            raise ValueError(f"unsupported descriptor fusion schema: {payload.get('schema_version')}")
+        keys = [str(key) for key in payload.get("landmark_ids", [])]
+        fused = _array(payload.get("fused_descriptors"), name="fused_descriptors")
+        positive = _array(payload.get("landmark_scores"), name="landmark_scores")
+        negative = _array(payload.get("negative_scores"), name="negative_scores")
+        if fused.ndim != 2:
+            raise ValueError("descriptor fusion fused_descriptors must have shape [N,D]")
+        if len(keys) != fused.shape[0] or positive.shape[0] != fused.shape[0] or negative.shape[0] != fused.shape[0]:
+            raise ValueError("descriptor fusion torch fields must share the same landmark count")
+        return cls(
+            fused_descriptors={key: [float(item) for item in fused[idx].tolist()] for idx, key in enumerate(keys)},
+            landmark_scores={key: float(positive[idx]) for idx, key in enumerate(keys) if float(positive[idx]) != 0.0},
+            negative_scores={key: float(negative[idx]) for idx, key in enumerate(keys) if float(negative[idx]) != 0.0},
             score_scale=float(payload.get("score_scale", 1.0)),
         )
 
@@ -146,17 +186,41 @@ def descriptor_fusion_score_rows(batch: SparseCandidateBatch, model: DescriptorF
     batch.validate()
     rows: list[list[float]] = []
     valid_rows = batch.candidate_valid_mask or []
+    query_descriptors = batch.query_descriptors
+    needed_landmark_ids = {str(int(landmark_id)) for row in batch.candidate_landmark_ids for landmark_id in row}
+    fused_cache = {
+        str(key): _normalize(np.asarray(value, dtype=np.float64).reshape(-1))
+        for key, value in model.fused_descriptors.items()
+        if str(key) in needed_landmark_ids
+    }
+    normalized_queries = (
+        [_normalize(np.asarray(desc, dtype=np.float64).reshape(-1)) for desc in query_descriptors]
+        if query_descriptors is not None
+        else None
+    )
     for row_idx, landmark_ids in enumerate(batch.candidate_landmark_ids):
         row: list[float] = []
+        query_desc = None if normalized_queries is None else normalized_queries[row_idx]
         for rank, landmark_id in enumerate(landmark_ids):
             valid = True if not valid_rows else bool(valid_rows[row_idx][rank])
-            row.append(model.score_landmark(int(landmark_id)) if valid else -1.0e12)
+            if not valid:
+                row.append(-1.0e12)
+                continue
+            prior_score = model.score_landmark(int(landmark_id))
+            descriptor_score = _descriptor_score(query_desc, fused_cache.get(str(int(landmark_id))))
+            row.append(float(prior_score + descriptor_score))
         rows.append(row)
     return rows
 
 
 def load_descriptor_fusion(path: str | Path) -> DescriptorFusionModel:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    source = Path(path)
+    if source.suffix.lower() == ".pt":
+        payload = torch.load(source, map_location="cpu")
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"descriptor fusion torch payload must contain an object: {path}")
+        return DescriptorFusionModel.from_torch_dict(payload)
+    payload = json.loads(source.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"descriptor fusion JSON must contain an object: {path}")
     return DescriptorFusionModel.from_json_dict(payload)
@@ -175,3 +239,11 @@ def _normalize(value: np.ndarray) -> np.ndarray:
     if norm <= 1.0e-12:
         return np.asarray(value, dtype=np.float64)
     return np.asarray(value, dtype=np.float64) / norm
+
+
+def _descriptor_score(query_desc: np.ndarray | None, fused_desc: np.ndarray | None) -> float:
+    if query_desc is None or fused_desc is None:
+        return 0.0
+    if query_desc.shape != fused_desc.shape:
+        return 0.0
+    return float(query_desc @ fused_desc)

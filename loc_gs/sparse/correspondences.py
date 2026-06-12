@@ -12,6 +12,8 @@ class SparseCandidateBatch:
     keypoint_xy: Sequence[Sequence[float]]
     candidate_landmark_ids: Sequence[Sequence[int]]
     candidate_scores: Sequence[Sequence[float]]
+    query_descriptors: Sequence[Sequence[float]] | None = None
+    candidate_landmark_descriptors: Sequence[Sequence[Sequence[float]]] | None = None
     teacher_labels: Sequence[int | None] | None = None
     candidate_valid_mask: Sequence[Sequence[bool]] | None = None
     candidate_geometric_correct: Sequence[Sequence[bool]] | None = None
@@ -40,6 +42,13 @@ class SparseCandidateBatch:
             raise ValueError("keypoint_xy and candidate_landmark_ids must have the same keypoint count")
         if len(self.candidate_scores) != len(self.candidate_landmark_ids):
             raise ValueError("candidate_scores and candidate_landmark_ids must have the same keypoint count")
+        if self.query_descriptors is not None and len(self.query_descriptors) != len(self.keypoint_xy):
+            raise ValueError("query_descriptors must have the same keypoint count")
+        if (
+            self.candidate_landmark_descriptors is not None
+            and len(self.candidate_landmark_descriptors) != len(self.keypoint_xy)
+        ):
+            raise ValueError("candidate_landmark_descriptors must have the same keypoint count")
         if self.teacher_labels is not None and len(self.teacher_labels) != len(self.keypoint_xy):
             raise ValueError("teacher_labels must have the same keypoint count")
         if self.candidate_valid_mask is not None and len(self.candidate_valid_mask) != len(self.keypoint_xy):
@@ -72,6 +81,14 @@ class SparseCandidateBatch:
         for row_idx, (ids, scores) in enumerate(zip(self.candidate_landmark_ids, self.candidate_scores)):
             if len(ids) != len(scores):
                 raise ValueError(f"candidate ids and scores must have the same top-k length at row {row_idx}")
+        if self.candidate_landmark_descriptors is not None:
+            for row_idx, (ids, descriptors) in enumerate(
+                zip(self.candidate_landmark_ids, self.candidate_landmark_descriptors)
+            ):
+                if len(ids) != len(descriptors):
+                    raise ValueError(
+                        f"candidate ids and landmark descriptors must have the same top-k length at row {row_idx}"
+                    )
         if self.candidate_valid_mask is not None:
             for row_idx, (ids, mask) in enumerate(zip(self.candidate_landmark_ids, self.candidate_valid_mask)):
                 if len(ids) != len(mask):

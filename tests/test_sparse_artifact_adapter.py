@@ -26,6 +26,18 @@ def _write_pair_cache(path: Path, *, split_name: str = "train") -> Path:
             },
         },
         "query_yx": torch.tensor([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]], dtype=torch.float32),
+        "query_desc": torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]],
+            dtype=torch.float32,
+        ),
+        "landmark_desc": torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]],
+                [[0.0, 1.0], [1.0, 0.0], [0.5, 0.5]],
+                [[0.5, 0.5], [1.0, 0.0], [0.0, 1.0]],
+            ],
+            dtype=torch.float32,
+        ),
         "landmark_id": torch.tensor([[101, 102, 103], [201, 202, 203], [301, 302, 303]], dtype=torch.int64),
         "cosine": torch.tensor([[0.9, 0.8, 0.7], [0.6, 0.5, 0.4], [0.3, 0.2, 0.1]], dtype=torch.float32),
         "margin": torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
@@ -94,6 +106,9 @@ def test_listwise_artifact_adapter_groups_rows_into_internal_candidate_batches(t
     assert first.candidate_query_score[1] == pytest.approx([0.85, 0.85, 0.85])
     assert first.candidate_landmark_prior[0] == pytest.approx([0.1, 0.9, 0.2])
     assert first.candidate_landmark_prior[1] == pytest.approx([0.3, 0.4, 0.5])
+    assert first.query_descriptors == [[1.0, 0.0], [0.0, 1.0]]
+    assert first.candidate_landmark_descriptors is not None
+    assert first.candidate_landmark_descriptors[0] == [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]]
 
     summary = artifact.summarize_candidate_availability()
     assert summary["keypoint_count"] == 3

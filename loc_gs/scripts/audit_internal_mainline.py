@@ -72,6 +72,8 @@ INTERNAL_MAINLINE_RELATIVE_PATHS: tuple[str, ...] = (
     "scripts/run_internal_mainline_smoke.py",
     "scripts/run_internal_sparse_gate.py",
     "scripts/run_internal_sparse_smoke.py",
+    "scripts/train_internal_descriptor_fusion.py",
+    "scripts/train_internal_landmark_selector.py",
     "scripts/train_internal_sparse_candidate_scorer.py",
     "scripts/train_internal_sparse_students.py",
 )
