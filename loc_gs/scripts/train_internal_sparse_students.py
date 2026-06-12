@@ -12,6 +12,7 @@ from typing import Iterable, Mapping
 import torch
 
 from loc_gs.core.camera import load_camera_records
+from loc_gs.simulation.render_manifest import load_simulation_plan_rows
 from loc_gs.simulation.query_sampler import SimulationSamplerConfig, sample_simulated_queries
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 from loc_gs.sparse.audit import reject_test_split
@@ -55,6 +56,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--cameras_json", type=Path, required=True)
     parser.add_argument("--candidate_artifact", type=Path, required=True)
     parser.add_argument("--solver_feedback_labels", type=Path, required=True)
+    parser.add_argument("--render_manifest", type=Path, default=None)
+    parser.add_argument("--require_rendered_rgb", action="store_true")
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--sample_count", type=int, required=True)
     parser.add_argument("--seed", type=int, default=13)
@@ -88,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         roll_std_deg=float(args.roll_std_deg),
     )
     feedback_rows = load_solver_feedback_label_rows(args.solver_feedback_labels)
+    render_records = load_simulation_plan_rows(args.render_manifest) if args.render_manifest is not None else None
     artifact = load_listwise_candidate_artifact(args.candidate_artifact)
     camera_records = load_camera_records(args.cameras_json)
     candidate_source_ids = {batch.query_id for batch in artifact.batches}
@@ -102,8 +106,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg=OnlineEpisodeConfig(
             max_keypoints_per_episode=None
             if args.max_keypoints_per_episode is None
-            else int(args.max_keypoints_per_episode)
+            else int(args.max_keypoints_per_episode),
+            require_rendered_rgb=bool(args.require_rendered_rgb),
         ),
+        render_records=render_records,
     )
 
     payload = torch.load(args.candidate_artifact, map_location="cpu")
@@ -180,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
         "cameras_json": str(args.cameras_json),
         "candidate_artifact": str(args.candidate_artifact),
         "solver_feedback_labels": str(args.solver_feedback_labels),
+        "render_manifest": None if args.render_manifest is None else str(args.render_manifest),
         "online_distilled_candidate_artifact": str(online_artifact_path),
         "hyperparameters": {
             "sample_count": int(args.sample_count),
@@ -189,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
             "pitch_std_deg": float(args.pitch_std_deg),
             "roll_std_deg": float(args.roll_std_deg),
             "max_keypoints_per_episode": args.max_keypoints_per_episode,
+            "require_rendered_rgb": bool(args.require_rendered_rgb),
             "dense_consistency_reprojection_px": float(args.dense_consistency_reprojection_px),
             "sparse_inlier_reprojection_px": float(args.sparse_inlier_reprojection_px),
             "hard_negative_reprojection_px": float(args.hard_negative_reprojection_px),

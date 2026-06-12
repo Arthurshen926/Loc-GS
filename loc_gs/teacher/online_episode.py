@@ -15,6 +15,7 @@ from loc_gs.teacher.distillation_artifact import SolverFeedbackRow
 @dataclass(frozen=True)
 class OnlineEpisodeConfig:
     max_keypoints_per_episode: int | None = None
+    require_rendered_rgb: bool = False
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,8 @@ class OnlineSparseDenseEpisode:
     feedback_matched: bool
     dense_helped: bool
     distill_weight: float
+    render_rgb_path: str | None = None
+    render_ready: bool = False
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -53,12 +56,18 @@ def build_online_sparse_dense_episodes(
     feedback_rows: Sequence[SolverFeedbackRow],
     *,
     cfg: OnlineEpisodeConfig | None = None,
+    render_records: Sequence[Mapping[str, Any]] | None = None,
 ) -> OnlineEpisodeList:
     if cfg is None:
         cfg = OnlineEpisodeConfig()
     artifact_split = reject_test_split(artifact.split_name, purpose="online sparse-dense episode generation")
     batches_by_query = {batch.query_id: batch for batch in artifact.batches}
     feedback_by_query = {row.query_id: row for row in feedback_rows}
+    render_by_query = {
+        str(record.get("synthetic_query_id")): record
+        for record in (render_records or [])
+        if record.get("synthetic_query_id")
+    }
     for feedback in feedback_rows:
         reject_test_split(feedback.split_name, purpose="online sparse-dense episode generation")
         if feedback.scene not in {"unknown", artifact.scene}:
@@ -82,6 +91,11 @@ def build_online_sparse_dense_episodes(
             [[{"geometric_correct": bool(value)} for value in row] for row in correct_rows]
         )
         feedback = feedback_by_query.get(spec.source_image_id)
+        render_record = render_by_query.get(spec.synthetic_query_id)
+        render_rgb_path = None if render_record is None else str(render_record.get("rgb_path") or "")
+        render_ready = bool(render_record is not None and render_record.get("rgb_exists"))
+        if bool(cfg.require_rendered_rgb) and not render_ready:
+            raise ValueError(f"missing rendered RGB for online episode: {spec.synthetic_query_id}")
         episodes.append(
             OnlineSparseDenseEpisode(
                 scene=artifact.scene,
@@ -98,6 +112,8 @@ def build_online_sparse_dense_episodes(
                 feedback_matched=bool(feedback is not None),
                 dense_helped=bool(feedback.dense_helped) if feedback is not None else False,
                 distill_weight=float(feedback.distill_weight) if feedback is not None else 0.0,
+                render_rgb_path=render_rgb_path or None,
+                render_ready=render_ready,
             )
         )
     return OnlineEpisodeList(episodes, missing_candidate_count=missing_candidate_count)
@@ -113,6 +129,8 @@ def summarize_online_sparse_dense_episodes(episodes: Sequence[OnlineSparseDenseE
         "source_image_count": int(len({episode.source_image_id for episode in episodes})),
         "dense_helped_episode_count": int(sum(1 for episode in episodes if episode.dense_helped)),
         "feedback_matched_episode_count": int(sum(1 for episode in episodes if episode.feedback_matched)),
+        "render_ready_episode_count": int(sum(1 for episode in episodes if episode.render_ready)),
+        "missing_render_episode_count": int(sum(1 for episode in episodes if not episode.render_ready)),
         "top1_correct": int(sum(episode.top1_correct for episode in episodes)),
         "topk_available": int(sum(episode.topk_available for episode in episodes)),
         "oracle_gap": int(sum(episode.oracle_gap for episode in episodes)),

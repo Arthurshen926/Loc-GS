@@ -73,6 +73,19 @@ def _write_feedback(path: Path) -> Path:
     return path
 
 
+def _write_render_manifest(path: Path) -> Path:
+    rows = [
+        {
+            "synthetic_query_id": f"sim/GreatCourt/train/{idx:06d}",
+            "rgb_path": f"/renders/{idx:06d}.png",
+            "rgb_exists": True,
+        }
+        for idx in range(4)
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    return path
+
+
 def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_path: Path):
     out = tmp_path / "train"
 
@@ -88,6 +101,8 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
             str(_write_pair_cache(tmp_path / "pairs.pt")),
             "--solver_feedback_labels",
             str(_write_feedback(tmp_path / "labels.jsonl")),
+            "--render_manifest",
+            str(_write_render_manifest(tmp_path / "render_manifest.jsonl")),
             "--output_dir",
             str(out),
             "--sample_count",
@@ -116,8 +131,12 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     assert manifest["dense_teacher_enabled"] is True
     assert manifest["dense_inference_enabled"] is False
     assert manifest["external_runtime_dependency"] == "forbidden"
+    assert manifest["render_manifest"] == str(tmp_path / "render_manifest.jsonl")
+    assert manifest["hyperparameters"]["require_rendered_rgb"] is False
     assert summary["online_episode_count"] == 4
     assert summary["missing_candidate_count"] == 0
+    assert summary["render_ready_episode_count"] == 4
+    assert summary["missing_render_episode_count"] == 0
     assert manifest["hyperparameters"]["camera_sampling_source"] == "candidate_artifact_sources"
     assert summary["student_modules"] == [
         "correspondence_scorer",

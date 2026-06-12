@@ -68,6 +68,55 @@ def test_online_sparse_dense_episodes_bind_simulated_queries_to_candidates_and_f
     assert summary["dense_helped_episode_count"] == 1
 
 
+def test_online_sparse_dense_episodes_bind_render_manifest_records(tmp_path: Path):
+    artifact = load_listwise_candidate_artifact(_write_pair_cache(tmp_path / "pairs.pt"))
+    specs = [_spec(0, "a.png"), _spec(1, "b.png")]
+    episodes = build_online_sparse_dense_episodes(
+        specs,
+        artifact,
+        [],
+        render_records=[
+            {
+                "synthetic_query_id": "sim/GreatCourt/train/000000",
+                "rgb_path": "/renders/000000.png",
+                "rgb_exists": True,
+            },
+            {
+                "synthetic_query_id": "sim/GreatCourt/train/000001",
+                "rgb_path": "/renders/000001.png",
+                "rgb_exists": False,
+            },
+        ],
+    )
+
+    assert episodes[0].render_rgb_path == "/renders/000000.png"
+    assert episodes[0].render_ready is True
+    assert episodes[1].render_rgb_path == "/renders/000001.png"
+    assert episodes[1].render_ready is False
+    summary = summarize_online_sparse_dense_episodes(episodes)
+    assert summary["render_ready_episode_count"] == 1
+    assert summary["missing_render_episode_count"] == 1
+
+
+def test_online_sparse_dense_episodes_can_require_rendered_rgb(tmp_path: Path):
+    artifact = load_listwise_candidate_artifact(_write_pair_cache(tmp_path / "pairs.pt"))
+
+    with pytest.raises(ValueError, match="missing rendered RGB"):
+        build_online_sparse_dense_episodes(
+            [_spec(0, "a.png")],
+            artifact,
+            [],
+            cfg=OnlineEpisodeConfig(require_rendered_rgb=True),
+            render_records=[
+                {
+                    "synthetic_query_id": "sim/GreatCourt/train/000000",
+                    "rgb_path": "/renders/000000.png",
+                    "rgb_exists": False,
+                }
+            ],
+        )
+
+
 def test_online_sparse_dense_episodes_reject_test_split(tmp_path: Path):
     artifact = load_listwise_candidate_artifact(_write_pair_cache(tmp_path / "pairs.pt"))
 
