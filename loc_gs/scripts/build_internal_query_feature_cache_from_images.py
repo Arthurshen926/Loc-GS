@@ -40,6 +40,8 @@ def build_manifest(
     allow_missing: bool,
     max_keypoints: int,
     score_threshold: float | None,
+    target_width: int | None,
+    target_height: int | None,
 ) -> dict[str, object]:
     split = reject_test_split(split_name, purpose="internal query feature cache from images manifest")
     return {
@@ -65,6 +67,8 @@ def build_manifest(
             "allow_missing": bool(allow_missing),
             "max_keypoints": int(max_keypoints),
             "score_threshold": None if score_threshold is None else float(score_threshold),
+            "target_width": None if target_width is None else int(target_width),
+            "target_height": None if target_height is None else int(target_height),
         },
     }
 
@@ -90,6 +94,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--allow_missing", action="store_true")
     parser.add_argument("--max_keypoints", type=int, default=2048)
     parser.add_argument("--score_threshold", type=float, default=None)
+    parser.add_argument("--target_width", type=int, default=None)
+    parser.add_argument("--target_height", type=int, default=None)
     return parser
 
 
@@ -121,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=int(args.batch_size),
         strict_missing=not bool(args.allow_missing),
         amp=bool(args.amp),
+        target_width=args.target_width,
+        target_height=args.target_height,
     )
     command = [
         sys.executable,
@@ -142,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
         allow_missing=bool(args.allow_missing),
         max_keypoints=int(args.max_keypoints),
         score_threshold=args.score_threshold,
+        target_width=args.target_width,
+        target_height=args.target_height,
     )
     split_audit = {
         "schema_version": "internal_split_audit_v1",

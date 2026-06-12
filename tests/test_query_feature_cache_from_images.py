@@ -56,6 +56,33 @@ def test_query_feature_cache_from_images_samples_sparse_superpoint_features(tmp_
     assert torch.allclose(payload["query_desc"], torch.tensor([[1.0, 0.0]], dtype=torch.float32))
 
 
+def test_query_feature_cache_from_images_accepts_explicit_target_frame(tmp_path: Path):
+    data_root = tmp_path / "GreatCourt"
+    _write_image(data_root / "seq2" / "frame00006.png", 32)
+    output = tmp_path / "query_features.pt"
+
+    summary = extract_superpoint_query_feature_cache_for_queries(
+        scene="GreatCourt",
+        split_name="train_dev",
+        data_root=data_root,
+        query_ids=["seq2/frame00006.png"],
+        output_cache=output,
+        model=_FakeSuperPoint(),
+        device=torch.device("cpu"),
+        max_keypoints=1,
+        target_width=8,
+        target_height=8,
+    )
+
+    payload = torch.load(output, map_location="cpu")
+    assert summary["target_width"] == 8
+    assert summary["target_height"] == 8
+    assert summary["feature_width"] == 1
+    assert summary["feature_height"] == 1
+    assert payload["metadata"]["target_width"] == 8
+    assert payload["metadata"]["target_height"] == 8
+
+
 def test_query_feature_cache_from_images_cli_writes_manifest_summary_and_cache(tmp_path: Path, monkeypatch):
     data_root = tmp_path / "GreatCourt"
     _write_image(data_root / "seq2" / "frame00006.png", 32)
@@ -82,6 +109,10 @@ def test_query_feature_cache_from_images_cli_writes_manifest_summary_and_cache(t
             "cpu",
             "--max_keypoints",
             "1",
+            "--target_width",
+            "8",
+            "--target_height",
+            "8",
             "--allow_missing",
         ]
     )
@@ -93,6 +124,9 @@ def test_query_feature_cache_from_images_cli_writes_manifest_summary_and_cache(t
     split_audit = json.loads((out / "split_audit.json").read_text(encoding="utf-8"))
     assert payload["image_id"] == ["seq2/frame00006.png"]
     assert summary["keypoint_count"] == 1
+    assert summary["target_width"] == 8
+    assert manifest["hyperparameters"]["target_width"] == 8
+    assert manifest["hyperparameters"]["target_height"] == 8
     assert manifest["schema_version"] == "internal_query_feature_cache_from_images_manifest_v1"
     assert manifest["external_runtime_dependency"] == "forbidden"
     assert split_audit["audit_status"] == "passed"

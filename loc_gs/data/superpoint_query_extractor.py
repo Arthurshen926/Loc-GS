@@ -148,6 +148,8 @@ def extract_superpoint_query_feature_cache_for_queries(
     batch_size: int = 16,
     strict_missing: bool = True,
     amp: bool = False,
+    target_width: int | None = None,
+    target_height: int | None = None,
 ) -> dict[str, object]:
     split = reject_test_split(split_name, purpose="internal SuperPoint image query feature cache")
     root = Path(data_root)
@@ -168,10 +170,16 @@ def extract_superpoint_query_feature_cache_for_queries(
     if missing and strict_missing:
         raise FileNotFoundError(f"missing query images under {root}: {missing[:10]}")
 
+    if (target_width is None) != (target_height is None):
+        raise ValueError("target_width and target_height must be provided together")
     target_h = 0
     target_w = 0
     if resolved:
-        target_h, target_w = _target_size_for_superpoint(resolved[0][1])
+        target_h, target_w = _target_size_for_superpoint(
+            resolved[0][1],
+            target_width=target_width,
+            target_height=target_height,
+        )
     device_obj = torch.device(device)
     model = model.to(device_obj)
     model.eval()
@@ -253,6 +261,8 @@ def extract_superpoint_query_feature_cache_for_queries(
             "split_name": split,
             "source": "internal_superpoint_image_sampler",
             "data_root": str(root),
+            "target_height": int(target_h),
+            "target_width": int(target_w),
             "split_audit": dict(split_audit),
         },
         "image_id": [str(row["image_id"]) for row in rows],
@@ -299,7 +309,22 @@ def _resolve_query_path(data_root: Path, query_id: str) -> Path:
     return candidate
 
 
-def _target_size_for_superpoint(path: Path) -> tuple[int, int]:
+def _target_size_for_superpoint(
+    path: Path,
+    *,
+    target_width: int | None = None,
+    target_height: int | None = None,
+) -> tuple[int, int]:
+    if (target_width is None) != (target_height is None):
+        raise ValueError("target_width and target_height must be provided together")
+    if target_width is not None and target_height is not None:
+        target_h = (int(target_height) // 8) * 8
+        target_w = (int(target_width) // 8) * 8
+        if target_h != int(target_height) or target_w != int(target_width):
+            raise ValueError("target_width and target_height must be divisible by 8")
+        if target_h <= 0 or target_w <= 0:
+            raise ValueError("target_width and target_height must be positive")
+        return target_h, target_w
     with Image.open(path) as image:
         width, height = image.size
     target_h = (int(height) // 8) * 8
