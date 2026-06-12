@@ -16,6 +16,7 @@ from loc_gs.simulation.render_manifest import load_simulation_plan_rows
 from loc_gs.simulation.query_sampler import SimulationSamplerConfig, sample_simulated_queries
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 from loc_gs.sparse.audit import reject_test_split
+from loc_gs.students.candidate_mlp_scorer import CandidateMLPScorerConfig, train_candidate_mlp_scorer
 from loc_gs.students.descriptor_fusion import DescriptorFusionConfig, train_descriptor_fusion_from_payload
 from loc_gs.students.detector_student import DetectorStudentConfig, train_detector_student
 from loc_gs.students.landmark_selector import LandmarkSelectorConfig, train_landmark_selector
@@ -73,6 +74,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=0.1)
     parser.add_argument("--rank_feature_scale", type=float, default=1.0)
+    parser.add_argument("--candidate_mlp_hidden_dim", type=int, default=32)
+    parser.add_argument("--candidate_mlp_learning_rate", type=float, default=0.03)
+    parser.add_argument("--candidate_mlp_listwise_loss_weight", type=float, default=1.0)
     parser.add_argument("--landmark_conflict_penalty", type=float, default=0.1)
     parser.add_argument("--descriptor_trust_region", type=float, default=0.25)
     parser.add_argument("--detector_grid_size", type=int, default=8)
@@ -138,6 +142,17 @@ def main(argv: list[str] | None = None) -> int:
         rank_feature_scale=float(args.rank_feature_scale),
     )
     model, scorer_summary = train_candidate_scorer(online_artifact, scorer_cfg)
+    candidate_mlp_model, candidate_mlp_summary = train_candidate_mlp_scorer(
+        online_artifact,
+        CandidateMLPScorerConfig(
+            epochs=int(args.epochs),
+            learning_rate=float(args.candidate_mlp_learning_rate),
+            hidden_dim=int(args.candidate_mlp_hidden_dim),
+            seed=int(args.seed),
+            listwise_loss_weight=float(args.candidate_mlp_listwise_loss_weight),
+            rank_feature_scale=float(args.rank_feature_scale),
+        ),
+    )
     selector_model, selector_summary = train_landmark_selector(
         online_artifact.batches,
         LandmarkSelectorConfig(conflict_penalty=float(args.landmark_conflict_penalty)),
@@ -154,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     episode_summary = summarize_online_sparse_dense_episodes(episodes)
     student_modules = [
         "correspondence_scorer",
+        "candidate_mlp_scorer",
         "landmark_selector",
         "conflict_graph",
         "descriptor_fusion",
@@ -167,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         **episode_summary,
         "distillation": distillation_summary,
         "candidate_scorer": scorer_summary,
+        "candidate_mlp_scorer": candidate_mlp_summary,
         "landmark_selector": selector_summary,
         "descriptor_fusion": descriptor_summary,
         "detector_student": detector_summary,
@@ -188,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
         "solver_feedback_labels": str(args.solver_feedback_labels),
         "render_manifest": None if args.render_manifest is None else str(args.render_manifest),
         "online_distilled_candidate_artifact": str(online_artifact_path),
+        "candidate_mlp_scorer": str(args.output_dir / "candidate_mlp_scorer.pt"),
         "hyperparameters": {
             "sample_count": int(args.sample_count),
             "seed": int(args.seed),
@@ -204,6 +222,9 @@ def main(argv: list[str] | None = None) -> int:
             "epochs": int(args.epochs),
             "learning_rate": float(args.learning_rate),
             "rank_feature_scale": float(args.rank_feature_scale),
+            "candidate_mlp_hidden_dim": int(args.candidate_mlp_hidden_dim),
+            "candidate_mlp_learning_rate": float(args.candidate_mlp_learning_rate),
+            "candidate_mlp_listwise_loss_weight": float(args.candidate_mlp_listwise_loss_weight),
             "landmark_conflict_penalty": float(args.landmark_conflict_penalty),
             "descriptor_trust_region": float(args.descriptor_trust_region),
             "detector_grid_size": int(args.detector_grid_size),
@@ -222,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(model.to_json_dict(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    torch.save(candidate_mlp_model.to_torch_dict(), args.output_dir / "candidate_mlp_scorer.pt")
     (args.output_dir / "landmark_selector.json").write_text(
         json.dumps(selector_model.to_json_dict(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

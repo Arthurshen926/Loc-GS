@@ -82,6 +82,7 @@ def test_internal_mainline_audit_cli_source_set_is_clean():
     assert any(str(path).endswith("sparse/query_feature_cache.py") for path in paths)
     assert any(str(path).endswith("sparse/real_inputs.py") for path in paths)
     assert any(str(path).endswith("students/descriptor_fusion.py") for path in paths)
+    assert any(str(path).endswith("students/candidate_mlp_scorer.py") for path in paths)
     assert any(str(path).endswith("students/detector_student.py") for path in paths)
     assert any(str(path).endswith("students/landmark_selector.py") for path in paths)
     assert any(str(path).endswith("simulation/render_manifest.py") for path in paths)
@@ -117,6 +118,7 @@ def test_internal_mainline_audit_cli_source_set_is_clean():
     assert any(str(path).endswith("build_internal_simulation_plan.py") for path in paths)
     assert any(str(path).endswith("training/sparse_candidate_scorer.py") for path in paths)
     assert any(str(path).endswith("train_internal_sparse_candidate_scorer.py") for path in paths)
+    assert any(str(path).endswith("train_internal_candidate_mlp_scorer.py") for path in paths)
 
     assert run_internal_mainline_audit(paths) == {
         "checked_file_count": len(paths),

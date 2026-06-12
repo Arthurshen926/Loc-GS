@@ -8,9 +8,11 @@ import torch
 from loc_gs.core.camera import load_camera_records
 from loc_gs.core.geometry import project_points_w2c
 from loc_gs.scripts.eval_internal_sparse_cached import main
+from loc_gs.students.candidate_mlp_scorer import CandidateMLPScorerConfig, train_candidate_mlp_scorer
 from loc_gs.students.descriptor_fusion import DescriptorFusionModel
 from loc_gs.students.detector_student import DetectorStudentModel
 from loc_gs.students.landmark_selector import LandmarkSelectorModel
+from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 
 
 def _write_ply(path: Path) -> Path:
@@ -64,7 +66,7 @@ def _write_cameras(path: Path) -> Path:
     return path
 
 
-def _write_pair_cache(path: Path, cameras: Path, *, buried_correct: bool = False) -> Path:
+def _write_pair_cache(path: Path, cameras: Path, *, buried_correct: bool = False, descriptor_signals: bool = False) -> Path:
     points = np.array(
         [
             (-0.5, -0.4, 3.0),
@@ -120,6 +122,13 @@ def _write_pair_cache(path: Path, cameras: Path, *, buried_correct: bool = False
         "keypoint_id": [f"kp{i}" for i in range(6)],
         "source_phase": ["train_dev"] * 6,
     }
+    if descriptor_signals:
+        payload["query_desc"] = torch.tensor([[1.0, 0.0]] * 6, dtype=torch.float32)
+        payload["landmark_desc"] = torch.tensor([[[0.0, 1.0], [1.0, 0.0]]] * 6, dtype=torch.float32)
+        payload["dense_consistent"] = torch.tensor([[False, True]] * 6, dtype=torch.bool)
+        payload["sparse_inlier"] = torch.tensor([[False, True]] * 6, dtype=torch.bool)
+        payload["solver_weight"] = torch.tensor([[0.25, 3.0]] * 6, dtype=torch.float32)
+        payload["label_roles"] = [["hard_negative", "protected_support"] for _idx in range(6)]
     torch.save(payload, path)
     return path
 
@@ -337,6 +346,56 @@ def test_eval_internal_sparse_cached_cli_accepts_descriptor_fusion(tmp_path: Pat
     metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
     rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
     assert metrics["descriptor_fusion_enabled"] is True
+    assert rows[0]["success"] is True
+    assert rows[0]["te_cm"] < 1.0
+
+
+def test_eval_internal_sparse_cached_cli_accepts_mlp_candidate_scorer(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    pairs = _write_pair_cache(tmp_path / "pairs.pt", cameras, buried_correct=True, descriptor_signals=True)
+    artifact = load_listwise_candidate_artifact(pairs)
+    model, summary = train_candidate_mlp_scorer(
+        artifact,
+        CandidateMLPScorerConfig(epochs=100, learning_rate=0.03, hidden_dim=8, seed=11),
+    )
+    assert summary["trained_top1_correct"] == 6
+    scorer_path = tmp_path / "candidate_mlp.pt"
+    torch.save(model.to_torch_dict(), scorer_path)
+    out = tmp_path / "eval_mlp_scorer"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(pairs),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--candidate_scorer",
+            str(scorer_path),
+            "--rerank_prefix_fraction",
+            "0",
+            "--native_weight",
+            "0",
+            "--solver_weight",
+            "1",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    rows = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert metrics["candidate_scorer_enabled"] is True
     assert rows[0]["success"] is True
     assert rows[0]["te_cm"] < 1.0
 
