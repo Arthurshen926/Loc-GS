@@ -101,6 +101,7 @@ def test_internal_mainline_audit_cli_source_set_is_clean():
     assert any(str(path).endswith("train_internal_sparse_students.py") for path in paths)
     assert any(str(path).endswith("merge_internal_candidate_artifacts.py") for path in paths)
     assert any(str(path).endswith("run_internal_sparse_smoke.py") for path in paths)
+    assert any(str(path).endswith("run_internal_mainline_smoke.py") for path in paths)
     assert any(str(path).endswith("render_internal_3dgs_assets.py") for path in paths)
     assert any(str(path).endswith("teacher/solver_feedback.py") for path in paths)
     assert any(str(path).endswith("build_internal_solver_feedback_labels.py") for path in paths)
