@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from loc_gs.core.camera import CameraIntrinsics, CameraRecord
@@ -27,6 +28,41 @@ def test_simulation_sampler_is_seeded_and_rejects_test_split():
     assert first[0].synthetic_query_id.startswith("sim/GreatCourt/train/")
     with pytest.raises(ValueError, match="test split"):
         sample_simulated_queries(_records(), scene="GreatCourt", split_name="test", cfg=cfg)
+
+
+def test_simulation_sampler_exports_render_pose_contract_for_3dgs():
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, 3] = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    records = {
+        "posed.png": CameraRecord(
+            "posed.png",
+            CameraIntrinsics(width=120, height=90, fx=60.0, fy=61.0, cx=59.5, cy=44.5),
+            pose_c2w=pose,
+        )
+    }
+    cfg = SimulationSamplerConfig(
+        sample_count=1,
+        seed=1,
+        translation_std_m=0.0,
+        yaw_std_deg=0.0,
+        pitch_std_deg=0.0,
+        roll_std_deg=0.0,
+    )
+
+    spec = sample_simulated_queries(records, scene="GreatCourt", split_name="train", cfg=cfg)[0]
+    row = spec.to_json_dict()
+
+    np.testing.assert_allclose(row["source_pose_c2w"], pose)
+    np.testing.assert_allclose(row["render_pose_c2w"], pose)
+    assert row["render_intrinsics"] == {
+        "width": 120,
+        "height": 90,
+        "fx": 60.0,
+        "fy": 61.0,
+        "cx": 59.5,
+        "cy": 44.5,
+    }
+    assert row["render_contract"] == "posed_3dgs_camera_v1"
 
 
 def test_simulation_plan_cli_writes_audited_plan(tmp_path: Path):
