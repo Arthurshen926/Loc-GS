@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -26,6 +26,7 @@ class CandidateMLPScorerConfig:
     seed: int = 13
     listwise_loss_weight: float = 1.0
     batch_size: int = 0
+    stream_features: bool = False
     rank_feature_scale: float = 1.0
     reprojection_error_scale_px: float = 8.0
     protected_support_weight: float = 2.0
@@ -118,6 +119,16 @@ class CandidateMLPScorer:
         )
 
 
+@dataclass(frozen=True)
+class _FeatureBatch:
+    features: np.ndarray
+    labels: np.ndarray
+    sample_weights: np.ndarray
+    group_slices: tuple[tuple[int, int], ...]
+    dense_teacher_sample_count: int
+    weighted_sample_count: float
+
+
 class CandidateMLPScorerRuntime:
     def __init__(self, model: CandidateMLPScorer):
         self.model = model
@@ -171,6 +182,8 @@ def train_candidate_mlp_scorer(
     if cfg is None:
         cfg = CandidateMLPScorerConfig()
     descriptor_dim = _infer_descriptor_dim(artifact)
+    if bool(cfg.stream_features):
+        return _train_candidate_mlp_scorer_streaming(artifact, cfg, descriptor_dim=descriptor_dim)
     x, y, sample_weights, group_slices, training_stats = _training_matrix(artifact, cfg, descriptor_dim=descriptor_dim)
     torch.manual_seed(int(cfg.seed))
     features = torch.tensor(x, dtype=torch.float32)
@@ -235,6 +248,7 @@ def train_candidate_mlp_scorer(
         "hidden_dim": int(cfg.hidden_dim),
         "listwise_loss_weight": float(cfg.listwise_loss_weight),
         "batch_size": int(cfg.batch_size),
+        "feature_materialization": "in_memory",
         "training_batch_count": int(len(train_batches)),
         "optimizer_step_count": int(optimizer_step_count),
         "descriptor_dim": int(descriptor_dim),
@@ -244,6 +258,91 @@ def train_candidate_mlp_scorer(
         "hyperparameters": asdict(cfg),
         **classify_feature_input_policy(cfg.scalar_feature_names),
         **training_stats,
+    }
+    return model, summary
+
+
+def _train_candidate_mlp_scorer_streaming(
+    artifact: CachedCandidateArtifact,
+    cfg: CandidateMLPScorerConfig,
+    *,
+    descriptor_dim: int,
+) -> tuple[CandidateMLPScorer, dict[str, object]]:
+    torch.manual_seed(int(cfg.seed))
+    stats = _streaming_feature_stats(artifact, cfg, descriptor_dim=descriptor_dim)
+    sample_count = int(stats["sample_count"])
+    if sample_count <= 0:
+        raise ValueError("candidate artifact did not contain trainable MLP scorer samples")
+    feature_mean_np = np.asarray(stats["feature_sum"], dtype=np.float64) / float(sample_count)
+    feature_var_np = np.asarray(stats["feature_sumsq"], dtype=np.float64) / float(sample_count) - feature_mean_np**2
+    feature_var_np = np.maximum(feature_var_np, 0.0)
+    feature_std_np = np.sqrt(feature_var_np)
+    feature_std_np[feature_std_np < 1.0e-6] = 1.0
+    feature_mean = torch.tensor(feature_mean_np, dtype=torch.float32)
+    feature_std = torch.tensor(feature_std_np, dtype=torch.float32)
+    network = _network(int(stats["feature_dim"]), int(cfg.hidden_dim))
+    optimizer = torch.optim.AdamW(network.parameters(), lr=float(cfg.learning_rate))
+    optimizer_step_count = 0
+    for _epoch in range(int(cfg.epochs)):
+        for feature_batch in _iter_feature_batches(artifact, cfg, descriptor_dim=descriptor_dim):
+            features = (torch.tensor(feature_batch.features, dtype=torch.float32) - feature_mean) / feature_std
+            labels = torch.tensor(feature_batch.labels.reshape(-1, 1), dtype=torch.float32)
+            weights = torch.tensor(feature_batch.sample_weights.reshape(-1, 1), dtype=torch.float32)
+            logits = network(features)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+            normalizer = torch.clamp(weights.sum(), min=torch.tensor(1.0e-6))
+            pointwise = (loss * weights).sum() / normalizer
+            objective = pointwise + float(cfg.listwise_loss_weight) * _listwise_softmax_loss(
+                logits,
+                labels,
+                weights,
+                feature_batch.group_slices,
+            )
+            optimizer.zero_grad()
+            objective.backward()
+            optimizer.step()
+            optimizer_step_count += 1
+    logit_mean, logit_std = _streaming_logit_stats(
+        artifact,
+        cfg,
+        descriptor_dim=descriptor_dim,
+        network=network,
+        feature_mean=feature_mean,
+        feature_std=feature_std,
+    )
+    model = CandidateMLPScorer(
+        scalar_feature_names=tuple(str(name) for name in cfg.scalar_feature_names),
+        descriptor_dim=int(descriptor_dim),
+        hidden_dim=int(cfg.hidden_dim),
+        feature_mean=tuple(float(v) for v in feature_mean.tolist()),
+        feature_std=tuple(float(v) for v in feature_std.tolist()),
+        state_dict={str(key): value.detach().cpu() for key, value in network.state_dict().items()},
+        logit_mean=float(logit_mean),
+        logit_std=float(logit_std),
+    )
+    summary = {
+        "schema_version": "internal_candidate_mlp_scorer_training_summary_v1",
+        "student_modules": ["candidate_mlp_scorer"],
+        "label_count": int(stats["label_count"]),
+        "sample_count": int(sample_count),
+        "native_top1_correct": int(_count_native_top1_correct(artifact)),
+        "trained_top1_correct": int(_count_top1_correct(artifact, model)),
+        "epochs": int(cfg.epochs),
+        "learning_rate": float(cfg.learning_rate),
+        "hidden_dim": int(cfg.hidden_dim),
+        "listwise_loss_weight": float(cfg.listwise_loss_weight),
+        "batch_size": int(cfg.batch_size),
+        "feature_materialization": "streaming",
+        "training_batch_count": int(stats["training_batch_count"]),
+        "optimizer_step_count": int(optimizer_step_count),
+        "descriptor_dim": int(descriptor_dim),
+        "score_calibration": "train_logit_zscore",
+        "logit_mean": float(logit_mean),
+        "logit_std": float(logit_std),
+        "hyperparameters": asdict(cfg),
+        **classify_feature_input_policy(cfg.scalar_feature_names),
+        "dense_teacher_sample_count": int(stats["dense_teacher_sample_count"]),
+        "weighted_sample_count": float(stats["weighted_sample_count"]),
     }
     return model, summary
 
@@ -310,6 +409,137 @@ def _training_matrix(
             "weighted_sample_count": float(sum(weights)),
         },
     )
+
+
+def _iter_feature_batches(
+    artifact: CachedCandidateArtifact,
+    cfg: CandidateMLPScorerConfig,
+    *,
+    descriptor_dim: int,
+) -> Iterator[_FeatureBatch]:
+    effective_batch_size = int(cfg.batch_size) if int(cfg.batch_size) > 0 else 8192
+    linear_cfg = cfg.candidate_config()
+    features: list[list[float]] = []
+    labels: list[float] = []
+    weights: list[float] = []
+    group_slices: list[tuple[int, int]] = []
+    dense_teacher_sample_count = 0
+
+    def make_feature_batch() -> _FeatureBatch:
+        return _FeatureBatch(
+            features=np.asarray(features, dtype=np.float32),
+            labels=np.asarray(labels, dtype=np.float32),
+            sample_weights=np.asarray(weights, dtype=np.float32),
+            group_slices=tuple((int(start), int(end)) for start, end in group_slices),
+            dense_teacher_sample_count=int(dense_teacher_sample_count),
+            weighted_sample_count=float(sum(weights)),
+        )
+
+    for batch in artifact.batches:
+        batch.validate()
+        valid_rows = batch.candidate_valid_mask or []
+        for row_idx, scores in enumerate(batch.candidate_scores):
+            row_start = len(labels)
+            for rank, score in enumerate(scores):
+                valid = True if not valid_rows else bool(valid_rows[row_idx][rank])
+                if not valid:
+                    continue
+                if batch.candidate_dense_consistent is not None:
+                    dense_teacher_sample_count += 1
+                target = _candidate_target(batch, row_idx=row_idx, rank=rank)
+                features.append(
+                    _candidate_mlp_feature(
+                        batch,
+                        row_idx=row_idx,
+                        rank=rank,
+                        native_score=float(score),
+                        valid=valid,
+                        cfg=cfg,
+                        descriptor_dim=descriptor_dim,
+                    )
+                )
+                labels.append(target)
+                weights.append(_candidate_sample_weight(batch, row_idx=row_idx, rank=rank, target=target, cfg=linear_cfg))
+            if len(labels) > row_start:
+                group_slices.append((int(row_start), int(len(labels))))
+            if features and len(features) >= effective_batch_size:
+                yield make_feature_batch()
+                features = []
+                labels = []
+                weights = []
+                group_slices = []
+                dense_teacher_sample_count = 0
+    if features:
+        yield make_feature_batch()
+
+
+def _streaming_feature_stats(
+    artifact: CachedCandidateArtifact,
+    cfg: CandidateMLPScorerConfig,
+    *,
+    descriptor_dim: int,
+) -> dict[str, object]:
+    feature_sum: np.ndarray | None = None
+    feature_sumsq: np.ndarray | None = None
+    sample_count = 0
+    label_count = 0.0
+    dense_teacher_sample_count = 0
+    weighted_sample_count = 0.0
+    training_batch_count = 0
+    for feature_batch in _iter_feature_batches(artifact, cfg, descriptor_dim=descriptor_dim):
+        values = np.asarray(feature_batch.features, dtype=np.float64)
+        if feature_sum is None:
+            feature_sum = np.zeros((values.shape[1],), dtype=np.float64)
+            feature_sumsq = np.zeros((values.shape[1],), dtype=np.float64)
+        feature_sum += values.sum(axis=0)
+        assert feature_sumsq is not None
+        feature_sumsq += np.square(values).sum(axis=0)
+        sample_count += int(values.shape[0])
+        label_count += float(feature_batch.labels.sum())
+        dense_teacher_sample_count += int(feature_batch.dense_teacher_sample_count)
+        weighted_sample_count += float(feature_batch.weighted_sample_count)
+        training_batch_count += 1
+    if feature_sum is None or feature_sumsq is None:
+        raise ValueError("candidate artifact did not contain trainable MLP scorer samples")
+    return {
+        "feature_sum": feature_sum,
+        "feature_sumsq": feature_sumsq,
+        "feature_dim": int(feature_sum.shape[0]),
+        "sample_count": int(sample_count),
+        "label_count": int(label_count),
+        "dense_teacher_sample_count": int(dense_teacher_sample_count),
+        "weighted_sample_count": float(weighted_sample_count),
+        "training_batch_count": int(training_batch_count),
+    }
+
+
+def _streaming_logit_stats(
+    artifact: CachedCandidateArtifact,
+    cfg: CandidateMLPScorerConfig,
+    *,
+    descriptor_dim: int,
+    network: torch.nn.Module,
+    feature_mean: torch.Tensor,
+    feature_std: torch.Tensor,
+) -> tuple[float, float]:
+    logit_sum = 0.0
+    logit_sumsq = 0.0
+    logit_count = 0
+    with torch.no_grad():
+        for feature_batch in _iter_feature_batches(artifact, cfg, descriptor_dim=descriptor_dim):
+            features = (torch.tensor(feature_batch.features, dtype=torch.float32) - feature_mean) / feature_std
+            logits = network(features).reshape(-1).double()
+            logit_sum += float(logits.sum().item())
+            logit_sumsq += float(torch.square(logits).sum().item())
+            logit_count += int(logits.numel())
+    if logit_count <= 0:
+        return 0.0, 1.0
+    mean = logit_sum / float(logit_count)
+    var = max(0.0, logit_sumsq / float(logit_count) - mean * mean)
+    std = float(var**0.5)
+    if std <= 1.0e-6:
+        std = 1.0
+    return float(mean), float(std)
 
 
 def _listwise_softmax_loss(

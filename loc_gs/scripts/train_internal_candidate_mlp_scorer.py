@@ -40,6 +40,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--listwise_loss_weight", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=0, help="0 keeps full-batch training; positive values split by candidate row.")
+    parser.add_argument("--stream_features", action="store_true", help="Stream descriptor-pair features instead of materializing the full training matrix.")
     parser.add_argument("--rank_feature_scale", type=float, default=1.0)
     parser.add_argument(
         "--scalar_feature_names",
@@ -68,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=int(args.seed),
         listwise_loss_weight=float(args.listwise_loss_weight),
         batch_size=int(args.batch_size),
+        stream_features=bool(args.stream_features),
         rank_feature_scale=float(args.rank_feature_scale),
         scalar_feature_names=scalar_feature_names,
     )
@@ -99,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
             "seed": int(args.seed),
             "listwise_loss_weight": float(args.listwise_loss_weight),
             "batch_size": int(args.batch_size),
+            "stream_features": bool(args.stream_features),
             "rank_feature_scale": float(args.rank_feature_scale),
             "scalar_feature_names": list(cfg.scalar_feature_names),
         },

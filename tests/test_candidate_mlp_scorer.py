@@ -129,6 +129,27 @@ def test_candidate_mlp_runtime_reuses_loaded_network_for_multiple_batches():
     assert runtime.score_rows(batch_b) == candidate_mlp_score_rows(batch_b, model)
 
 
+def test_candidate_mlp_scorer_streams_features_without_full_training_matrix():
+    model, summary = train_candidate_mlp_scorer(
+        _artifact(),
+        CandidateMLPScorerConfig(
+            epochs=80,
+            learning_rate=0.03,
+            hidden_dim=8,
+            seed=7,
+            batch_size=2,
+            stream_features=True,
+        ),
+    )
+
+    rows = candidate_mlp_score_rows(_descriptor_batch(), model)
+    assert summary["feature_materialization"] == "streaming"
+    assert summary["training_batch_count"] > 1
+    assert summary["optimizer_step_count"] == summary["epochs"] * summary["training_batch_count"]
+    assert summary["trained_top1_correct"] == 4
+    assert all(row[1] > row[0] for row in rows)
+
+
 def test_train_internal_candidate_mlp_scorer_cli_writes_pt_bundle(tmp_path: Path):
     out = tmp_path / "mlp"
 
@@ -152,6 +173,7 @@ def test_train_internal_candidate_mlp_scorer_cli_writes_pt_bundle(tmp_path: Path
             "1.0",
             "--batch_size",
             "2",
+            "--stream_features",
         ]
     )
 
@@ -164,6 +186,7 @@ def test_train_internal_candidate_mlp_scorer_cli_writes_pt_bundle(tmp_path: Path
     assert summary["student_modules"] == ["candidate_mlp_scorer"]
     assert summary["listwise_loss_weight"] == 1.0
     assert summary["batch_size"] == 2
+    assert summary["feature_materialization"] == "streaming"
     assert summary["optimizer_step_count"] > summary["epochs"]
     assert summary["score_calibration"] == "train_logit_zscore"
     assert summary["feature_input_policy"] == "inference_safe"
@@ -172,3 +195,4 @@ def test_train_internal_candidate_mlp_scorer_cli_writes_pt_bundle(tmp_path: Path
     assert manifest["dense_inference_enabled"] is False
     assert manifest["external_runtime_dependency"] == "forbidden"
     assert manifest["hyperparameters"]["batch_size"] == 2
+    assert manifest["hyperparameters"]["stream_features"] is True
