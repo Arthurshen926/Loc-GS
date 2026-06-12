@@ -77,6 +77,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate_mlp_hidden_dim", type=int, default=32)
     parser.add_argument("--candidate_mlp_learning_rate", type=float, default=0.03)
     parser.add_argument("--candidate_mlp_listwise_loss_weight", type=float, default=1.0)
+    parser.add_argument("--candidate_mlp_batch_size", type=int, default=0)
     parser.add_argument("--landmark_conflict_penalty", type=float, default=0.1)
     parser.add_argument("--descriptor_trust_region", type=float, default=0.25)
     parser.add_argument("--detector_grid_size", type=int, default=8)
@@ -150,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
             hidden_dim=int(args.candidate_mlp_hidden_dim),
             seed=int(args.seed),
             listwise_loss_weight=float(args.candidate_mlp_listwise_loss_weight),
+            batch_size=int(args.candidate_mlp_batch_size),
             rank_feature_scale=float(args.rank_feature_scale),
         ),
     )
@@ -225,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
             "candidate_mlp_hidden_dim": int(args.candidate_mlp_hidden_dim),
             "candidate_mlp_learning_rate": float(args.candidate_mlp_learning_rate),
             "candidate_mlp_listwise_loss_weight": float(args.candidate_mlp_listwise_loss_weight),
+            "candidate_mlp_batch_size": int(args.candidate_mlp_batch_size),
             "landmark_conflict_penalty": float(args.landmark_conflict_penalty),
             "descriptor_trust_region": float(args.descriptor_trust_region),
             "detector_grid_size": int(args.detector_grid_size),

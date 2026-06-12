@@ -84,7 +84,14 @@ def _write_artifact(path: Path) -> Path:
 def test_candidate_mlp_scorer_learns_descriptor_pair_reranking(tmp_path: Path):
     model, summary = train_candidate_mlp_scorer(
         _artifact(),
-        CandidateMLPScorerConfig(epochs=160, learning_rate=0.03, hidden_dim=8, seed=7, listwise_loss_weight=1.0),
+        CandidateMLPScorerConfig(
+            epochs=160,
+            learning_rate=0.03,
+            hidden_dim=8,
+            seed=7,
+            listwise_loss_weight=1.0,
+            batch_size=2,
+        ),
     )
 
     rows = candidate_mlp_score_rows(_descriptor_batch(), model)
@@ -94,6 +101,8 @@ def test_candidate_mlp_scorer_learns_descriptor_pair_reranking(tmp_path: Path):
     assert summary["native_top1_correct"] == 0
     assert summary["trained_top1_correct"] == 4
     assert summary["listwise_loss_weight"] == 1.0
+    assert summary["batch_size"] == 2
+    assert summary["optimizer_step_count"] > summary["epochs"]
     assert summary["score_calibration"] == "train_logit_zscore"
     assert all(row[1] > row[0] for row in rows)
 
@@ -127,6 +136,8 @@ def test_train_internal_candidate_mlp_scorer_cli_writes_pt_bundle(tmp_path: Path
             "8",
             "--listwise_loss_weight",
             "1.0",
+            "--batch_size",
+            "2",
         ]
     )
 
@@ -138,9 +149,12 @@ def test_train_internal_candidate_mlp_scorer_cli_writes_pt_bundle(tmp_path: Path
     assert payload["score_calibration"] == "train_logit_zscore"
     assert summary["student_modules"] == ["candidate_mlp_scorer"]
     assert summary["listwise_loss_weight"] == 1.0
+    assert summary["batch_size"] == 2
+    assert summary["optimizer_step_count"] > summary["epochs"]
     assert summary["score_calibration"] == "train_logit_zscore"
     assert summary["feature_input_policy"] == "inference_safe"
     assert manifest["inference_stage"] == "sparse_candidate_mlp_scorer_training"
     assert manifest["dense_teacher_enabled"] is True
     assert manifest["dense_inference_enabled"] is False
     assert manifest["external_runtime_dependency"] == "forbidden"
+    assert manifest["hyperparameters"]["batch_size"] == 2

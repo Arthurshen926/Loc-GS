@@ -39,6 +39,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden_dim", type=int, default=32)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--listwise_loss_weight", type=float, default=1.0)
+    parser.add_argument("--batch_size", type=int, default=0, help="0 keeps full-batch training; positive values split by candidate row.")
     parser.add_argument("--rank_feature_scale", type=float, default=1.0)
     parser.add_argument(
         "--scalar_feature_names",
@@ -66,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         hidden_dim=int(args.hidden_dim),
         seed=int(args.seed),
         listwise_loss_weight=float(args.listwise_loss_weight),
+        batch_size=int(args.batch_size),
         rank_feature_scale=float(args.rank_feature_scale),
         scalar_feature_names=scalar_feature_names,
     )
@@ -96,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
             "hidden_dim": int(args.hidden_dim),
             "seed": int(args.seed),
             "listwise_loss_weight": float(args.listwise_loss_weight),
+            "batch_size": int(args.batch_size),
             "rank_feature_scale": float(args.rank_feature_scale),
             "scalar_feature_names": list(cfg.scalar_feature_names),
         },

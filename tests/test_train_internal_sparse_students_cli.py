@@ -113,6 +113,8 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
             "1",
             "--epochs",
             "20",
+            "--candidate_mlp_batch_size",
+            "2",
         ]
     )
 
@@ -151,6 +153,8 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     assert candidate_mlp["schema_version"] == "internal_candidate_mlp_scorer_v1"
     assert candidate_mlp["score_calibration"] == "train_logit_zscore"
     assert summary["candidate_mlp_scorer"]["student_modules"] == ["candidate_mlp_scorer"]
+    assert summary["candidate_mlp_scorer"]["batch_size"] == 2
+    assert manifest["hyperparameters"]["candidate_mlp_batch_size"] == 2
     assert selector["schema_version"] == "internal_landmark_selector_v1"
     assert conflicts["schema_version"] == "internal_conflict_graph_v1"
     assert fusion["schema_version"] == "internal_descriptor_fusion_v1"

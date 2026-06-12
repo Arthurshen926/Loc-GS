@@ -25,6 +25,7 @@ class CandidateMLPScorerConfig:
     hidden_dim: int = 32
     seed: int = 13
     listwise_loss_weight: float = 1.0
+    batch_size: int = 0
     rank_feature_scale: float = 1.0
     reprojection_error_scale_px: float = 8.0
     protected_support_weight: float = 2.0
@@ -135,20 +136,31 @@ def train_candidate_mlp_scorer(
     features = (features - feature_mean) / feature_std
     network = _network(features.shape[1], int(cfg.hidden_dim))
     optimizer = torch.optim.AdamW(network.parameters(), lr=float(cfg.learning_rate))
-    normalizer = torch.clamp(weights.sum(), min=torch.tensor(1.0e-6))
+    train_batches = _training_batches(
+        sample_count=int(features.shape[0]),
+        group_slices=group_slices,
+        batch_size=int(cfg.batch_size),
+    )
+    optimizer_step_count = 0
     for _epoch in range(int(cfg.epochs)):
-        logits = network(features)
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels, reduction="none")
-        pointwise = (loss * weights).sum() / normalizer
-        objective = pointwise + float(cfg.listwise_loss_weight) * _listwise_softmax_loss(
-            logits,
-            labels,
-            weights,
-            group_slices,
-        )
-        optimizer.zero_grad()
-        objective.backward()
-        optimizer.step()
+        for start, end, batch_group_slices in train_batches:
+            batch_features = features[int(start) : int(end)]
+            batch_labels = labels[int(start) : int(end)]
+            batch_weights = weights[int(start) : int(end)]
+            logits = network(batch_features)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, batch_labels, reduction="none")
+            normalizer = torch.clamp(batch_weights.sum(), min=torch.tensor(1.0e-6))
+            pointwise = (loss * batch_weights).sum() / normalizer
+            objective = pointwise + float(cfg.listwise_loss_weight) * _listwise_softmax_loss(
+                logits,
+                batch_labels,
+                batch_weights,
+                batch_group_slices,
+            )
+            optimizer.zero_grad()
+            objective.backward()
+            optimizer.step()
+            optimizer_step_count += 1
     with torch.no_grad():
         train_logits = network(features).reshape(-1)
         logit_mean = float(train_logits.mean().item())
@@ -176,6 +188,9 @@ def train_candidate_mlp_scorer(
         "learning_rate": float(cfg.learning_rate),
         "hidden_dim": int(cfg.hidden_dim),
         "listwise_loss_weight": float(cfg.listwise_loss_weight),
+        "batch_size": int(cfg.batch_size),
+        "training_batch_count": int(len(train_batches)),
+        "optimizer_step_count": int(optimizer_step_count),
         "descriptor_dim": int(descriptor_dim),
         "score_calibration": "train_logit_zscore",
         "logit_mean": float(logit_mean),
@@ -308,6 +323,43 @@ def _listwise_softmax_loss(
     loss_tensor = torch.stack(losses)
     weight_tensor = torch.stack(weights)
     return (loss_tensor * weight_tensor).sum() / torch.clamp(weight_tensor.sum(), min=torch.tensor(1.0e-6, device=weight_tensor.device))
+
+
+def _training_batches(
+    *,
+    sample_count: int,
+    group_slices: Sequence[tuple[int, int]],
+    batch_size: int,
+) -> list[tuple[int, int, list[tuple[int, int]]]]:
+    if sample_count <= 0:
+        return []
+    if int(batch_size) <= 0 or int(batch_size) >= int(sample_count):
+        return [(0, int(sample_count), [(int(start), int(end)) for start, end in group_slices])]
+    batches: list[tuple[int, int, list[tuple[int, int]]]] = []
+    batch_start: int | None = None
+    batch_end: int | None = None
+    batch_groups: list[tuple[int, int]] = []
+    for group_start, group_end in group_slices:
+        group_start = int(group_start)
+        group_end = int(group_end)
+        if batch_start is None:
+            batch_start = group_start
+            batch_end = group_end
+            batch_groups = [(0, group_end - group_start)]
+            continue
+        assert batch_end is not None
+        next_count = group_end - batch_start
+        if batch_groups and next_count > int(batch_size):
+            batches.append((batch_start, batch_end, batch_groups))
+            batch_start = group_start
+            batch_end = group_end
+            batch_groups = [(0, group_end - group_start)]
+        else:
+            batch_groups.append((group_start - batch_start, group_end - batch_start))
+            batch_end = group_end
+    if batch_start is not None and batch_end is not None:
+        batches.append((batch_start, batch_end, batch_groups))
+    return batches or [(0, int(sample_count), [(int(start), int(end)) for start, end in group_slices])]
 
 
 def _candidate_mlp_feature(
