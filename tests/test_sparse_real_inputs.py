@@ -3,6 +3,7 @@ import struct
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from loc_gs.core.camera import load_camera_records
@@ -86,6 +87,41 @@ def test_camera_records_load_cambridge_json_intrinsics(tmp_path: Path):
     assert records["img.png"].intrinsics.cx == 960.0
     assert records["img.png"].intrinsics.cy == 540.0
     np.testing.assert_allclose(records["img.png"].pose_w2c[:3, 3], [-1.0, -2.0, -3.0])
+
+
+def test_camera_records_can_match_cambridge_resized_canvas(tmp_path: Path):
+    cameras = tmp_path / "cameras.json"
+    cameras.write_text(
+        json.dumps(
+            [
+                {
+                    "img_name": "img.png",
+                    "width": 1920,
+                    "height": 1080,
+                    "fx": 1665.6534,
+                    "fy": 1665.6534,
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    records = load_camera_records(
+        cameras,
+        target_width=640,
+        target_height=360,
+        missing_principal_point="pixel_center",
+    )
+
+    intr = records["img.png"].intrinsics
+    assert intr.width == 640
+    assert intr.height == 360
+    assert intr.fx == pytest.approx(555.2178, abs=1e-4)
+    assert intr.fy == pytest.approx(555.2178, abs=1e-4)
+    assert intr.cx == pytest.approx(319.8333333, abs=1e-6)
+    assert intr.cy == pytest.approx(179.8333333, abs=1e-6)
 
 
 def test_cached_batch_converts_to_sparse_localization_input_with_resolved_xyz(tmp_path: Path):

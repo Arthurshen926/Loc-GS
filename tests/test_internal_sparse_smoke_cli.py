@@ -2,8 +2,11 @@ import json
 import struct
 from pathlib import Path
 
+import numpy as np
 import torch
 
+from loc_gs.core.camera import load_camera_records
+from loc_gs.core.geometry import project_points_w2c
 from loc_gs.scripts.run_internal_sparse_smoke import main
 
 
@@ -53,6 +56,50 @@ def _write_artifact(path: Path) -> Path:
             ],
             dtype=torch.float32,
         ),
+        "landmark_id": torch.arange(6, dtype=torch.int64).reshape(6, 1),
+        "cosine": torch.ones((6, 1), dtype=torch.float32),
+        "label": torch.zeros(6, dtype=torch.int64),
+        "candidate_mask": torch.ones((6, 1), dtype=torch.bool),
+        "query_id": [f"img.png::kp{i}" for i in range(6)],
+        "image_id": ["img.png"] * 6,
+        "keypoint_id": [f"kp{i}" for i in range(6)],
+        "source_phase": ["train"] * 6,
+    }
+    torch.save(payload, path)
+    return path
+
+
+def _write_resized_canvas_artifact(path: Path, cameras: Path) -> Path:
+    rows = np.array(
+        [
+            (-0.5, -0.4, 3.0),
+            (0.5, -0.4, 3.1),
+            (-0.4, 0.5, 2.9),
+            (0.4, 0.5, 3.3),
+            (0.0, 0.0, 2.6),
+            (-0.7, 0.1, 3.4),
+        ],
+        dtype=np.float64,
+    )
+    intr = load_camera_records(
+        cameras,
+        target_width=120,
+        target_height=90,
+        missing_principal_point="pixel_center",
+    )["img.png"].intrinsics
+    keypoints_xy, valid = project_points_w2c(rows, np.eye(4, dtype=np.float64), intr)
+    assert bool(valid.all())
+    keypoints_yx = np.stack([keypoints_xy[:, 1], keypoints_xy[:, 0]], axis=1)
+    payload = {
+        "metadata": {
+            "format": "listwise",
+            "scene": "GreatCourt",
+            "source_split_name": "train",
+            "topk": 1,
+            "split_audit": {"audit_status": "passed", "checks": {}},
+        },
+        "base_gaussian_id": torch.arange(6, dtype=torch.int64),
+        "query_yx": torch.tensor(keypoints_yx, dtype=torch.float32),
         "landmark_id": torch.arange(6, dtype=torch.int64).reshape(6, 1),
         "cosine": torch.ones((6, 1), dtype=torch.float32),
         "label": torch.zeros(6, dtype=torch.int64),
@@ -118,3 +165,58 @@ def test_internal_sparse_smoke_cli_runs_cached_candidates_through_pnp(tmp_path: 
     assert metrics["pose_metric_status"] == "computed_unverified"
     assert manifest["inference_stage"] == "sparse_only"
     assert manifest["hyperparameters"]["score_mode"] == "native"
+
+
+def test_internal_sparse_smoke_cli_can_use_resized_cache_canvas_intrinsics(tmp_path: Path):
+    cameras = tmp_path / "cameras.json"
+    cameras.write_text(
+        json.dumps(
+            [
+                {
+                    "img_name": "img.png",
+                    "width": 240,
+                    "height": 180,
+                    "fx": 140.0,
+                    "fy": 140.0,
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "smoke_resized"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train",
+            "--candidate_artifact",
+            str(_write_resized_canvas_artifact(tmp_path / "pairs_resized.pt", cameras)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--output_dir",
+            str(out),
+            "--max_queries",
+            "1",
+            "--score_mode",
+            "native",
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert metrics["success_count"] == 1
+    assert metrics["median_te_cm"] < 1.0
+    assert metrics["pose_metric_frame"] == "camera_json_c2w_resized_pixel_center"
+    assert manifest["hyperparameters"]["image_width"] == 120
+    assert manifest["hyperparameters"]["missing_principal_point"] == "pixel_center"

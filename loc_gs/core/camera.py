@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
+
+MissingPrincipalPoint = Literal["half_extent", "pixel_center"]
 
 
 @dataclass(frozen=True)
@@ -55,7 +58,23 @@ class CameraRecord:
         return inv
 
 
-def load_camera_records(cameras_json: str | Path) -> dict[str, CameraRecord]:
+def _fallback_principal_point(size: int, mode: MissingPrincipalPoint) -> float:
+    if mode == "half_extent":
+        return float(size) / 2.0
+    if mode == "pixel_center":
+        return (float(size) - 1.0) * 0.5
+    raise ValueError(f"unsupported missing principal point mode: {mode}")
+
+
+def load_camera_records(
+    cameras_json: str | Path,
+    *,
+    target_width: int | None = None,
+    target_height: int | None = None,
+    missing_principal_point: MissingPrincipalPoint = "half_extent",
+) -> dict[str, CameraRecord]:
+    if (target_width is None) != (target_height is None):
+        raise ValueError("target_width and target_height must be provided together")
     path = Path(cameras_json)
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
@@ -67,15 +86,23 @@ def load_camera_records(cameras_json: str | Path) -> dict[str, CameraRecord]:
         image_id = str(row.get("img_name") or row.get("image_id") or "")
         if not image_id:
             continue
-        width = int(row["width"])
-        height = int(row["height"])
+        source_width = int(row["width"])
+        source_height = int(row["height"])
+        width = int(target_width if target_width is not None else source_width)
+        height = int(target_height if target_height is not None else source_height)
+        sx = float(width) / max(float(source_width), 1.0)
+        sy = float(height) / max(float(source_height), 1.0)
+        source_fx = float(row["fx"])
+        source_fy = float(row.get("fy", row["fx"]))
+        source_cx = float(row["cx"]) if "cx" in row else _fallback_principal_point(source_width, missing_principal_point)
+        source_cy = float(row["cy"]) if "cy" in row else _fallback_principal_point(source_height, missing_principal_point)
         intrinsics = CameraIntrinsics(
             width=width,
             height=height,
-            fx=float(row["fx"]),
-            fy=float(row.get("fy", row["fx"])),
-            cx=float(row.get("cx", width / 2.0)),
-            cy=float(row.get("cy", height / 2.0)),
+            fx=source_fx * sx,
+            fy=source_fy * sy,
+            cx=source_cx * sx,
+            cy=source_cy * sy,
         )
         pose_c2w = None
         if "rotation" in row and "position" in row:

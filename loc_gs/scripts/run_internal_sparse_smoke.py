@@ -65,6 +65,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--point_cloud", type=Path, required=True)
     parser.add_argument("--cameras_json", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument("--image_width", type=int, default=None)
+    parser.add_argument("--image_height", type=int, default=None)
+    parser.add_argument("--missing_principal_point", choices=["half_extent", "pixel_center"], default="pixel_center")
     parser.add_argument("--max_queries", type=int, default=5)
     parser.add_argument("--max_keypoints", type=int, default=512)
     parser.add_argument("--score_mode", choices=["native", "teacher_oracle"], default="native")
@@ -79,11 +82,23 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_argparser().parse_args(argv)
     reject_test_split(str(args.split_name), purpose="internal sparse smoke")
+    if (args.image_width is None) != (args.image_height is None):
+        raise ValueError("--image_width and --image_height must be provided together")
     command = [sys.executable, "-m", "loc_gs.scripts.run_internal_sparse_smoke", *(argv or sys.argv[1:])]
     artifact = load_listwise_candidate_artifact(args.candidate_artifact)
     landmark_map = load_gaussian_landmark_map(args.point_cloud)
     resolver = CacheLandmarkResolver.from_pair_cache(args.candidate_artifact, landmark_map)
-    cameras = load_camera_records(args.cameras_json)
+    if args.image_width is None:
+        cameras = load_camera_records(args.cameras_json)
+        pose_metric_frame = "camera_json_c2w"
+    else:
+        cameras = load_camera_records(
+            args.cameras_json,
+            target_width=int(args.image_width),
+            target_height=int(args.image_height),
+            missing_principal_point=str(args.missing_principal_point),
+        )
+        pose_metric_frame = f"camera_json_c2w_resized_{args.missing_principal_point}"
 
     input_cfg = CachedSparseInputConfig(score_mode=args.score_mode, max_keypoints=int(args.max_keypoints))
     loc_cfg = SparseLocalizationConfig(
@@ -134,11 +149,14 @@ def main(argv: list[str] | None = None) -> int:
         "median_te_cm": _median_or_none(te_cm_values),
         "median_re_deg": _median_or_none(re_deg_values),
         "pose_metric_status": "computed_unverified" if te_cm_values else "missing_gt_pose",
-        "pose_metric_frame": "camera_json_c2w",
+        "pose_metric_frame": pose_metric_frame,
         "score_mode": str(args.score_mode),
         "candidate_artifact": artifact.summarize_candidate_availability(),
     }
     hyperparameters = {
+        "image_width": args.image_width,
+        "image_height": args.image_height,
+        "missing_principal_point": str(args.missing_principal_point),
         "max_queries": int(args.max_queries),
         "max_keypoints": int(args.max_keypoints),
         "score_mode": str(args.score_mode),
