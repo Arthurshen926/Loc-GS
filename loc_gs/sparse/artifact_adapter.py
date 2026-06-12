@@ -81,6 +81,13 @@ def _field(payload: Mapping[str, Any], key: str, *, required: bool = True) -> An
     return payload[key]
 
 
+def _first_field(payload: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    for key in keys:
+        if key in payload:
+            return payload[key]
+    return None
+
+
 def _rows(value: Any, *, max_rows: int | None = None) -> list[Any]:
     if hasattr(value, "detach"):
         value = value.detach().cpu()
@@ -160,6 +167,14 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
     keypoint_ids_field = _field(payload, "keypoint_id", required=False)
     phase_field = _field(payload, "source_phase", required=False)
     masks_field = _field(payload, "candidate_mask", required=False)
+    dense_consistent_field = _first_field(payload, ("dense_consistent", "candidate_dense_consistent"))
+    sparse_inlier_field = _first_field(payload, ("sparse_inlier", "candidate_sparse_inlier"))
+    reprojection_error_field = _first_field(
+        payload,
+        ("reprojection_error", "reprojection_error_px", "candidate_reprojection_error_px"),
+    )
+    solver_weight_field = _first_field(payload, ("solver_weight", "distill_weight", "candidate_solver_weight"))
+    label_roles_field = _first_field(payload, ("label_roles", "label_role", "candidate_label_roles"))
     image_ids = (
         [str(v) for v in _rows(image_ids_field, max_rows=max_rows)]
         if image_ids_field is not None
@@ -174,6 +189,13 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
         [str(v) for v in _rows(phase_field, max_rows=max_rows)] if phase_field is not None else [split_name] * len(query_ids)
     )
     masks = _rows(masks_field, max_rows=max_rows) if masks_field is not None else None
+    dense_consistent = _rows(dense_consistent_field, max_rows=max_rows) if dense_consistent_field is not None else None
+    sparse_inlier = _rows(sparse_inlier_field, max_rows=max_rows) if sparse_inlier_field is not None else None
+    reprojection_error = (
+        _rows(reprojection_error_field, max_rows=max_rows) if reprojection_error_field is not None else None
+    )
+    solver_weight = _rows(solver_weight_field, max_rows=max_rows) if solver_weight_field is not None else None
+    label_roles = _rows(label_roles_field, max_rows=max_rows) if label_roles_field is not None else None
 
     row_count = len(query_yx)
     lengths = {
@@ -187,8 +209,17 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
     }
     if any(length != row_count for length in lengths.values()):
         raise ValueError(f"candidate artifact field length mismatch: query_yx={row_count}, lengths={lengths}")
-    if masks is not None and len(masks) != row_count:
-        raise ValueError("candidate_mask must have the same row count as query_yx")
+    optional_row_fields = {
+        "candidate_mask": masks,
+        "dense_consistent": dense_consistent,
+        "sparse_inlier": sparse_inlier,
+        "reprojection_error": reprojection_error,
+        "solver_weight": solver_weight,
+        "label_roles": label_roles,
+    }
+    for name, value in optional_row_fields.items():
+        if value is not None and len(value) != row_count:
+            raise ValueError(f"{name} must have the same row count as query_yx")
 
     grouped: "OrderedDict[str, dict[str, list[Any]]]" = OrderedDict()
     for row_idx in range(row_count):
@@ -213,6 +244,11 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
                 "teacher_labels": [],
                 "candidate_valid_mask": [],
                 "candidate_geometric_correct": [],
+                "candidate_dense_consistent": [],
+                "candidate_sparse_inlier": [],
+                "candidate_reprojection_error_px": [],
+                "candidate_solver_weight": [],
+                "candidate_label_roles": [],
                 "source_keypoint_ids": [],
                 "source_phases": [],
             },
@@ -223,6 +259,16 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
         bucket["teacher_labels"].append(teacher_label)
         bucket["candidate_valid_mask"].append(valid_mask)
         bucket["candidate_geometric_correct"].append(correct)
+        if dense_consistent is not None:
+            bucket["candidate_dense_consistent"].append([bool(v) for v in dense_consistent[row_idx]])
+        if sparse_inlier is not None:
+            bucket["candidate_sparse_inlier"].append([bool(v) for v in sparse_inlier[row_idx]])
+        if reprojection_error is not None:
+            bucket["candidate_reprojection_error_px"].append([float(v) for v in reprojection_error[row_idx]])
+        if solver_weight is not None:
+            bucket["candidate_solver_weight"].append([float(v) for v in solver_weight[row_idx]])
+        if label_roles is not None:
+            bucket["candidate_label_roles"].append([str(v) for v in label_roles[row_idx]])
         bucket["source_keypoint_ids"].append(keypoint_ids[row_idx])
         bucket["source_phases"].append(phases[row_idx])
 
@@ -238,6 +284,11 @@ def load_listwise_candidate_artifact(path: str | Path, *, max_rows: int | None =
             teacher_labels=bucket["teacher_labels"],
             candidate_valid_mask=bucket["candidate_valid_mask"],
             candidate_geometric_correct=bucket["candidate_geometric_correct"],
+            candidate_dense_consistent=bucket["candidate_dense_consistent"] or None,
+            candidate_sparse_inlier=bucket["candidate_sparse_inlier"] or None,
+            candidate_reprojection_error_px=bucket["candidate_reprojection_error_px"] or None,
+            candidate_solver_weight=bucket["candidate_solver_weight"] or None,
+            candidate_label_roles=bucket["candidate_label_roles"] or None,
             source_keypoint_ids=bucket["source_keypoint_ids"],
             source_phases=bucket["source_phases"],
             metadata={"source_path": str(source_path), "artifact_format": artifact_format},
@@ -269,6 +320,11 @@ def _batch_to_json_dict(batch: SparseCandidateBatch) -> dict[str, object]:
         "teacher_labels": list(batch.teacher_labels) if batch.teacher_labels is not None else None,
         "candidate_valid_mask": batch.candidate_valid_mask,
         "candidate_geometric_correct": batch.candidate_geometric_correct,
+        "candidate_dense_consistent": batch.candidate_dense_consistent,
+        "candidate_sparse_inlier": batch.candidate_sparse_inlier,
+        "candidate_reprojection_error_px": batch.candidate_reprojection_error_px,
+        "candidate_solver_weight": batch.candidate_solver_weight,
+        "candidate_label_roles": batch.candidate_label_roles,
         "source_keypoint_ids": list(batch.source_keypoint_ids) if batch.source_keypoint_ids is not None else None,
         "source_phases": list(batch.source_phases) if batch.source_phases is not None else None,
         "metadata": dict(batch.metadata or {}),

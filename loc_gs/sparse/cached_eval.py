@@ -20,6 +20,7 @@ class CachedSparseEvalConfig:
     image_width: int | None = None
     image_height: int | None = None
     missing_principal_point: str = "pixel_center"
+    query_ids: Sequence[str] | None = None
     max_queries: int | None = None
     max_keypoints: int = 1024
     score_mode: str = "native"
@@ -34,6 +35,12 @@ class CachedSparseEvalConfig:
     second_pnp_enabled: bool = False
     second_pnp_method: str = "iterative"
     lgcv_reprojection_error_px: float = 4.0
+    post_pnp_candidate_rescore: bool = False
+    post_pnp_reprojection_weight: float = 1.0
+    post_pnp_reprojection_score_scale_px: float = 4.0
+    post_pnp_rescore_min_improvement_px: float = 2.0
+    post_pnp_rescore_max_residual_px: float = 4.0
+    post_pnp_rescore_only_initial_outliers: bool = True
 
 
 def run_cached_sparse_eval(
@@ -75,14 +82,31 @@ def run_cached_sparse_eval(
         second_pnp_enabled=bool(cfg.second_pnp_enabled),
         second_pnp_method=str(cfg.second_pnp_method),
         lgcv_reprojection_error_px=float(cfg.lgcv_reprojection_error_px),
+        post_pnp_candidate_rescore=bool(cfg.post_pnp_candidate_rescore),
+        post_pnp_reprojection_weight=float(cfg.post_pnp_reprojection_weight),
+        post_pnp_reprojection_score_scale_px=float(cfg.post_pnp_reprojection_score_scale_px),
+        post_pnp_rescore_min_improvement_px=float(cfg.post_pnp_rescore_min_improvement_px),
+        post_pnp_rescore_max_residual_px=float(cfg.post_pnp_rescore_max_residual_px),
+        post_pnp_rescore_only_initial_outliers=bool(cfg.post_pnp_rescore_only_initial_outliers),
     )
+    requested_query_ids = [str(query_id) for query_id in cfg.query_ids] if cfg.query_ids is not None else None
+    requested_query_set = set(requested_query_ids) if requested_query_ids is not None else None
     rows: list[dict[str, object]] = []
     te_values: list[float] = []
     re_values: list[float] = []
     inliers: list[int] = []
     stage_counts: list[float] = []
     lgcv_keep_counts: list[float] = []
+    post_pnp_changed_counts: list[float] = []
     batches = artifact.batches
+    available_query_ids = {batch.query_id for batch in batches}
+    missing_query_ids = (
+        [query_id for query_id in requested_query_ids or [] if query_id not in available_query_ids]
+        if requested_query_ids is not None
+        else []
+    )
+    if requested_query_set is not None:
+        batches = [batch for batch in batches if batch.query_id in requested_query_set]
     if cfg.max_queries is not None:
         batches = batches[: max(0, int(cfg.max_queries))]
     for batch in batches:
@@ -109,6 +133,7 @@ def run_cached_sparse_eval(
         stage_counts.append(float(result.pnp_stage_count))
         if result.lgcv_keep_count is not None:
             lgcv_keep_counts.append(float(result.lgcv_keep_count))
+        post_pnp_changed_counts.append(float(result.post_pnp_rescore_changed_count))
         rows.append(
             {
                 "query_id": batch.query_id,
@@ -116,6 +141,7 @@ def run_cached_sparse_eval(
                 "inlier_count": int(result.inlier_count),
                 "initial_inlier_count": int(result.initial_inlier_count),
                 "lgcv_keep_count": result.lgcv_keep_count,
+                "post_pnp_rescore_changed_count": int(result.post_pnp_rescore_changed_count),
                 "pnp_stage_count": int(result.pnp_stage_count),
                 "selected_count": int(len(result.selected_landmark_ids)),
                 "te_cm": te_cm,
@@ -128,6 +154,11 @@ def run_cached_sparse_eval(
         "schema_version": "internal_sparse_cached_eval_metrics_v1",
         "scene": str(scene),
         "split_name": split,
+        "query_filter_enabled": bool(requested_query_ids is not None),
+        "requested_query_count": None if requested_query_ids is None else int(len(requested_query_ids)),
+        "matched_query_count": None if requested_query_ids is None else int(len(rows)),
+        "missing_query_count": None if requested_query_ids is None else int(len(missing_query_ids)),
+        "missing_query_ids_preview": missing_query_ids[:10],
         "query_count": int(len(rows)),
         "success_count": int(len(success_rows)),
         "success_rate": float(len(success_rows) / max(1, len(rows))),
@@ -141,6 +172,8 @@ def run_cached_sparse_eval(
         "candidate_scorer_enabled": bool(scorer is not None),
         "pnp_stage_count_median": _median_or_none(stage_counts),
         "lgcv_keep_count_median": _median_or_none(lgcv_keep_counts),
+        "post_pnp_rescore_changed_count_median": _median_or_none(post_pnp_changed_counts),
+        "post_pnp_candidate_rescore_enabled": bool(cfg.post_pnp_candidate_rescore),
         "candidate_artifact": artifact.summarize_candidate_availability(),
     }
     return summary, rows

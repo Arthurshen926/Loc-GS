@@ -34,6 +34,27 @@ def test_solver_feedback_labels_measure_dense_improvement_and_weights():
     assert labels[1].distill_weight == 0.0
 
 
+def test_solver_feedback_labels_accept_legacy_dense_result_field_names():
+    labels = build_solver_feedback_labels(
+        scene="GreatCourt",
+        split_name="train",
+        sparse_rows=[
+            {"image_name": "q1.png", "sparse_te": 22.0, "sparse_ae": 0.9, "sparse_inliers": 30},
+            {"image_name": "q2.png", "te_cm": 12.0, "re_deg": 0.4, "inlier_count": 70},
+        ],
+        dense_rows=[
+            {"image_name": "q1.png", "sparse_conditioned_dense_te_cm": 8.0, "sparse_conditioned_dense_re_deg": 0.2},
+            {"image_name": "q2.png", "base_dense_te_cm": 11.0, "base_dense_re_deg": 0.3},
+        ],
+        cfg=SolverFeedbackConfig(min_dense_improvement_cm=2.0, weight_clip_cm=20.0),
+    )
+
+    assert labels[0].dense_helped is True
+    assert labels[0].translation_improvement_cm == 14.0
+    assert labels[0].rotation_improvement_deg == 0.7
+    assert labels[1].dense_helped is False
+
+
 def test_solver_feedback_labels_reject_test_split():
     with pytest.raises(ValueError, match="test split"):
         build_solver_feedback_labels(

@@ -140,3 +140,41 @@ def test_eval_internal_sparse_cached_cli_writes_auditable_eval_bundle(tmp_path: 
     assert split_audit["audit_status"] == "passed"
     assert (out / "command.txt").is_file()
     assert (out / "git_status.txt").is_file()
+
+
+def test_eval_internal_sparse_cached_cli_accepts_query_id_filter(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    query_ids = tmp_path / "query_ids.txt"
+    query_ids.write_text("img.png\nmissing.png\n", encoding="utf-8")
+    out = tmp_path / "eval_filtered"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt", cameras)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--query_ids",
+            str(query_ids),
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    assert metrics["query_filter_enabled"] is True
+    assert metrics["requested_query_count"] == 2
+    assert metrics["matched_query_count"] == 1
+    assert metrics["missing_query_count"] == 1
+    assert metrics["missing_query_ids_preview"] == ["missing.png"]

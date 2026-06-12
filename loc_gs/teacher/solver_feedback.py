@@ -80,12 +80,32 @@ def build_solver_feedback_labels(
         if not qid or qid not in dense_by_query:
             continue
         dense = dense_by_query[qid]
-        sparse_te = _float_field(sparse, "sparse_te_cm", "te_cm", "median_te_cm")
-        dense_te = _float_field(dense, "dense_te_cm", "te_cm", "sparse_te_cm", "median_te_cm")
+        sparse_te = _float_field(sparse, "sparse_te_cm", "sparse_te", "te_cm", "median_te_cm")
+        dense_te = _float_field(
+            dense,
+            "dense_te_cm",
+            "sparse_conditioned_dense_te_cm",
+            "base_dense_te_cm",
+            "dense_te",
+            "te_cm",
+            "sparse_te_cm",
+            "sparse_te",
+            "median_te_cm",
+        )
         if sparse_te is None or dense_te is None:
             continue
-        sparse_re = _float_field(sparse, "sparse_re_deg", "re_deg", "median_re_deg")
-        dense_re = _float_field(dense, "dense_re_deg", "re_deg", "sparse_re_deg", "median_re_deg")
+        sparse_re = _float_field(sparse, "sparse_re_deg", "sparse_ae", "re_deg", "median_re_deg")
+        dense_re = _float_field(
+            dense,
+            "dense_re_deg",
+            "sparse_conditioned_dense_re_deg",
+            "base_dense_re_deg",
+            "dense_ae",
+            "re_deg",
+            "sparse_re_deg",
+            "sparse_ae",
+            "median_re_deg",
+        )
         improvement = float(sparse_te - dense_te)
         rotation_improvement = None if sparse_re is None or dense_re is None else float(sparse_re - dense_re)
         dense_helped = improvement >= float(cfg.min_dense_improvement_cm)

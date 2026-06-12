@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         "command": [sys.executable, "-m", "loc_gs.scripts.train_internal_sparse_candidate_scorer", *(argv or sys.argv[1:])],
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "inference_stage": "sparse_candidate_scorer_training",
-        "dense_teacher_enabled": True,
+        "dense_teacher_enabled": bool(summary.get("dense_teacher_sample_count", 0)),
         "dense_inference_enabled": False,
         "external_runtime_dependency": "forbidden",
         "candidate_artifact": str(args.candidate_artifact),
@@ -62,6 +62,12 @@ def main(argv: list[str] | None = None) -> int:
             "epochs": int(args.epochs),
             "learning_rate": float(args.learning_rate),
             "rank_feature_scale": float(args.rank_feature_scale),
+            "reprojection_error_scale_px": float(cfg.reprojection_error_scale_px),
+            "protected_support_weight": float(cfg.protected_support_weight),
+            "positive_inlier_weight": float(cfg.positive_inlier_weight),
+            "hard_negative_weight": float(cfg.hard_negative_weight),
+            "neutral_weight": float(cfg.neutral_weight),
+            "feature_names": list(cfg.feature_names),
         },
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)

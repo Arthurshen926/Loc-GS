@@ -12,6 +12,7 @@ from typing import Sequence
 from loc_gs.sparse.audit import reject_test_split
 from loc_gs.sparse.cached_eval import CachedSparseEvalConfig, run_cached_sparse_eval
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
+from loc_gs.sparse.results_metrics import load_query_ids
 
 
 def _git_commit() -> str:
@@ -73,6 +74,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--image_width", type=int, default=None)
     parser.add_argument("--image_height", type=int, default=None)
     parser.add_argument("--missing_principal_point", choices=["half_extent", "pixel_center"], default="pixel_center")
+    parser.add_argument("--query_ids", type=Path, default=None)
     parser.add_argument("--max_queries", type=int, default=None)
     parser.add_argument("--max_keypoints", type=int, default=1024)
     parser.add_argument("--score_mode", choices=["native", "teacher_oracle"], default="native")
@@ -87,17 +89,25 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--second_pnp_enabled", action="store_true")
     parser.add_argument("--second_pnp_method", choices=["epnp", "iterative"], default="iterative")
     parser.add_argument("--lgcv_reprojection_error_px", type=float, default=4.0)
+    parser.add_argument("--post_pnp_candidate_rescore", action="store_true")
+    parser.add_argument("--post_pnp_reprojection_weight", type=float, default=1.0)
+    parser.add_argument("--post_pnp_reprojection_score_scale_px", type=float, default=4.0)
+    parser.add_argument("--post_pnp_rescore_min_improvement_px", type=float, default=2.0)
+    parser.add_argument("--post_pnp_rescore_max_residual_px", type=float, default=4.0)
+    parser.add_argument("--post_pnp_rescore_all_matches", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_argparser().parse_args(argv)
     split = reject_test_split(str(args.split_name), purpose="internal sparse cached eval")
+    query_ids = load_query_ids(args.query_ids) if args.query_ids is not None else None
     command = [sys.executable, "-m", "loc_gs.scripts.eval_internal_sparse_cached", *(argv or sys.argv[1:])]
     cfg = CachedSparseEvalConfig(
         image_width=args.image_width,
         image_height=args.image_height,
         missing_principal_point=str(args.missing_principal_point),
+        query_ids=query_ids,
         max_queries=args.max_queries,
         max_keypoints=int(args.max_keypoints),
         score_mode=str(args.score_mode),
@@ -112,6 +122,12 @@ def main(argv: list[str] | None = None) -> int:
         second_pnp_enabled=bool(args.second_pnp_enabled),
         second_pnp_method=str(args.second_pnp_method),
         lgcv_reprojection_error_px=float(args.lgcv_reprojection_error_px),
+        post_pnp_candidate_rescore=bool(args.post_pnp_candidate_rescore),
+        post_pnp_reprojection_weight=float(args.post_pnp_reprojection_weight),
+        post_pnp_reprojection_score_scale_px=float(args.post_pnp_reprojection_score_scale_px),
+        post_pnp_rescore_min_improvement_px=float(args.post_pnp_rescore_min_improvement_px),
+        post_pnp_rescore_max_residual_px=float(args.post_pnp_rescore_max_residual_px),
+        post_pnp_rescore_only_initial_outliers=not bool(args.post_pnp_rescore_all_matches),
     )
     summary, rows = run_cached_sparse_eval(
         scene=str(args.scene),
@@ -125,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         "image_width": args.image_width,
         "image_height": args.image_height,
         "missing_principal_point": str(args.missing_principal_point),
+        "query_ids": None if args.query_ids is None else str(args.query_ids),
         "max_queries": args.max_queries,
         "max_keypoints": int(args.max_keypoints),
         "score_mode": str(args.score_mode),
@@ -139,6 +156,12 @@ def main(argv: list[str] | None = None) -> int:
         "second_pnp_enabled": bool(args.second_pnp_enabled),
         "second_pnp_method": str(args.second_pnp_method),
         "lgcv_reprojection_error_px": float(args.lgcv_reprojection_error_px),
+        "post_pnp_candidate_rescore": bool(args.post_pnp_candidate_rescore),
+        "post_pnp_reprojection_weight": float(args.post_pnp_reprojection_weight),
+        "post_pnp_reprojection_score_scale_px": float(args.post_pnp_reprojection_score_scale_px),
+        "post_pnp_rescore_min_improvement_px": float(args.post_pnp_rescore_min_improvement_px),
+        "post_pnp_rescore_max_residual_px": float(args.post_pnp_rescore_max_residual_px),
+        "post_pnp_rescore_only_initial_outliers": not bool(args.post_pnp_rescore_all_matches),
     }
     manifest = build_cached_eval_manifest(
         scene=str(args.scene),

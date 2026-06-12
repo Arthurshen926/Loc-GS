@@ -16,13 +16,23 @@ class CandidateScorerConfig:
     epochs: int = 100
     learning_rate: float = 0.1
     rank_feature_scale: float = 1.0
+    reprojection_error_scale_px: float = 8.0
+    protected_support_weight: float = 2.0
+    positive_inlier_weight: float = 1.25
+    hard_negative_weight: float = 1.5
+    neutral_weight: float = 1.0
+    feature_names: tuple[str, ...] = (
+        "native_score",
+        "negative_rank",
+        "valid",
+    )
 
 
 @dataclass(frozen=True)
 class LinearCandidateScorer:
-    weights: tuple[float, float, float]
+    weights: tuple[float, ...]
     bias: float
-    feature_names: tuple[str, str, str] = ("native_score", "negative_rank", "valid")
+    feature_names: tuple[str, ...] = CandidateScorerConfig.feature_names
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -33,12 +43,18 @@ class LinearCandidateScorer:
     @classmethod
     def from_json_dict(cls, payload: dict[str, object]) -> "LinearCandidateScorer":
         weights = tuple(float(value) for value in payload.get("weights", ()))
-        if len(weights) != 3:
-            raise ValueError("internal sparse candidate scorer weights must contain three values")
+        if not weights:
+            raise ValueError("internal sparse candidate scorer weights must not be empty")
+        feature_names = tuple(
+            str(value)
+            for value in payload.get("feature_names", CandidateScorerConfig.feature_names[: len(weights)])
+        )
+        if len(feature_names) != len(weights):
+            raise ValueError("internal sparse candidate scorer feature_names must match weights")
         return cls(
             weights=weights,
             bias=float(payload.get("bias", 0.0)),
-            feature_names=tuple(str(value) for value in payload.get("feature_names", ("native_score", "negative_rank", "valid"))),
+            feature_names=feature_names,
         )
 
 
@@ -47,10 +63,81 @@ def _sigmoid(values: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-values))
 
 
-def _training_matrix(artifact: CachedCandidateArtifact, cfg: CandidateScorerConfig) -> tuple[np.ndarray, np.ndarray]:
+def _grid_value(rows: Sequence[Sequence[object]] | None, row_idx: int, rank: int, default: object) -> object:
+    if rows is None or row_idx >= len(rows) or rank >= len(rows[row_idx]):
+        return default
+    return rows[row_idx][rank]
+
+
+def _candidate_feature(
+    batch: SparseCandidateBatch,
+    *,
+    row_idx: int,
+    rank: int,
+    native_score: float,
+    valid: bool,
+    feature_names: Sequence[str],
+    rank_feature_scale: float = 1.0,
+    reprojection_error_scale_px: float = 8.0,
+) -> list[float]:
+    dense = bool(_grid_value(batch.candidate_dense_consistent, row_idx, rank, False))
+    sparse_inlier = bool(_grid_value(batch.candidate_sparse_inlier, row_idx, rank, False))
+    reprojection = float(_grid_value(batch.candidate_reprojection_error_px, row_idx, rank, 0.0))
+    solver_weight = float(_grid_value(batch.candidate_solver_weight, row_idx, rank, 1.0))
+    scale = max(1.0e-9, float(reprojection_error_scale_px))
+    feature_values = {
+        "native_score": float(native_score),
+        "negative_rank": -float(rank) * float(rank_feature_scale),
+        "valid": 1.0 if valid else 0.0,
+        "dense_consistent": 1.0 if dense else 0.0,
+        "sparse_inlier": 1.0 if sparse_inlier else 0.0,
+        "negative_reprojection_error": -float(reprojection) / scale,
+        "solver_weight": float(solver_weight),
+    }
+    try:
+        return [float(feature_values[str(name)]) for name in feature_names]
+    except KeyError as exc:
+        raise ValueError(f"unsupported candidate scorer feature: {exc.args[0]}") from exc
+
+
+def _candidate_target(batch: SparseCandidateBatch, *, row_idx: int, rank: int) -> float:
+    role = str(_grid_value(batch.candidate_label_roles, row_idx, rank, ""))
+    if role in {"protected_support", "positive_inlier"}:
+        return 1.0
+    if role == "hard_negative":
+        return 0.0
+    geometric = bool(_grid_value(batch.candidate_geometric_correct, row_idx, rank, False))
+    if batch.candidate_dense_consistent is not None:
+        return 1.0 if geometric and bool(_grid_value(batch.candidate_dense_consistent, row_idx, rank, False)) else 0.0
+    if batch.candidate_sparse_inlier is not None:
+        return 1.0 if geometric and bool(_grid_value(batch.candidate_sparse_inlier, row_idx, rank, False)) else 0.0
+    return 1.0 if geometric else 0.0
+
+
+def _candidate_sample_weight(batch: SparseCandidateBatch, *, row_idx: int, rank: int, target: float, cfg: CandidateScorerConfig) -> float:
+    role = str(_grid_value(batch.candidate_label_roles, row_idx, rank, ""))
+    dense = bool(_grid_value(batch.candidate_dense_consistent, row_idx, rank, False))
+    sparse_inlier = bool(_grid_value(batch.candidate_sparse_inlier, row_idx, rank, False))
+    reprojection = float(_grid_value(batch.candidate_reprojection_error_px, row_idx, rank, 0.0))
+    solver_weight = max(0.0, float(_grid_value(batch.candidate_solver_weight, row_idx, rank, 1.0)))
+    if role == "protected_support" or (target > 0.5 and dense and sparse_inlier):
+        base = float(cfg.protected_support_weight)
+    elif role == "positive_inlier" or target > 0.5:
+        base = float(cfg.positive_inlier_weight)
+    elif role == "hard_negative" or reprojection >= float(cfg.reprojection_error_scale_px):
+        base = float(cfg.hard_negative_weight)
+    else:
+        base = float(cfg.neutral_weight)
+    return float(base * max(1.0e-6, solver_weight))
+
+
+def _training_matrix(artifact: CachedCandidateArtifact, cfg: CandidateScorerConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int | float]]:
     features: list[list[float]] = []
     labels: list[float] = []
+    weights: list[float] = []
+    dense_teacher_sample_count = 0
     for batch in artifact.batches:
+        batch.validate()
         correct_rows = batch.candidate_geometric_correct or []
         valid_rows = batch.candidate_valid_mask or []
         for row_idx, scores in enumerate(batch.candidate_scores):
@@ -60,11 +147,35 @@ def _training_matrix(artifact: CachedCandidateArtifact, cfg: CandidateScorerConf
                 valid = True if not valid_rows else bool(valid_rows[row_idx][rank])
                 if not valid:
                     continue
-                features.append([float(score), -float(rank) * float(cfg.rank_feature_scale), 1.0])
-                labels.append(1.0 if bool(correct_rows[row_idx][rank]) else 0.0)
+                if batch.candidate_dense_consistent is not None:
+                    dense_teacher_sample_count += 1
+                target = _candidate_target(batch, row_idx=row_idx, rank=rank)
+                features.append(
+                    _candidate_feature(
+                        batch,
+                        row_idx=row_idx,
+                        rank=rank,
+                        native_score=float(score),
+                        valid=valid,
+                        feature_names=cfg.feature_names,
+                        rank_feature_scale=float(cfg.rank_feature_scale),
+                        reprojection_error_scale_px=float(cfg.reprojection_error_scale_px),
+                    )
+                )
+                labels.append(target)
+                weights.append(_candidate_sample_weight(batch, row_idx=row_idx, rank=rank, target=target, cfg=cfg))
     if not features:
         raise ValueError("candidate artifact did not contain trainable labels")
-    return np.asarray(features, dtype=np.float64), np.asarray(labels, dtype=np.float64)
+    stats = {
+        "dense_teacher_sample_count": int(dense_teacher_sample_count),
+        "weighted_sample_count": float(sum(weights)),
+    }
+    return (
+        np.asarray(features, dtype=np.float64),
+        np.asarray(labels, dtype=np.float64),
+        np.asarray(weights, dtype=np.float64),
+        stats,
+    )
 
 
 def train_candidate_scorer(
@@ -73,15 +184,20 @@ def train_candidate_scorer(
 ) -> tuple[LinearCandidateScorer, dict[str, object]]:
     if cfg is None:
         cfg = CandidateScorerConfig()
-    x, y = _training_matrix(artifact, cfg)
+    x, y, sample_weights, training_stats = _training_matrix(artifact, cfg)
     weights = np.zeros(x.shape[1], dtype=np.float64)
     bias = 0.0
+    normalizer = max(1.0e-9, float(sample_weights.sum()))
     for _epoch in range(int(cfg.epochs)):
         pred = _sigmoid(x @ weights + bias)
-        err = pred - y
-        weights -= float(cfg.learning_rate) * (x.T @ err) / max(1, x.shape[0])
-        bias -= float(cfg.learning_rate) * float(err.mean())
-    model = LinearCandidateScorer(weights=tuple(float(v) for v in weights), bias=float(bias))
+        err = (pred - y) * sample_weights
+        weights -= float(cfg.learning_rate) * (x.T @ err) / normalizer
+        bias -= float(cfg.learning_rate) * float(err.sum() / normalizer)
+    model = LinearCandidateScorer(
+        weights=tuple(float(v) for v in weights),
+        bias=float(bias),
+        feature_names=tuple(str(name) for name in cfg.feature_names),
+    )
     trained_top1 = _count_top1_correct(artifact, model)
     native_top1 = _count_native_top1_correct(artifact)
     summary = {
@@ -92,6 +208,7 @@ def train_candidate_scorer(
         "trained_top1_correct": int(trained_top1),
         "epochs": int(cfg.epochs),
         "learning_rate": float(cfg.learning_rate),
+        **training_stats,
     }
     return model, summary
 
@@ -107,7 +224,17 @@ def score_candidate_rows(batch: SparseCandidateBatch, model: LinearCandidateScor
             valid = True if not valid_rows else bool(valid_rows[row_idx][rank])
             if not valid:
                 continue
-            feature = np.asarray([float(score), -float(rank), 1.0], dtype=np.float64)
+            feature = np.asarray(
+                _candidate_feature(
+                    batch,
+                    row_idx=row_idx,
+                    rank=rank,
+                    native_score=float(score),
+                    valid=valid,
+                    feature_names=model.feature_names,
+                ),
+                dtype=np.float64,
+            )
             solver_score = float(feature @ weights + float(model.bias))
             correct = row_idx < len(correct_rows) and bool(correct_rows[row_idx][rank])
             scored.append(
@@ -125,10 +252,22 @@ def score_candidate_rows(batch: SparseCandidateBatch, model: LinearCandidateScor
 def candidate_solver_score_rows(batch: SparseCandidateBatch, model: LinearCandidateScorer) -> list[list[float]]:
     weights = np.asarray(model.weights, dtype=np.float64)
     rows: list[list[float]] = []
-    for scores in batch.candidate_scores:
+    valid_rows = batch.candidate_valid_mask or []
+    for row_idx, scores in enumerate(batch.candidate_scores):
         row: list[float] = []
         for rank, score in enumerate(scores):
-            feature = np.asarray([float(score), -float(rank), 1.0], dtype=np.float64)
+            valid = True if not valid_rows else bool(valid_rows[row_idx][rank])
+            feature = np.asarray(
+                _candidate_feature(
+                    batch,
+                    row_idx=row_idx,
+                    rank=rank,
+                    native_score=float(score),
+                    valid=valid,
+                    feature_names=model.feature_names,
+                ),
+                dtype=np.float64,
+            )
             row.append(float(feature @ weights + float(model.bias)))
         rows.append(row)
     return rows

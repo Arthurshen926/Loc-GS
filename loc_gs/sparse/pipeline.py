@@ -6,6 +6,7 @@ from typing import Sequence
 import numpy as np
 
 from loc_gs.core.camera import CameraIntrinsics
+from loc_gs.core.geometry import project_points_w2c
 from loc_gs.core.pnp import OpenCvPnPConfig, solve_pnp_ransac
 from loc_gs.sparse.audit import reject_test_split
 from loc_gs.sparse.rerank import (
@@ -71,6 +72,12 @@ class SparseLocalizationConfig:
     second_pnp_enabled: bool = False
     second_pnp_method: str = "iterative"
     lgcv_reprojection_error_px: float = 4.0
+    post_pnp_candidate_rescore: bool = False
+    post_pnp_reprojection_weight: float = 1.0
+    post_pnp_reprojection_score_scale_px: float = 4.0
+    post_pnp_rescore_min_improvement_px: float = 2.0
+    post_pnp_rescore_max_residual_px: float = 4.0
+    post_pnp_rescore_only_initial_outliers: bool = True
 
 
 @dataclass(frozen=True)
@@ -84,6 +91,7 @@ class SparseLocalizationResult:
     pnp_stage_count: int = 0
     initial_inlier_count: int = 0
     lgcv_keep_count: int | None = None
+    post_pnp_rescore_changed_count: int = 0
     pnp_method: str = "epnp"
     second_pnp_method: str | None = None
 
@@ -105,6 +113,76 @@ def _rank_candidates(
             native_weight=float(cfg.native_weight),
         ),
     )
+
+
+def _match_scores(rows: Sequence[dict[str, object]], cfg: SparseLocalizationConfig) -> np.ndarray:
+    return np.asarray(
+        [
+            float(row.get("native_score", 0.0)) * float(cfg.native_weight)
+            + float(row.get("solver_score", 0.0)) * float(cfg.solver_weight)
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
+
+
+def _post_pnp_rescore_rows(
+    data: SparseLocalizationInput,
+    pose_w2c: np.ndarray,
+    cfg: SparseLocalizationConfig,
+    *,
+    eligible_mask: np.ndarray | None = None,
+) -> tuple[list[dict[str, object]], int]:
+    keypoints = np.asarray(data.keypoints_xy, dtype=np.float64).reshape(-1, 2)
+    selected_rows: list[dict[str, object]] = []
+    changed_count = 0
+    scale = max(1.0e-9, float(cfg.post_pnp_reprojection_score_scale_px))
+    for row_idx, candidates in enumerate(data.candidates_by_keypoint):
+        ranked = _rank_candidates(candidates, cfg)
+        if eligible_mask is not None and row_idx < eligible_mask.shape[0] and not bool(eligible_mask[row_idx]):
+            selected_rows.append(dict(ranked[0]))
+            continue
+        points = np.asarray([row["point3d"] for row in ranked], dtype=np.float64).reshape(-1, 3)
+        projected_xy, valid = project_points_w2c(points, pose_w2c, data.intrinsics)
+        residuals = np.linalg.norm(projected_xy - keypoints[row_idx].reshape(1, 2), axis=1)
+        rescored: list[tuple[float, int, dict[str, object]]] = []
+        for candidate_idx, row in enumerate(ranked):
+            residual = (
+                float(residuals[candidate_idx])
+                if bool(valid[candidate_idx]) and np.isfinite(residuals[candidate_idx])
+                else float("inf")
+            )
+            base_score = (
+                float(row.get("native_score", 0.0)) * float(cfg.native_weight)
+                + float(row.get("solver_score", 0.0)) * float(cfg.solver_weight)
+            )
+            runtime_score = (
+                base_score - float(cfg.post_pnp_reprojection_weight) * (residual / scale)
+                if np.isfinite(residual)
+                else -1.0e12
+            )
+            enriched = dict(row)
+            enriched["post_pnp_reprojection_error_px"] = residual
+            enriched["post_pnp_runtime_score"] = runtime_score
+            enriched["post_pnp_rescore_candidate_index"] = candidate_idx
+            rescored.append((runtime_score, -candidate_idx, enriched))
+        best = max(rescored, key=lambda item: (item[0], item[1]))[2]
+        initial = dict(ranked[0])
+        initial_residual = (
+            float(residuals[0]) if bool(valid[0]) and np.isfinite(residuals[0]) else float("inf")
+        )
+        initial["post_pnp_reprojection_error_px"] = initial_residual
+        initial["post_pnp_runtime_score"] = rescored[0][0]
+        initial["post_pnp_rescore_candidate_index"] = 0
+        best_residual = float(best["post_pnp_reprojection_error_px"])
+        improved_enough = initial_residual - best_residual >= float(cfg.post_pnp_rescore_min_improvement_px)
+        low_residual = best_residual <= float(cfg.post_pnp_rescore_max_residual_px)
+        if not (improved_enough and low_residual):
+            best = initial
+        if int(best["landmark_id"]) != int(ranked[0]["landmark_id"]):
+            changed_count += 1
+        selected_rows.append(best)
+    return selected_rows, changed_count
 
 
 def run_sparse_localization(
@@ -131,14 +209,7 @@ def run_sparse_localization(
 
     points = np.asarray([row["point3d"] for row in selected_rows], dtype=np.float64).reshape(-1, 3)
     keypoints_xy = np.asarray(data.keypoints_xy, dtype=np.float64).reshape(-1, 2)
-    scores = np.asarray(
-        [
-            float(row.get("native_score", 0.0)) * float(cfg.native_weight)
-            + float(row.get("solver_score", 0.0)) * float(cfg.solver_weight)
-            for row in selected_rows
-        ],
-        dtype=np.float64,
-    )
+    scores = _match_scores(selected_rows, cfg)
     if points.shape[0] < int(cfg.min_correspondences):
         return SparseLocalizationResult(
             success=False,
@@ -167,7 +238,21 @@ def run_sparse_localization(
     pnp_stage_count = 1 if bool(pnp.success) else 0
     lgcv_keep_count = None
     second_method = None
+    post_pnp_changed_count = 0
     if bool(pnp.success) and bool(cfg.second_pnp_enabled) and pnp.pose_w2c is not None:
+        if bool(cfg.post_pnp_candidate_rescore):
+            eligible = None
+            if bool(cfg.post_pnp_rescore_only_initial_outliers):
+                eligible = ~np.asarray(pnp.inlier_mask, dtype=bool)
+            selected_rows, post_pnp_changed_count = _post_pnp_rescore_rows(
+                data,
+                pnp.pose_w2c,
+                cfg,
+                eligible_mask=eligible,
+            )
+            selected_landmark_ids = [int(row["landmark_id"]) for row in selected_rows]
+            points = np.asarray([row["point3d"] for row in selected_rows], dtype=np.float64).reshape(-1, 3)
+            scores = _match_scores(selected_rows, cfg)
         lgcv = filter_correspondences_by_reprojection(
             points,
             keypoints_xy,
@@ -208,6 +293,7 @@ def run_sparse_localization(
         pnp_stage_count=pnp_stage_count,
         initial_inlier_count=int(pnp.inlier_count),
         lgcv_keep_count=lgcv_keep_count,
+        post_pnp_rescore_changed_count=int(post_pnp_changed_count),
         pnp_method=str(cfg.pnp_method),
         second_pnp_method=second_method,
     )

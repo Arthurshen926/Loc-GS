@@ -33,6 +33,22 @@ def _write_pair_cache(path: Path, *, split_name: str = "train") -> Path:
             [[True, True, True], [True, False, True], [True, True, False]],
             dtype=torch.bool,
         ),
+        "dense_consistent": torch.tensor(
+            [[False, True, False], [False, False, False], [True, False, False]],
+            dtype=torch.bool,
+        ),
+        "sparse_inlier": torch.tensor(
+            [[False, True, False], [False, False, False], [True, False, False]],
+            dtype=torch.bool,
+        ),
+        "reprojection_error": torch.tensor(
+            [[15.0, 1.0, 20.0], [18.0, 17.0, 16.0], [0.5, 9.0, 12.0]],
+            dtype=torch.float32,
+        ),
+        "solver_weight": torch.tensor(
+            [[0.1, 2.0, 0.1], [0.1, 0.1, 0.1], [3.0, 0.1, 0.1]],
+            dtype=torch.float32,
+        ),
         "query_id": ["img_a.png::kp_0001", "img_a.png::kp_0002", "img_b.png::kp_0001"],
         "image_id": ["img_a.png", "img_a.png", "img_b.png"],
         "keypoint_id": ["kp_0001", "kp_0002", "kp_0001"],
@@ -60,6 +76,12 @@ def test_listwise_artifact_adapter_groups_rows_into_internal_candidate_batches(t
     assert first.teacher_labels == [1, None]
     assert first.candidate_geometric_correct == [[False, True, False], [False, False, False]]
     assert first.candidate_valid_mask == [[True, True, True], [True, False, True]]
+    assert first.candidate_dense_consistent == [[False, True, False], [False, False, False]]
+    assert first.candidate_sparse_inlier == [[False, True, False], [False, False, False]]
+    assert first.candidate_reprojection_error_px == [[15.0, 1.0, 20.0], [18.0, 17.0, 16.0]]
+    assert first.candidate_solver_weight is not None
+    assert first.candidate_solver_weight[0] == pytest.approx([0.1, 2.0, 0.1])
+    assert first.candidate_solver_weight[1] == pytest.approx([0.1, 0.1, 0.1])
 
     summary = artifact.summarize_candidate_availability()
     assert summary["keypoint_count"] == 3

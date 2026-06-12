@@ -143,3 +143,29 @@ def test_cached_sparse_eval_reports_verified_pose_metrics(tmp_path: Path):
     assert summary["pnp_stage_count_median"] == 2.0
     assert len(rows) == 2
     assert rows[0]["te_cm"] < 1.0
+
+
+def test_cached_sparse_eval_filters_queries_and_reports_missing_coverage(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+
+    summary, rows = run_cached_sparse_eval(
+        scene="GreatCourt",
+        split_name="train_dev",
+        candidate_artifact=_write_pair_cache(tmp_path / "pairs.pt", cameras),
+        point_cloud=_write_ply(tmp_path / "point_cloud.ply"),
+        cameras_json=cameras,
+        cfg=CachedSparseEvalConfig(
+            image_width=120,
+            image_height=90,
+            query_ids=("b.png", "missing.png"),
+            max_keypoints=16,
+        ),
+    )
+
+    assert [row["query_id"] for row in rows] == ["b.png"]
+    assert summary["query_filter_enabled"] is True
+    assert summary["requested_query_count"] == 2
+    assert summary["matched_query_count"] == 1
+    assert summary["missing_query_count"] == 1
+    assert summary["missing_query_ids_preview"] == ["missing.png"]
+    assert summary["query_count"] == 1
