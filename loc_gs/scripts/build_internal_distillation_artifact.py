@@ -13,7 +13,9 @@ import torch
 from loc_gs.sparse.audit import reject_test_split
 from loc_gs.teacher.distillation_artifact import (
     DistillationArtifactConfig,
+    build_distillation_payload_from_observations,
     build_distillation_payload,
+    load_teacher_observation_rows,
     load_solver_feedback_label_rows,
 )
 
@@ -31,7 +33,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--scene", required=True)
     parser.add_argument("--split_name", required=True)
     parser.add_argument("--candidate_artifact", type=Path, required=True)
-    parser.add_argument("--solver_feedback_labels", type=Path, required=True)
+    parser.add_argument("--solver_feedback_labels", type=Path, default=None)
+    parser.add_argument("--teacher_observations", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--dense_consistency_reprojection_px", type=float, default=4.0)
     parser.add_argument("--sparse_inlier_reprojection_px", type=float, default=8.0)
@@ -52,13 +55,28 @@ def main(argv: list[str] | None = None) -> int:
     payload = torch.load(args.candidate_artifact, map_location="cpu")
     if not isinstance(payload, dict):
         raise ValueError(f"candidate artifact must contain a dict payload: {args.candidate_artifact}")
-    distilled, summary = build_distillation_payload(
-        payload,
-        load_solver_feedback_label_rows(args.solver_feedback_labels),
-        scene=str(args.scene),
-        split_name=split,
-        cfg=cfg,
-    )
+    if args.solver_feedback_labels is None and args.teacher_observations is None:
+        raise ValueError("--solver_feedback_labels or --teacher_observations is required")
+    if args.solver_feedback_labels is not None and args.teacher_observations is not None:
+        raise ValueError("--solver_feedback_labels and --teacher_observations are mutually exclusive")
+    if args.teacher_observations is not None:
+        distilled, summary = build_distillation_payload_from_observations(
+            payload,
+            load_teacher_observation_rows(str(args.teacher_observations)),
+            scene=str(args.scene),
+            split_name=split,
+            cfg=cfg,
+        )
+        teacher_source = "per_candidate_teacher_observations"
+    else:
+        distilled, summary = build_distillation_payload(
+            payload,
+            load_solver_feedback_label_rows(str(args.solver_feedback_labels)),
+            scene=str(args.scene),
+            split_name=split,
+            cfg=cfg,
+        )
+        teacher_source = "solver_feedback_labels"
     manifest = {
         "schema_version": "internal_distillation_artifact_manifest_v1",
         "method": "sparse_dense_distilled_internal",
@@ -72,7 +90,9 @@ def main(argv: list[str] | None = None) -> int:
         "dense_inference_enabled": False,
         "external_runtime_dependency": "forbidden",
         "candidate_artifact": str(args.candidate_artifact),
-        "solver_feedback_labels": str(args.solver_feedback_labels),
+        "solver_feedback_labels": None if args.solver_feedback_labels is None else str(args.solver_feedback_labels),
+        "teacher_observations": None if args.teacher_observations is None else str(args.teacher_observations),
+        "teacher_source": teacher_source,
         "hyperparameters": {
             "dense_consistency_reprojection_px": float(args.dense_consistency_reprojection_px),
             "sparse_inlier_reprojection_px": float(args.sparse_inlier_reprojection_px),
