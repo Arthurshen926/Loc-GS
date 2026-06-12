@@ -110,6 +110,11 @@ def _write_pair_cache(path: Path, cameras: Path, *, buried_correct: bool = False
         "cosine": cosine,
         "label": label,
         "candidate_mask": candidate_mask,
+        "reprojection_error": torch.where(
+            torch.arange(topk, dtype=torch.int64).reshape(1, topk) == label.reshape(-1, 1),
+            torch.zeros((6, topk), dtype=torch.float32),
+            torch.full((6, topk), 1000.0, dtype=torch.float32),
+        ),
         "query_id": [f"img.png::kp{i}" for i in range(6)],
         "image_id": ["img.png"] * 6,
         "keypoint_id": [f"kp{i}" for i in range(6)],
@@ -164,6 +169,40 @@ def test_eval_internal_sparse_cached_cli_writes_auditable_eval_bundle(tmp_path: 
     assert split_audit["audit_status"] == "passed"
     assert (out / "command.txt").is_file()
     assert (out / "git_status.txt").is_file()
+
+
+def test_eval_internal_sparse_cached_cli_auto_calibrates_camera_frame(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    out = tmp_path / "eval_auto_frame"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt", cameras)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--output_dir",
+            str(out),
+            "--max_queries",
+            "1",
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert metrics["frame_calibration_status"] == "passed"
+    assert metrics["frame_calibration_best_frame"] == "auto_120x90_pixel_center"
+    assert metrics["resolved_image_width"] == 120
+    assert metrics["resolved_image_height"] == 90
+    assert metrics["recall_10cm_5d"] == 1.0
+    assert manifest["hyperparameters"]["frame_auto_calibration"] is True
 
 
 def test_eval_internal_sparse_cached_cli_accepts_query_id_filter(tmp_path: Path):

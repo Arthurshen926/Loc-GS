@@ -11,6 +11,7 @@ from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 from loc_gs.sparse.audit import reject_test_split
 from loc_gs.sparse.landmarks import CacheLandmarkResolver, load_gaussian_landmark_map
 from loc_gs.sparse.pipeline import SparseLocalizationConfig, run_sparse_localization
+from loc_gs.sparse.pose_map_frame_audit import audit_pose_map_frame
 from loc_gs.sparse.real_inputs import CachedSparseInputConfig, sparse_input_from_cached_batch
 from loc_gs.students.descriptor_fusion import descriptor_fusion_score_rows, load_descriptor_fusion
 from loc_gs.students.detector_student import detector_score_rows, load_detector_student
@@ -50,6 +51,9 @@ class CachedSparseEvalConfig:
     post_pnp_rescore_min_improvement_px: float = 2.0
     post_pnp_rescore_max_residual_px: float = 4.0
     post_pnp_rescore_only_initial_outliers: bool = True
+    frame_auto_calibration: bool = True
+    frame_calibration_max_rows: int = 2048
+    frame_calibration_agreement_threshold_px: float = 0.05
 
 
 def run_cached_sparse_eval(
@@ -67,17 +71,39 @@ def run_cached_sparse_eval(
     resolver = CacheLandmarkResolver.from_pair_cache(candidate_artifact, landmark_map)
     if (cfg.image_width is None) != (cfg.image_height is None):
         raise ValueError("image_width and image_height must be provided together")
-    if cfg.image_width is None:
+    resolved_image_width = cfg.image_width
+    resolved_image_height = cfg.image_height
+    resolved_missing_principal_point = str(cfg.missing_principal_point)
+    frame_calibration = _frame_calibration_summary(
+        candidate_artifact=candidate_artifact,
+        point_cloud=point_cloud,
+        cameras_json=cameras_json,
+        enabled=bool(cfg.frame_auto_calibration) and cfg.image_width is None,
+        max_rows=int(cfg.frame_calibration_max_rows),
+        agreement_threshold_px=float(cfg.frame_calibration_agreement_threshold_px),
+    )
+    if frame_calibration.get("status") == "passed":
+        resolved_image_width = int(frame_calibration["best_frame_width"])
+        resolved_image_height = int(frame_calibration["best_frame_height"])
+        best_frame = str(frame_calibration.get("best_frame", ""))
+        if best_frame.endswith("_pixel_center"):
+            resolved_missing_principal_point = "pixel_center"
+        elif best_frame.endswith("_half_extent"):
+            resolved_missing_principal_point = "half_extent"
+    if resolved_image_width is None:
         cameras = load_camera_records(cameras_json)
         pose_metric_frame = "camera_json_c2w"
     else:
         cameras = load_camera_records(
             cameras_json,
-            target_width=int(cfg.image_width),
-            target_height=int(cfg.image_height),
-            missing_principal_point=str(cfg.missing_principal_point),
+            target_width=int(resolved_image_width),
+            target_height=int(resolved_image_height),
+            missing_principal_point=resolved_missing_principal_point,
         )
-        pose_metric_frame = f"camera_json_c2w_resized_{cfg.missing_principal_point}"
+        if frame_calibration.get("status") == "passed":
+            pose_metric_frame = f"camera_json_c2w_{frame_calibration.get('best_frame')}"
+        else:
+            pose_metric_frame = f"camera_json_c2w_resized_{resolved_missing_principal_point}"
     scorer = load_candidate_scorer(cfg.candidate_scorer) if cfg.candidate_scorer is not None else None
     selector = load_landmark_selector(cfg.landmark_selector) if cfg.landmark_selector is not None else None
     descriptor_fusion = load_descriptor_fusion(cfg.descriptor_fusion) if cfg.descriptor_fusion is not None else None
@@ -205,6 +231,12 @@ def run_cached_sparse_eval(
         "recall_5cm_5d": _recall(te_values, re_values, te_threshold_cm=5.0, re_threshold_deg=5.0),
         "pose_metric_status": "verified" if te_values else "missing_gt_pose",
         "pose_metric_frame": pose_metric_frame,
+        "resolved_image_width": None if resolved_image_width is None else int(resolved_image_width),
+        "resolved_image_height": None if resolved_image_height is None else int(resolved_image_height),
+        "resolved_missing_principal_point": resolved_missing_principal_point,
+        "frame_calibration_status": str(frame_calibration.get("status", "disabled")),
+        "frame_calibration_best_frame": frame_calibration.get("best_frame"),
+        "frame_calibration_auto_resize_candidates": frame_calibration.get("auto_resize_candidates", []),
         "candidate_scorer_enabled": bool(scorer is not None),
         "landmark_selector_enabled": bool(selector is not None),
         "descriptor_fusion_enabled": bool(descriptor_fusion is not None),
@@ -216,6 +248,44 @@ def run_cached_sparse_eval(
         "candidate_artifact": artifact.summarize_candidate_availability(),
     }
     return summary, rows
+
+
+def _frame_calibration_summary(
+    *,
+    candidate_artifact: str | Path,
+    point_cloud: str | Path,
+    cameras_json: str | Path,
+    enabled: bool,
+    max_rows: int,
+    agreement_threshold_px: float,
+) -> dict[str, object]:
+    if not enabled:
+        return {"status": "disabled"}
+    try:
+        audit = audit_pose_map_frame(
+            candidate_artifact=candidate_artifact,
+            point_cloud=point_cloud,
+            cameras_json=cameras_json,
+            max_rows=max_rows,
+            agreement_threshold_px=agreement_threshold_px,
+        )
+    except Exception as exc:
+        return {"status": "failed", "reason": str(exc)}
+    best_width = audit.get("best_frame_width")
+    best_height = audit.get("best_frame_height")
+    if audit.get("status") == "passed" and best_width is not None and best_height is not None:
+        return {
+            "status": "passed",
+            "best_frame": audit.get("best_frame"),
+            "best_frame_width": int(best_width),
+            "best_frame_height": int(best_height),
+            "auto_resize_candidates": audit.get("auto_resize_candidates", []),
+        }
+    return {
+        "status": str(audit.get("status", "failed")),
+        "best_frame": audit.get("best_frame"),
+        "auto_resize_candidates": audit.get("auto_resize_candidates", []),
+    }
 
 
 def _combine_score_rows(
