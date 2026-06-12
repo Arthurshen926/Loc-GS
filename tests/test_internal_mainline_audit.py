@@ -91,6 +91,7 @@ def test_internal_mainline_audit_cli_source_set_is_clean():
     assert any(str(path).endswith("build_internal_distillation_artifact.py") for path in paths)
     assert any(str(path).endswith("build_internal_candidate_completion_plan.py") for path in paths)
     assert any(str(path).endswith("build_internal_candidate_shard_artifact.py") for path in paths)
+    assert any(str(path).endswith("build_internal_candidate_shard_from_feature_maps.py") for path in paths)
     assert any(str(path).endswith("build_internal_query_feature_cache.py") for path in paths)
     assert any(str(path).endswith("build_internal_query_feature_cache_from_maps.py") for path in paths)
     assert any(str(path).endswith("build_internal_render_manifest.py") for path in paths)
