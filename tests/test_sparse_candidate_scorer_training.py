@@ -30,6 +30,28 @@ def _write_artifact(path: Path) -> Path:
     return path
 
 
+def _write_distilled_artifact(path: Path) -> Path:
+    payload = {
+        "metadata": {"format": "listwise", "scene": "GreatCourt", "source_split_name": "train", "topk": 2},
+        "query_yx": torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
+        "landmark_id": torch.tensor([[1, 2], [3, 4]], dtype=torch.int64),
+        "cosine": torch.tensor([[0.95, 0.10], [0.90, 0.20]], dtype=torch.float32),
+        "label": torch.tensor([1, 1], dtype=torch.int64),
+        "candidate_mask": torch.ones((2, 2), dtype=torch.bool),
+        "dense_consistent": torch.tensor([[False, True], [False, True]], dtype=torch.bool),
+        "sparse_inlier": torch.tensor([[False, True], [False, True]], dtype=torch.bool),
+        "reprojection_error": torch.tensor([[18.0, 1.0], [16.0, 1.5]], dtype=torch.float32),
+        "solver_weight": torch.tensor([[0.25, 3.0], [0.25, 3.0]], dtype=torch.float32),
+        "label_roles": [["hard_negative", "protected_support"], ["hard_negative", "protected_support"]],
+        "query_id": ["img.png::kp0", "img.png::kp1"],
+        "image_id": ["img.png", "img.png"],
+        "keypoint_id": ["kp0", "kp1"],
+        "source_phase": ["train", "train"],
+    }
+    torch.save(payload, path)
+    return path
+
+
 def test_candidate_scorer_training_learns_rank_bias_from_labels(tmp_path: Path):
     artifact = load_listwise_candidate_artifact(_write_artifact(tmp_path / "pairs.pt"))
 
@@ -106,3 +128,41 @@ def test_candidate_scorer_training_cli_writes_model_manifest_and_summary(tmp_pat
     assert model["schema_version"] == "internal_sparse_candidate_scorer_v1"
     assert summary["label_count"] == 3
     assert manifest["inference_stage"] == "sparse_candidate_scorer_training"
+
+
+def test_candidate_scorer_training_cli_accepts_solver_aware_feature_names(tmp_path: Path):
+    out = tmp_path / "model"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train",
+            "--candidate_artifact",
+            str(_write_distilled_artifact(tmp_path / "distilled.pt")),
+            "--output_dir",
+            str(out),
+            "--epochs",
+            "20",
+            "--feature_names",
+            "native_score,negative_rank,valid,dense_consistent,sparse_inlier,negative_reprojection_error,solver_weight",
+        ]
+    )
+
+    assert rc == 0
+    model = json.loads((out / "model.json").read_text(encoding="utf-8"))
+    summary = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert model["feature_names"] == [
+        "native_score",
+        "negative_rank",
+        "valid",
+        "dense_consistent",
+        "sparse_inlier",
+        "negative_reprojection_error",
+        "solver_weight",
+    ]
+    assert summary["dense_teacher_sample_count"] == 4
+    assert manifest["dense_teacher_enabled"] is True
+    assert manifest["hyperparameters"]["feature_names"] == model["feature_names"]

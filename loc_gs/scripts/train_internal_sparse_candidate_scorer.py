@@ -31,7 +31,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=0.1)
     parser.add_argument("--rank_feature_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--feature_names",
+        default=",".join(CandidateScorerConfig.feature_names),
+        help="Comma-separated candidate scorer features.",
+    )
     return parser
+
+
+def _feature_names(raw: str) -> tuple[str, ...]:
+    names = tuple(part.strip() for part in str(raw).split(",") if part.strip())
+    if not names:
+        raise ValueError("feature_names must contain at least one feature")
+    return names
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         epochs=int(args.epochs),
         learning_rate=float(args.learning_rate),
         rank_feature_scale=float(args.rank_feature_scale),
+        feature_names=_feature_names(str(args.feature_names)),
     )
     model, summary = train_candidate_scorer(artifact, cfg)
     manifest = {
