@@ -27,7 +27,19 @@ class SparseGateComparison:
         delta = candidate_te - baseline_te
         candidate_metric_source = str(self.candidate_metrics.get("schema_version", "unknown"))
         candidate_pose_metric_status = self.candidate_metrics.get("pose_metric_status")
-        if candidate_metric_source == "internal_sparse_smoke_metrics_v1" and candidate_pose_metric_status != "verified":
+        baseline_split = self.baseline_metrics.get("split_name")
+        candidate_split = self.candidate_metrics.get("split_name")
+        baseline_query_count = _maybe_int(self.baseline_metrics.get("query_count"))
+        candidate_query_count = _maybe_int(self.candidate_metrics.get("query_count"))
+        comparable_split = not baseline_split or not candidate_split or str(baseline_split) == str(candidate_split)
+        comparable_count = (
+            baseline_query_count is None
+            or candidate_query_count is None
+            or int(baseline_query_count) == int(candidate_query_count)
+        )
+        if not comparable_split or not comparable_count:
+            status = "diagnostic_split_or_query_mismatch"
+        elif candidate_metric_source == "internal_sparse_smoke_metrics_v1" and candidate_pose_metric_status != "verified":
             status = "diagnostic_pose_frame_unverified"
         elif candidate_te <= dense_target and candidate_te <= baseline_te:
             status = "pass"
@@ -51,8 +63,10 @@ class SparseGateComparison:
             "target_gap_cm": float(candidate_te - dense_target),
             "baseline_median_re_deg": _maybe_float(self.baseline_metrics.get("median_re_deg")),
             "candidate_median_re_deg": _maybe_float(self.candidate_metrics.get("median_re_deg")),
-            "baseline_query_count": _maybe_int(self.baseline_metrics.get("query_count")),
-            "candidate_query_count": _maybe_int(self.candidate_metrics.get("query_count")),
+            "baseline_split_name": None if baseline_split is None else str(baseline_split),
+            "candidate_split_name": None if candidate_split is None else str(candidate_split),
+            "baseline_query_count": baseline_query_count,
+            "candidate_query_count": candidate_query_count,
             "baseline_recall_10cm_5d": _maybe_float(self.baseline_metrics.get("recall_10cm_5d")),
             "candidate_recall_10cm_5d": _maybe_float(self.candidate_metrics.get("recall_10cm_5d")),
             "candidate_metric_source": candidate_metric_source,

@@ -130,3 +130,40 @@ def test_internal_sparse_gate_marks_unverified_internal_pipeline_metrics_diagnos
     assert metrics["sparse_gate_status"] == "diagnostic_pose_frame_unverified"
     assert metrics["candidate_metric_source"] == "internal_sparse_smoke_metrics_v1"
     assert metrics["candidate_pose_metric_status"] == "computed_unverified"
+
+
+def test_internal_sparse_gate_marks_split_or_query_mismatch_diagnostic(tmp_path: Path):
+    pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
+    baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train_dev")
+    candidate = _write_metrics(tmp_path / "candidate.json", median_te_cm=9.0, split_name="train")
+    data = json.loads(candidate.read_text(encoding="utf-8"))
+    data["schema_version"] = "internal_sparse_cached_eval_metrics_v1"
+    data["pose_metric_status"] = "verified"
+    data["query_count"] = 2
+    candidate.write_text(json.dumps(data), encoding="utf-8")
+    out = tmp_path / "gate_mismatch"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(pair_cache),
+            "--baseline_metrics",
+            str(baseline),
+            "--candidate_metrics",
+            str(candidate),
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    assert metrics["sparse_gate_status"] == "diagnostic_split_or_query_mismatch"
+    assert metrics["baseline_split_name"] == "train_dev"
+    assert metrics["candidate_split_name"] == "train"
+    assert metrics["baseline_query_count"] == 7
+    assert metrics["candidate_query_count"] == 2
