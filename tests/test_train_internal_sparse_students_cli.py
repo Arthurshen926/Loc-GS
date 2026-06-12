@@ -1,0 +1,108 @@
+import json
+from pathlib import Path
+
+import torch
+
+from loc_gs.scripts.train_internal_sparse_students import main
+from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
+
+
+def _write_cameras(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            [
+                {"img_name": "a.png", "width": 100, "height": 80, "fx": 50.0, "fy": 50.0},
+                {"img_name": "b.png", "width": 100, "height": 80, "fx": 50.0, "fy": 50.0},
+                {"img_name": "c.png", "width": 100, "height": 80, "fx": 50.0, "fy": 50.0},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_pair_cache(path: Path) -> Path:
+    payload = {
+        "metadata": {"format": "listwise", "scene": "GreatCourt", "source_split_name": "train", "topk": 2},
+        "query_yx": torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]], dtype=torch.float32),
+        "landmark_id": torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]], dtype=torch.int64),
+        "cosine": torch.tensor([[0.95, 0.10], [0.90, 0.20], [0.85, 0.30], [0.80, 0.40]], dtype=torch.float32),
+        "label": torch.tensor([1, 1, 0, 0], dtype=torch.int64),
+        "candidate_mask": torch.ones((4, 2), dtype=torch.bool),
+        "reprojection_error": torch.tensor([[18.0, 1.0], [16.0, 1.5], [1.0, 20.0], [1.0, 22.0]], dtype=torch.float32),
+        "query_id": ["a.png::kp0", "a.png::kp1", "b.png::kp0", "b.png::kp1"],
+        "image_id": ["a.png", "a.png", "b.png", "b.png"],
+        "keypoint_id": ["kp0", "kp1", "kp0", "kp1"],
+        "source_phase": ["train", "train", "train", "train"],
+    }
+    torch.save(payload, path)
+    return path
+
+
+def _write_feedback(path: Path) -> Path:
+    rows = [
+        {
+            "scene": "GreatCourt",
+            "split_name": "train",
+            "query_id": "a.png",
+            "dense_helped": True,
+            "distill_weight": 0.75,
+        },
+        {
+            "scene": "GreatCourt",
+            "split_name": "train",
+            "query_id": "b.png",
+            "dense_helped": False,
+            "distill_weight": 0.0,
+        },
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    return path
+
+
+def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_path: Path):
+    out = tmp_path / "train"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train",
+            "--cameras_json",
+            str(_write_cameras(tmp_path / "cameras.json")),
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt")),
+            "--solver_feedback_labels",
+            str(_write_feedback(tmp_path / "labels.jsonl")),
+            "--output_dir",
+            str(out),
+            "--sample_count",
+            "4",
+            "--seed",
+            "3",
+            "--max_keypoints_per_episode",
+            "1",
+            "--epochs",
+            "20",
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    model = json.loads((out / "model.json").read_text(encoding="utf-8"))
+    episodes = [json.loads(line) for line in (out / "online_episodes.jsonl").read_text(encoding="utf-8").splitlines()]
+    artifact = load_listwise_candidate_artifact(out / "online_distilled_candidates.pt")
+
+    assert manifest["inference_stage"] == "online_sparse_student_training"
+    assert manifest["dense_teacher_enabled"] is True
+    assert manifest["dense_inference_enabled"] is False
+    assert manifest["external_runtime_dependency"] == "forbidden"
+    assert summary["online_episode_count"] == 4
+    assert summary["missing_candidate_count"] == 0
+    assert manifest["hyperparameters"]["camera_sampling_source"] == "candidate_artifact_sources"
+    assert summary["student_modules"] == ["correspondence_scorer"]
+    assert model["schema_version"] == "internal_sparse_candidate_scorer_v1"
+    assert episodes[0]["schema_version"] == "internal_online_sparse_dense_episode_v1"
+    assert artifact.keypoint_count <= 4
