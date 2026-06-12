@@ -196,6 +196,46 @@ def test_summarize_compacts_sparse_gate_with_scorer_training_evidence(tmp_path, 
     assert payload["candidate_scorer_training"]["feature_materialization"] == "feature_cache"
 
 
+def test_summarize_compacts_sparse_cached_eval_rerank_diagnostics(tmp_path, capsys):
+    run_dir = tmp_path / "eval"
+    run_dir.mkdir()
+    (run_dir / "metrics_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "internal_sparse_cached_eval_metrics_v1",
+                "scene": "GreatCourt",
+                "split_name": "train_dev",
+                "median_te_cm": 76.85,
+                "median_re_deg": 0.37,
+                "recall_10cm_5d": 0.0,
+                "candidate_scorer_enabled": True,
+                "rerank_diagnostic_enabled": True,
+                "rerank_diagnostic_query_count": 1536,
+                "native_top1_correct": 91,
+                "reranked_top1_correct": 225,
+                "reranked_top1_gain": 134,
+                "reranked_top1_changed_count": 1065,
+                "reranked_topk_available": 259,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _run_cli(capsys, "summarize", str(run_dir))
+
+    assert payload["sparse"]["median_te_cm"] == 76.85
+    assert payload["sparse"]["median_re_deg"] == 0.37
+    assert payload["rerank_diagnostic"] == {
+        "native_top1_correct": 91,
+        "rerank_diagnostic_enabled": True,
+        "rerank_diagnostic_query_count": 1536,
+        "reranked_top1_changed_count": 1065,
+        "reranked_top1_correct": 225,
+        "reranked_top1_gain": 134,
+        "reranked_topk_available": 259,
+    }
+
+
 def test_compare_reports_candidate_minus_baseline_deltas(tmp_path, capsys):
     baseline = tmp_path / "baseline"
     candidate = tmp_path / "candidate"

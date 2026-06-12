@@ -260,6 +260,19 @@ def _compact_candidate_scorer_training(data: dict[str, Any]) -> dict[str, Any]:
     return {key: data[key] for key in keys if key in data}
 
 
+def _compact_rerank_diagnostic(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "rerank_diagnostic_enabled",
+        "rerank_diagnostic_query_count",
+        "native_top1_correct",
+        "reranked_top1_correct",
+        "reranked_top1_gain",
+        "reranked_top1_changed_count",
+        "reranked_topk_available",
+    )
+    return {key: data[key] for key in keys if key in data}
+
+
 def _parse_hyperparameters(raw: str | None) -> dict[str, Any]:
     if raw is None or not str(raw).strip():
         return {}
@@ -282,6 +295,13 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
         payload["candidate_mlp_scorer"] = _compact_candidate_mlp_scorer(data)
     if data.get("schema_version") == "internal_sparse_train_dev_gate_v1":
         payload["sparse_gate"] = _compact_sparse_gate(data)
+    if data.get("schema_version") == "internal_sparse_cached_eval_metrics_v1":
+        compact = _compact_stage(data)
+        if compact:
+            payload["sparse"] = compact
+        rerank = _compact_rerank_diagnostic(data)
+        if rerank:
+            payload["rerank_diagnostic"] = rerank
     nested_cache = data.get("candidate_mlp_feature_cache")
     if isinstance(nested_cache, dict):
         payload["candidate_mlp_feature_cache"] = _compact_candidate_mlp_feature_cache(nested_cache)
@@ -297,7 +317,7 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
             compact = _compact_stage(stage_data)
             if compact:
                 payload[stage] = compact
-    if "dense" not in payload:
+    if "dense" not in payload and "sparse" not in payload:
         compact = _compact_stage(data)
         if compact:
             payload["dense"] = compact
