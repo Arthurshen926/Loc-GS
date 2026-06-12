@@ -11,6 +11,7 @@ from statistics import mean
 from typing import Sequence
 
 from loc_gs.core.camera import load_camera_records
+from loc_gs.core.metrics import pose_error_cm_deg
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 from loc_gs.sparse.audit import reject_test_split
 from loc_gs.sparse.landmarks import CacheLandmarkResolver, load_gaussian_landmark_map
@@ -93,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
         pnp_iterations=int(args.pnp_iterations),
     )
     rows: list[dict[str, object]] = []
+    te_cm_values: list[float] = []
+    re_deg_values: list[float] = []
     for batch in artifact.batches[: max(0, int(args.max_queries))]:
         camera = cameras.get(batch.query_id)
         if camera is None:
@@ -100,12 +103,20 @@ def main(argv: list[str] | None = None) -> int:
             continue
         data = sparse_input_from_cached_batch(batch, resolver, intrinsics=camera.intrinsics, cfg=input_cfg)
         result = run_sparse_localization(data, loc_cfg)
+        te_cm = None
+        re_deg = None
+        if result.success and result.pose_w2c is not None and camera.pose_w2c is not None:
+            te_cm, re_deg = pose_error_cm_deg(result.pose_w2c, camera.pose_w2c)
+            te_cm_values.append(float(te_cm))
+            re_deg_values.append(float(re_deg))
         rows.append(
             {
                 "query_id": batch.query_id,
                 "success": bool(result.success),
                 "inlier_count": int(result.inlier_count),
                 "selected_count": int(len(result.selected_landmark_ids)),
+                "te_cm": te_cm,
+                "re_deg": re_deg,
                 "availability_summary": result.availability_summary,
             }
         )
@@ -120,6 +131,10 @@ def main(argv: list[str] | None = None) -> int:
         "success_count": int(len(success_rows)),
         "success_rate": float(len(success_rows) / max(1, len(rows))),
         "mean_inliers": float(mean(inliers)) if inliers else 0.0,
+        "median_te_cm": _median_or_none(te_cm_values),
+        "median_re_deg": _median_or_none(re_deg_values),
+        "pose_metric_status": "computed_unverified" if te_cm_values else "missing_gt_pose",
+        "pose_metric_frame": "camera_json_c2w",
         "score_mode": str(args.score_mode),
         "candidate_artifact": artifact.summarize_candidate_availability(),
     }
@@ -151,6 +166,16 @@ def main(argv: list[str] | None = None) -> int:
     (args.output_dir / "results.json").write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
+
+
+def _median_or_none(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
 
 
 if __name__ == "__main__":

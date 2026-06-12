@@ -85,6 +85,7 @@ def test_camera_records_load_cambridge_json_intrinsics(tmp_path: Path):
     assert records["img.png"].intrinsics.width == 1920
     assert records["img.png"].intrinsics.cx == 960.0
     assert records["img.png"].intrinsics.cy == 540.0
+    np.testing.assert_allclose(records["img.png"].pose_w2c[:3, 3], [-1.0, -2.0, -3.0])
 
 
 def test_cached_batch_converts_to_sparse_localization_input_with_resolved_xyz(tmp_path: Path):

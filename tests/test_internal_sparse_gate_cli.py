@@ -96,3 +96,37 @@ def test_internal_sparse_gate_cli_writes_manifest_metrics_and_candidate_preview(
     split_audit = json.loads((out / "split_audit.json").read_text(encoding="utf-8"))
     assert split_audit["audit_status"] == "passed"
     assert (out / "git_status.txt").exists()
+
+
+def test_internal_sparse_gate_marks_unverified_internal_pipeline_metrics_diagnostic(tmp_path: Path):
+    pair_cache = _write_pair_cache(tmp_path / "pairs.pt")
+    baseline = _write_metrics(tmp_path / "baseline.json", median_te_cm=15.0, split_name="train")
+    candidate = _write_metrics(tmp_path / "candidate.json", median_te_cm=500.0, split_name="train")
+    data = json.loads(candidate.read_text(encoding="utf-8"))
+    data["schema_version"] = "internal_sparse_smoke_metrics_v1"
+    data["pose_metric_status"] = "computed_unverified"
+    candidate.write_text(json.dumps(data), encoding="utf-8")
+    out = tmp_path / "gate"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train",
+            "--candidate_artifact",
+            str(pair_cache),
+            "--baseline_metrics",
+            str(baseline),
+            "--candidate_metrics",
+            str(candidate),
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    assert metrics["sparse_gate_status"] == "diagnostic_pose_frame_unverified"
+    assert metrics["candidate_metric_source"] == "internal_sparse_smoke_metrics_v1"
+    assert metrics["candidate_pose_metric_status"] == "computed_unverified"

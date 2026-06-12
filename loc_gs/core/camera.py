@@ -42,6 +42,18 @@ class CameraRecord:
     intrinsics: CameraIntrinsics
     pose_c2w: np.ndarray | None = None
 
+    @property
+    def pose_w2c(self) -> np.ndarray | None:
+        if self.pose_c2w is None:
+            return None
+        pose = np.asarray(self.pose_c2w, dtype=np.float64).reshape(4, 4)
+        inv = np.eye(4, dtype=np.float64)
+        rotation = pose[:3, :3]
+        center = pose[:3, 3]
+        inv[:3, :3] = rotation.T
+        inv[:3, 3] = -(rotation.T @ center)
+        return inv
+
 
 def load_camera_records(cameras_json: str | Path) -> dict[str, CameraRecord]:
     path = Path(cameras_json)

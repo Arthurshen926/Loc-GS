@@ -43,7 +43,14 @@ def _write_artifact(path: Path) -> Path:
         },
         "base_gaussian_id": torch.arange(6, dtype=torch.int64),
         "query_yx": torch.tensor(
-            [[77.2, 82.2], [77.1, 127.1], [124.3, 82.8], [122.4, 126.1], [104.0, 104.0], [93.6, 69.7]],
+            [
+                [71.3333, 96.6667],
+                [71.9355, 142.5806],
+                [114.1379, 100.6897],
+                [111.2121, 136.9697],
+                [90.0, 120.0],
+                [94.1176, 91.1765],
+            ],
             dtype=torch.float32,
         ),
         "landmark_id": torch.arange(6, dtype=torch.int64).reshape(6, 1),
@@ -62,7 +69,19 @@ def _write_artifact(path: Path) -> Path:
 def test_internal_sparse_smoke_cli_runs_cached_candidates_through_pnp(tmp_path: Path):
     cameras = tmp_path / "cameras.json"
     cameras.write_text(
-        json.dumps([{"img_name": "img.png", "width": 240, "height": 180, "fx": 140.0, "fy": 140.0}]),
+        json.dumps(
+            [
+                {
+                    "img_name": "img.png",
+                    "width": 240,
+                    "height": 180,
+                    "fx": 140.0,
+                    "fy": 140.0,
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                }
+            ]
+        ),
         encoding="utf-8",
     )
     out = tmp_path / "smoke"
@@ -94,5 +113,8 @@ def test_internal_sparse_smoke_cli_runs_cached_candidates_through_pnp(tmp_path: 
     assert metrics["query_count"] == 1
     assert metrics["success_count"] == 1
     assert metrics["mean_inliers"] >= 4
+    assert metrics["median_te_cm"] < 1.0
+    assert metrics["median_re_deg"] < 1.0
+    assert metrics["pose_metric_status"] == "computed_unverified"
     assert manifest["inference_stage"] == "sparse_only"
     assert manifest["hyperparameters"]["score_mode"] == "native"

@@ -25,7 +25,11 @@ class SparseGateComparison:
         candidate_te = float(self.candidate_metrics["median_te_cm"])
         dense_target = float(self.dense_target_cm)
         delta = candidate_te - baseline_te
-        if candidate_te <= dense_target and candidate_te <= baseline_te:
+        candidate_metric_source = str(self.candidate_metrics.get("schema_version", "unknown"))
+        candidate_pose_metric_status = self.candidate_metrics.get("pose_metric_status")
+        if candidate_metric_source == "internal_sparse_smoke_metrics_v1" and candidate_pose_metric_status != "verified":
+            status = "diagnostic_pose_frame_unverified"
+        elif candidate_te <= dense_target and candidate_te <= baseline_te:
             status = "pass"
         elif candidate_te < baseline_te:
             status = "improved_not_target"
@@ -51,6 +55,8 @@ class SparseGateComparison:
             "candidate_query_count": _maybe_int(self.candidate_metrics.get("query_count")),
             "baseline_recall_10cm_5d": _maybe_float(self.baseline_metrics.get("recall_10cm_5d")),
             "candidate_recall_10cm_5d": _maybe_float(self.candidate_metrics.get("recall_10cm_5d")),
+            "candidate_metric_source": candidate_metric_source,
+            "candidate_pose_metric_status": candidate_pose_metric_status,
             "candidate_artifact": artifact_summary,
             "baseline_metrics_path": self.baseline_metrics_path,
             "candidate_metrics_path": self.candidate_metrics_path,
