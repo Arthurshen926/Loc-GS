@@ -118,6 +118,52 @@ class CandidateMLPScorer:
         )
 
 
+class CandidateMLPScorerRuntime:
+    def __init__(self, model: CandidateMLPScorer):
+        self.model = model
+        self.network = _network(model.input_dim, int(model.hidden_dim))
+        self.network.load_state_dict(dict(model.state_dict))
+        self.network.eval()
+        self.mean = torch.tensor(model.feature_mean, dtype=torch.float32)
+        self.std = torch.tensor(model.feature_std, dtype=torch.float32)
+
+    def score_rows(self, batch: SparseCandidateBatch) -> list[list[float]]:
+        batch.validate()
+        valid_rows = batch.candidate_valid_mask or []
+        rows: list[list[float]] = []
+        with torch.no_grad():
+            for row_idx, scores in enumerate(batch.candidate_scores):
+                feature_rows: list[list[float]] = []
+                valid_flags: list[bool] = []
+                for rank, score in enumerate(scores):
+                    valid = True if not valid_rows else bool(valid_rows[row_idx][rank])
+                    valid_flags.append(valid)
+                    feature_rows.append(
+                        _candidate_mlp_feature(
+                            batch,
+                            row_idx=row_idx,
+                            rank=rank,
+                            native_score=float(score),
+                            valid=valid,
+                            cfg=self.model,
+                        )
+                    )
+                if not feature_rows:
+                    rows.append([])
+                    continue
+                features = (torch.tensor(feature_rows, dtype=torch.float32) - self.mean) / self.std
+                logits = self.network(features).reshape(-1)
+                calibrated = (
+                    (logits - float(self.model.logit_mean)) / max(1.0e-6, float(self.model.logit_std))
+                ).tolist()
+                rows.append([float(value) if valid else -1.0e12 for value, valid in zip(calibrated, valid_flags)])
+        return rows
+
+
+def build_candidate_mlp_scorer_runtime(model: CandidateMLPScorer) -> CandidateMLPScorerRuntime:
+    return CandidateMLPScorerRuntime(model)
+
+
 def train_candidate_mlp_scorer(
     artifact: CachedCandidateArtifact,
     cfg: CandidateMLPScorerConfig | None = None,
@@ -203,39 +249,7 @@ def train_candidate_mlp_scorer(
 
 
 def candidate_mlp_score_rows(batch: SparseCandidateBatch, model: CandidateMLPScorer) -> list[list[float]]:
-    batch.validate()
-    network = _network(model.input_dim, int(model.hidden_dim))
-    network.load_state_dict(dict(model.state_dict))
-    network.eval()
-    mean = torch.tensor(model.feature_mean, dtype=torch.float32)
-    std = torch.tensor(model.feature_std, dtype=torch.float32)
-    valid_rows = batch.candidate_valid_mask or []
-    rows: list[list[float]] = []
-    with torch.no_grad():
-        for row_idx, scores in enumerate(batch.candidate_scores):
-            feature_rows: list[list[float]] = []
-            valid_flags: list[bool] = []
-            for rank, score in enumerate(scores):
-                valid = True if not valid_rows else bool(valid_rows[row_idx][rank])
-                valid_flags.append(valid)
-                feature_rows.append(
-                    _candidate_mlp_feature(
-                        batch,
-                        row_idx=row_idx,
-                        rank=rank,
-                        native_score=float(score),
-                        valid=valid,
-                        cfg=model,
-                    )
-                )
-            if not feature_rows:
-                rows.append([])
-                continue
-            features = (torch.tensor(feature_rows, dtype=torch.float32) - mean) / std
-            logits = network(features).reshape(-1)
-            calibrated = ((logits - float(model.logit_mean)) / max(1.0e-6, float(model.logit_std))).tolist()
-            rows.append([float(value) if valid else -1.0e12 for value, valid in zip(calibrated, valid_flags)])
-    return rows
+    return build_candidate_mlp_scorer_runtime(model).score_rows(batch)
 
 
 def load_candidate_mlp_scorer(path: str | Path) -> CandidateMLPScorer:

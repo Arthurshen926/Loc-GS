@@ -318,8 +318,14 @@ def score_candidate_rows(batch: SparseCandidateBatch, model: LinearCandidateScor
 
 def candidate_solver_score_rows(batch: SparseCandidateBatch, model: object) -> list[list[float]]:
     if not isinstance(model, LinearCandidateScorer):
-        from loc_gs.students.candidate_mlp_scorer import CandidateMLPScorer, candidate_mlp_score_rows
+        from loc_gs.students.candidate_mlp_scorer import (
+            CandidateMLPScorer,
+            CandidateMLPScorerRuntime,
+            candidate_mlp_score_rows,
+        )
 
+        if isinstance(model, CandidateMLPScorerRuntime):
+            return model.score_rows(batch)
         if isinstance(model, CandidateMLPScorer):
             return candidate_mlp_score_rows(batch, model)
         raise TypeError(f"unsupported candidate scorer model type: {type(model).__name__}")
@@ -349,9 +355,9 @@ def candidate_solver_score_rows(batch: SparseCandidateBatch, model: object) -> l
 def load_candidate_scorer(path: str | Path) -> object:
     source = Path(path)
     if source.suffix.lower() == ".pt":
-        from loc_gs.students.candidate_mlp_scorer import load_candidate_mlp_scorer
+        from loc_gs.students.candidate_mlp_scorer import build_candidate_mlp_scorer_runtime, load_candidate_mlp_scorer
 
-        return load_candidate_mlp_scorer(source)
+        return build_candidate_mlp_scorer_runtime(load_candidate_mlp_scorer(source))
     payload = json.loads(source.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"candidate scorer JSON must contain an object: {path}")

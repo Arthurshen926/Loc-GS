@@ -8,6 +8,7 @@ from loc_gs.sparse.artifact_adapter import CachedCandidateArtifact
 from loc_gs.sparse.correspondences import SparseCandidateBatch
 from loc_gs.students.candidate_mlp_scorer import (
     CandidateMLPScorerConfig,
+    build_candidate_mlp_scorer_runtime,
     candidate_mlp_score_rows,
     load_candidate_mlp_scorer,
     train_candidate_mlp_scorer,
@@ -113,6 +114,19 @@ def test_candidate_mlp_scorer_learns_descriptor_pair_reranking(tmp_path: Path):
     assert float(payload["logit_std"]) > 0.0
     loaded = load_candidate_mlp_scorer(path)
     assert candidate_mlp_score_rows(_descriptor_batch(), loaded) == rows
+
+
+def test_candidate_mlp_runtime_reuses_loaded_network_for_multiple_batches():
+    model, _summary = train_candidate_mlp_scorer(
+        _artifact(),
+        CandidateMLPScorerConfig(epochs=80, learning_rate=0.03, hidden_dim=8, seed=7, batch_size=2),
+    )
+    runtime = build_candidate_mlp_scorer_runtime(model)
+    batch_a = _descriptor_batch()
+    batch_b = _descriptor_batch()
+
+    assert runtime.score_rows(batch_a) == candidate_mlp_score_rows(batch_a, model)
+    assert runtime.score_rows(batch_b) == candidate_mlp_score_rows(batch_b, model)
 
 
 def test_train_internal_candidate_mlp_scorer_cli_writes_pt_bundle(tmp_path: Path):
