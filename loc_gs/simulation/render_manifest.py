@@ -29,6 +29,7 @@ def build_render_manifest_from_plan_rows(
             raise ValueError(f"simulation plan row {row_idx} is missing synthetic_query_id")
         rgb_path = root / f"{synthetic_query_id}.png"
         depth_path = root / f"{synthetic_query_id}.depth.npy"
+        feature_map_path = root / f"{synthetic_query_id}.features.pt"
         records.append(
             {
                 "schema_version": "internal_render_manifest_record_v1",
@@ -44,6 +45,8 @@ def build_render_manifest_from_plan_rows(
                 "rgb_exists": bool(rgb_path.is_file()),
                 "depth_path": str(depth_path),
                 "depth_exists": bool(depth_path.is_file()),
+                "feature_map_path": str(feature_map_path),
+                "feature_map_exists": bool(feature_map_path.is_file()),
                 "role": "training_render_asset",
                 "dense_inference_enabled": False,
                 "external_runtime_dependency": "forbidden",
@@ -51,6 +54,7 @@ def build_render_manifest_from_plan_rows(
         )
     missing_rgb = [record for record in records if not bool(record["rgb_exists"])]
     missing_depth = [record for record in records if not bool(record["depth_exists"])]
+    missing_feature_map = [record for record in records if not bool(record["feature_map_exists"])]
     summary = {
         "schema_version": "internal_render_manifest_summary_v1",
         "scene": str(scene),
@@ -61,6 +65,8 @@ def build_render_manifest_from_plan_rows(
         "missing_rgb_count": int(len(missing_rgb)),
         "rendered_depth_count": int(len(records) - len(missing_depth)),
         "missing_depth_count": int(len(missing_depth)),
+        "rendered_feature_map_count": int(len(records) - len(missing_feature_map)),
+        "missing_feature_map_count": int(len(missing_feature_map)),
         "render_engine": "3dgs",
         "render_contract": "posed_3dgs_camera_v1",
     }

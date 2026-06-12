@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Sequence
 
 from loc_gs.simulation.render_runner import (
+    build_feature_map_cache_from_render_records,
     load_render_manifest_records,
     render_assets_from_manifest_records,
     render_record_with_internal_3dgs,
@@ -33,6 +34,7 @@ def build_manifest(
     command: Sequence[str],
     render_manifest: str | Path,
     gaussian_ply: str | Path | None,
+    feature_map_cache: str | Path,
     dry_run: bool,
     max_records: int | None,
 ) -> dict[str, object]:
@@ -51,6 +53,7 @@ def build_manifest(
         "external_runtime_dependency": "forbidden",
         "render_manifest": str(render_manifest),
         "gaussian_ply": None if gaussian_ply is None else str(gaussian_ply),
+        "feature_map_cache": str(feature_map_cache),
         "hyperparameters": {
             "dry_run": bool(dry_run),
             "max_records": None if max_records is None else int(max_records),
@@ -69,6 +72,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--latent_dim", type=int, default=16)
     parser.add_argument("--max_records", type=int, default=None)
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--feature_map_cache_name", default="render_feature_map_cache.pt")
     return parser
 
 
@@ -95,6 +99,20 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=bool(args.dry_run),
         max_records=args.max_records,
     )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    feature_map_cache = args.output_dir / str(args.feature_map_cache_name)
+    feature_summary = build_feature_map_cache_from_render_records(
+        updated,
+        output_cache=feature_map_cache,
+        scene=str(args.scene),
+        split_name=split,
+    )
+    summary = {
+        **summary,
+        "feature_map_cache": str(feature_map_cache),
+        "feature_map_cache_entry_count": int(feature_summary["entry_count"]),
+        "feature_map_cache_missing_count": int(feature_summary["missing_feature_map_count"]),
+    }
     command = [sys.executable, "-m", "loc_gs.scripts.render_internal_3dgs_assets", *(argv or sys.argv[1:])]
     manifest = build_manifest(
         scene=str(args.scene),
@@ -102,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         command=command,
         render_manifest=args.render_manifest,
         gaussian_ply=args.gaussian_ply,
+        feature_map_cache=feature_map_cache,
         dry_run=bool(args.dry_run),
         max_records=args.max_records,
     )
@@ -112,7 +131,6 @@ def main(argv: list[str] | None = None) -> int:
         "official_test_used": False,
         "test_split_used": False,
     }
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     with (args.output_dir / "render_manifest.updated.jsonl").open("w", encoding="utf-8") as handle:
         for record in updated:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
