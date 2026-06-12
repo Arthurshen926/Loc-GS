@@ -97,3 +97,38 @@ def test_candidate_completion_plan_cli_reads_coverage_dir_and_writes_auditable_b
     assert "loc_gs.scripts.build_internal_candidate_completion_plan" in (out / "command.txt").read_text(
         encoding="utf-8"
     )
+
+
+def test_candidate_completion_plan_cli_can_shard_explicit_query_ids(tmp_path: Path):
+    query_ids = tmp_path / "query_ids.txt"
+    query_ids.write_text("img_a.png\nimg_b.png\nimg_c.png\n", encoding="utf-8")
+    out = tmp_path / "completion"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev_seed13_20p",
+            "--query_ids",
+            str(query_ids),
+            "--base_candidate_artifact",
+            "existing.pt",
+            "--shard_size",
+            "2",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    summary = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines = [json.loads(line) for line in (out / "candidate_completion_plan.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert summary["missing_query_count"] == 3
+    assert summary["query_ids"] == str(query_ids)
+    assert summary["coverage_dir"] is None
+    assert manifest["query_ids"] == str(query_ids)
+    assert manifest["coverage_dir"] is None
+    assert lines[0]["query_ids"] == ["img_a.png", "img_b.png"]
+    assert lines[1]["query_ids"] == ["img_c.png"]

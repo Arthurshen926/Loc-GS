@@ -27,7 +27,8 @@ def build_manifest(
     scene: str,
     split_name: str,
     command: Sequence[str],
-    coverage_dir: str | Path,
+    coverage_dir: str | Path | None,
+    query_ids: str | Path | None,
     base_candidate_artifact: str | Path | None,
     shard_size: int,
 ) -> dict[str, object]:
@@ -44,7 +45,8 @@ def build_manifest(
         "dense_teacher_enabled": False,
         "dense_inference_enabled": False,
         "external_runtime_dependency": "forbidden",
-        "coverage_dir": str(coverage_dir),
+        "coverage_dir": None if coverage_dir is None else str(coverage_dir),
+        "query_ids": None if query_ids is None else str(query_ids),
         "base_candidate_artifact": None if base_candidate_artifact is None else str(base_candidate_artifact),
         "hyperparameters": {"shard_size": int(shard_size)},
     }
@@ -54,7 +56,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build an internal plan for missing candidate-cache query shards.")
     parser.add_argument("--scene", required=True)
     parser.add_argument("--split_name", required=True)
-    parser.add_argument("--coverage_dir", type=Path, required=True)
+    parser.add_argument("--coverage_dir", type=Path, default=None)
+    parser.add_argument("--query_ids", type=Path, default=None)
     parser.add_argument("--base_candidate_artifact", type=Path, default=None)
     parser.add_argument("--shard_size", type=int, default=64)
     parser.add_argument("--output_dir", type=Path, required=True)
@@ -64,9 +67,16 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_argparser().parse_args(argv)
     split = reject_test_split(str(args.split_name), purpose="internal candidate completion plan")
-    coverage_summary_path = args.coverage_dir / "metrics_summary.json"
-    coverage_summary = json.loads(coverage_summary_path.read_text(encoding="utf-8"))
-    missing_query_ids = load_query_ids(args.coverage_dir / "missing_query_ids.txt")
+    if (args.coverage_dir is None) == (args.query_ids is None):
+        raise ValueError("exactly one of --coverage_dir or --query_ids is required")
+    coverage_summary_path = None
+    coverage_summary = {}
+    if args.coverage_dir is not None:
+        coverage_summary_path = args.coverage_dir / "metrics_summary.json"
+        coverage_summary = json.loads(coverage_summary_path.read_text(encoding="utf-8"))
+        missing_query_ids = load_query_ids(args.coverage_dir / "missing_query_ids.txt")
+    else:
+        missing_query_ids = load_query_ids(args.query_ids)
     summary, shards = build_candidate_completion_plan(
         scene=str(args.scene),
         split_name=split,
@@ -76,7 +86,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     summary.update(
         {
-            "coverage_dir": str(args.coverage_dir),
+            "coverage_dir": None if args.coverage_dir is None else str(args.coverage_dir),
+            "query_ids": None if args.query_ids is None else str(args.query_ids),
             "coverage_requested_query_count": coverage_summary.get("requested_query_count"),
             "coverage_covered_query_count": coverage_summary.get("covered_query_count"),
             "coverage_missing_query_count": coverage_summary.get("missing_query_count"),
@@ -93,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         split_name=split,
         command=command,
         coverage_dir=args.coverage_dir,
+        query_ids=args.query_ids,
         base_candidate_artifact=args.base_candidate_artifact,
         shard_size=int(args.shard_size),
     )
@@ -102,7 +114,8 @@ def main(argv: list[str] | None = None) -> int:
         "split_name": split,
         "official_test_used": False,
         "test_split_used": False,
-        "coverage_summary": str(coverage_summary_path),
+        "coverage_summary": None if coverage_summary_path is None else str(coverage_summary_path),
+        "query_ids": None if args.query_ids is None else str(args.query_ids),
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with (args.output_dir / "candidate_completion_plan.jsonl").open("w", encoding="utf-8") as handle:
