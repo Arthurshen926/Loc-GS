@@ -41,6 +41,7 @@ def build_cached_eval_manifest(
     cameras_json: str | Path,
     candidate_scorer: str | Path | None,
     conflict_graph: str | Path | None,
+    landmark_activation: str | Path | None,
     hyperparameters: dict[str, object],
 ) -> dict[str, object]:
     split = reject_test_split(split_name, purpose="internal sparse cached eval manifest")
@@ -61,6 +62,7 @@ def build_cached_eval_manifest(
         "cameras_json": str(cameras_json),
         "candidate_scorer": None if candidate_scorer is None else str(candidate_scorer),
         "conflict_graph": None if conflict_graph is None else str(conflict_graph),
+        "landmark_activation": None if landmark_activation is None else str(landmark_activation),
         "hyperparameters": hyperparameters,
     }
 
@@ -86,6 +88,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--conflict_graph", type=Path, default=None)
     parser.add_argument("--descriptor_fusion", type=Path, default=None)
     parser.add_argument("--descriptor_fusion_weight", type=float, default=1.0)
+    parser.add_argument("--landmark_activation", type=Path, default=None)
+    parser.add_argument("--landmark_activation_weight", type=float, default=1.0)
     parser.add_argument("--detector_student", type=Path, default=None)
     parser.add_argument("--detector_student_weight", type=float, default=1.0)
     parser.add_argument("--set_conflict_penalty", type=float, default=0.0)
@@ -131,6 +135,8 @@ def main(argv: list[str] | None = None) -> int:
         conflict_graph=args.conflict_graph,
         descriptor_fusion=args.descriptor_fusion,
         descriptor_fusion_weight=float(args.descriptor_fusion_weight),
+        landmark_activation=args.landmark_activation,
+        landmark_activation_weight=float(args.landmark_activation_weight),
         detector_student=args.detector_student,
         detector_student_weight=float(args.detector_student_weight),
         set_conflict_penalty=float(args.set_conflict_penalty),
@@ -177,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
         "conflict_graph": None if args.conflict_graph is None else str(args.conflict_graph),
         "descriptor_fusion": None if args.descriptor_fusion is None else str(args.descriptor_fusion),
         "descriptor_fusion_weight": float(args.descriptor_fusion_weight),
+        "landmark_activation": None if args.landmark_activation is None else str(args.landmark_activation),
+        "landmark_activation_weight": float(args.landmark_activation_weight),
         "detector_student": None if args.detector_student is None else str(args.detector_student),
         "detector_student_weight": float(args.detector_student_weight),
         "set_conflict_penalty": float(args.set_conflict_penalty),
@@ -212,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
         cameras_json=args.cameras_json,
         candidate_scorer=args.candidate_scorer,
         conflict_graph=args.conflict_graph,
+        landmark_activation=args.landmark_activation,
         hyperparameters=hyperparameters,
     )
     artifact = load_listwise_candidate_artifact(args.candidate_artifact, max_rows=1)

@@ -3,6 +3,7 @@ import json
 import pytest
 
 from loc_gs.feedback.query_view_validation_pruning import (
+    attach_trace_attributions_to_eval_rows,
     load_eval_rows,
     prune_active_fusion_plan_from_sparse_validation,
 )
@@ -142,3 +143,31 @@ def test_load_eval_rows_accepts_rows_schema(tmp_path):
     rows = load_eval_rows(run_dir)
 
     assert rows == [{"image_name": "q0", "sparse_te_cm": 1.0}]
+
+
+def test_attach_trace_attributions_to_eval_rows_joins_payload_by_query():
+    rows = [
+        {"image_name": "q0", "sparse_te_cm": 2.0},
+        {"image_name": "q1", "sparse_te_cm": 3.0},
+    ]
+    payload = {
+        "split_name": "train_selfmap",
+        "correspondences": [
+            {"query_id": "q0", "matched_gaussian_id": 10, "pnp_inlier": False},
+            {"image_id": "q0", "matched_gaussian_id": 11, "pnp_inlier": True},
+            {"query_id": "q2", "matched_gaussian_id": 12, "pnp_inlier": True},
+        ],
+    }
+
+    joined = attach_trace_attributions_to_eval_rows(rows, payload)
+
+    assert len(joined[0]["sparse_match_attributions"]) == 2
+    assert "sparse_match_attributions" not in joined[1]
+
+
+def test_attach_trace_attributions_rejects_test_payload():
+    with pytest.raises(ValueError, match="test split"):
+        attach_trace_attributions_to_eval_rows(
+            [{"image_name": "q0"}],
+            {"split_name": "test", "correspondences": []},
+        )

@@ -6,6 +6,8 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+import torch
+
 
 SCHEMA_VERSION = "query_view_validation_pruning_v1"
 
@@ -59,6 +61,71 @@ def load_eval_rows(run_dir: str | Path) -> list[dict[str, Any]]:
     if not isinstance(payload, list):
         raise ValueError(f"eval results must be a list or contain rows/results: {root / 'results.json'}")
     return [dict(row) for row in payload if isinstance(row, Mapping)]
+
+
+def load_sparse_trace_payload(path: str | Path) -> dict[str, Any]:
+    """Load a sparse PnP trace payload and reject any test-split source."""
+
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"sparse trace payload must contain a dict: {path}")
+    payload = dict(payload)
+    _reject_test_split(payload)
+    audit = payload.get("split_audit", {})
+    if isinstance(audit, Mapping) and (
+        bool(audit.get("test_split_used", False)) or bool(audit.get("official_test_used", False))
+    ):
+        raise ValueError("test split is not allowed for query/view validation pruning")
+    return payload
+
+
+def _record_query_id(record: Mapping[str, Any]) -> str:
+    return str(record.get("query_id", record.get("image_id", ""))).strip()
+
+
+def attach_trace_attributions_to_eval_rows(
+    rows: Iterable[Mapping[str, Any]],
+    sparse_trace_payload: Mapping[str, Any],
+    *,
+    max_records_per_query: int = 0,
+) -> list[dict[str, Any]]:
+    """Attach per-correspondence sparse PnP traces to eval rows.
+
+    Sparse eval keeps large match records in ``sparse_pnp_trace_payload.pt`` to
+    avoid bloating ``results.json``. Query/view validation pruning needs those
+    records to attribute candidate regressions to concrete landmark/view pairs.
+    This helper joins them back by query image id without changing evaluator
+    outputs.
+    """
+
+    _reject_test_split(sparse_trace_payload)
+    correspondences = sparse_trace_payload.get("correspondences", [])
+    if not isinstance(correspondences, list):
+        raise ValueError("sparse trace payload must contain a correspondences list")
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for record in correspondences:
+        if not isinstance(record, Mapping):
+            continue
+        query_id = _record_query_id(record)
+        if not query_id:
+            continue
+        bucket = grouped.setdefault(query_id, [])
+        if max_records_per_query <= 0 or len(bucket) < int(max_records_per_query):
+            bucket.append(record)
+
+    out: list[dict[str, Any]] = []
+    attached = 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        copied = dict(row)
+        query_id = _query_id(copied)
+        records = grouped.get(query_id, [])
+        if records:
+            copied["sparse_match_attributions"] = [dict(record) for record in records]
+            attached += len(records)
+        out.append(copied)
+    return out
 
 
 def _reject_test_split(payload: Mapping[str, Any]) -> None:

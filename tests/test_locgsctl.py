@@ -745,6 +745,7 @@ def test_list_scenes_uses_stdloc_cambridge_default_root(capsys):
     payload = _run_cli(capsys, "list-scenes")
 
     assert payload["scenes"][0]["data_root"].startswith("/mnt/pool/sqy/Cambridge_stdloc/")
+    assert "map_cambridge_spgs_lsf_v6_guarded512_20260525" in payload["scenes"][0]["map_path"]
 
 
 def test_list_scenes_reports_native_sampled_count_status(tmp_path, capsys):

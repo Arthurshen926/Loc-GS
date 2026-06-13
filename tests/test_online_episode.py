@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,9 @@ from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
 from loc_gs.teacher.distillation_artifact import SolverFeedbackRow
 from loc_gs.teacher.online_episode import (
     OnlineEpisodeConfig,
+    build_online_candidate_payload_from_observations,
     build_online_sparse_dense_episodes,
+    load_online_teacher_observation_rows,
     summarize_online_sparse_dense_episodes,
 )
 
@@ -132,3 +135,76 @@ def test_online_episode_jsonl_writer_uses_internal_schema(tmp_path: Path):
     _write_jsonl(path, [episode.to_json_dict() for episode in episodes])
 
     assert '"schema_version": "internal_online_sparse_dense_episode_v1"' in path.read_text(encoding="utf-8")
+
+
+def test_online_teacher_observations_build_synthetic_candidate_payload_without_source_reuse(tmp_path: Path):
+    path = tmp_path / "observations.jsonl"
+    rows = [
+        {
+            "schema_version": "internal_online_teacher_observation_v1",
+            "scene": "GreatCourt",
+            "split_name": "train",
+            "synthetic_query_id": "sim/GreatCourt/train/000000",
+            "source_image_id": "a.png",
+            "keypoint_id": "kp0",
+            "query_yx": [11.0, 21.0],
+            "query_desc": [1.0, 0.0],
+            "landmark_ids": [101, 102],
+            "landmark_desc": [[1.0, 0.0], [0.0, 1.0]],
+            "candidate_scores": [0.20, 0.90],
+            "candidate_mask": [True, True],
+            "geometric_correct": [False, True],
+            "dense_consistent": [False, True],
+            "sparse_inlier": [False, True],
+            "reprojection_error_px": [24.0, 1.5],
+            "solver_weight": [0.5, 3.0],
+            "label_roles": ["hard_negative", "protected_support"],
+            "dense_helped": True,
+            "distill_weight": 0.75,
+            "render_rgb_path": "/renders/000000.png",
+            "render_ready": True,
+        },
+        {
+            "schema_version": "internal_online_teacher_observation_v1",
+            "scene": "GreatCourt",
+            "split_name": "train",
+            "synthetic_query_id": "sim/GreatCourt/train/000001",
+            "source_image_id": "b.png",
+            "keypoint_id": "kp0",
+            "query_yx": [13.0, 23.0],
+            "query_desc": [0.0, 1.0],
+            "landmark_ids": [201, 202],
+            "landmark_desc": [[1.0, 0.0], [0.0, 1.0]],
+            "candidate_scores": [0.85, 0.10],
+            "candidate_mask": [True, True],
+            "geometric_correct": [True, False],
+            "dense_consistent": [True, False],
+            "sparse_inlier": [True, False],
+            "reprojection_error_px": [1.0, 18.0],
+            "solver_weight": [1.5, 0.5],
+            "label_roles": ["positive_inlier", "hard_negative"],
+            "dense_helped": False,
+            "distill_weight": 0.0,
+            "render_ready": False,
+        },
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    observations = load_online_teacher_observation_rows(path)
+    payload, summary = build_online_candidate_payload_from_observations(
+        observations,
+        scene="GreatCourt",
+        split_name="train",
+    )
+    torch.save(payload, tmp_path / "online_payload.pt")
+    artifact = load_listwise_candidate_artifact(tmp_path / "online_payload.pt")
+
+    assert summary["online_observation_count"] == 2
+    assert summary["candidate_binding_mode"] == "direct_online_teacher_observations"
+    assert summary["source_candidate_reuse_enabled"] is False
+    assert artifact.batches[0].query_id == "sim/GreatCourt/train/000000"
+    assert artifact.batches[1].query_id == "sim/GreatCourt/train/000001"
+    assert artifact.batches[0].candidate_landmark_ids == [[101, 102]]
+    assert artifact.batches[0].candidate_dense_consistent == [[False, True]]
+    assert artifact.metadata["training_source"] == "online_3dgs_student_teacher_observation_stream"
+    assert artifact.metadata["source_candidate_reuse_enabled"] is False

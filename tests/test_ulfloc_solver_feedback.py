@@ -175,6 +175,26 @@ def test_ulfloc_solver_feedback_loads_view_landmark_weights(tmp_path):
     )
 
 
+def test_ulfloc_solver_feedback_resolves_absolute_weight_application(tmp_path):
+    module = _load_ulfloc_solver_feedback()
+    artifact = tmp_path / "feedback.pkl"
+    with artifact.open("wb") as f:
+        pickle.dump(
+            {
+                "schema_version": "ulfloc_solver_feedback_v1",
+                "split_name": "selfmap_train",
+                "landmark_weights": torch.ones(1, dtype=torch.float32),
+                "metadata": {"weight_application": "absolute"},
+            },
+            f,
+        )
+
+    feedback = module.load_solver_feedback(artifact, num_landmarks=1)
+
+    assert module.resolve_weight_application({}, feedback) == "absolute"
+    assert module.resolve_weight_application({"solver_feedback": {"weight_application": "blend"}}, feedback) == "blend"
+
+
 def test_view_dependent_weights_can_change_normalized_feature_fusion(tmp_path):
     module = _load_ulfloc_solver_feedback()
     artifact = tmp_path / "feedback.pkl"

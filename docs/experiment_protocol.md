@@ -19,7 +19,8 @@ contract for Loc-GS training, self-map generation, calibration, and evaluation.
 Allowed uses:
 
 - STDLoc or Loc-GS reconstruction and training.
-- SuperPoint teacher extraction.
+- SuperPoint teacher extraction only for explicitly labeled diagnostic
+  ablations. It is not part of the current ULF sparse solver-feedback mainline.
 - Training-time localization rehearsal.
 - Hard-negative mining when labels come from train/self-map episodes only.
 - Feedback bank construction with `split_name` set to `train`,

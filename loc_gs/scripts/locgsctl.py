@@ -15,7 +15,8 @@ from loc_gs.stdloc_native.commands import CAMBRIDGE_SCENES
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MAP_ROOT = Path("output/stdloc/map_cambridge_spgs")
+LEGACY_NATIVE_MAP_ROOT = Path("output/stdloc/map_cambridge_spgs")
+DEFAULT_MAP_ROOT = Path("output/stdloc/map_cambridge_spgs_lsf_v6_guarded512_20260525")
 DEFAULT_CHECKPOINT_ROOT = Path("output/stdloc_hybrid")
 DEFAULT_DATA_ROOT = Path("/mnt/pool/sqy/Cambridge_stdloc")
 EXPECTED_NATIVE_SAMPLED_COUNT = 16384
@@ -116,12 +117,13 @@ def _scene_defaults(
     checkpoint_root: str | Path = DEFAULT_CHECKPOINT_ROOT,
     data_root: str | Path = DEFAULT_DATA_ROOT,
 ) -> list[dict[str, Any]]:
-    map_base = _resolve_repo_path(repo_root, map_root)
+    map_root_path = Path(map_root)
+    map_base = _resolve_repo_path(repo_root, map_root_path)
     checkpoint_base = _resolve_repo_path(repo_root, checkpoint_root)
     data_base = _resolve_repo_path(repo_root, data_root)
     rows: list[dict[str, Any]] = []
     for scene in CAMBRIDGE_SCENES:
-        map_scene = DEFAULT_MAP_NAME_OVERRIDES.get(scene, scene)
+        map_scene = DEFAULT_MAP_NAME_OVERRIDES.get(scene, scene) if map_root_path == LEGACY_NATIVE_MAP_ROOT else scene
         map_path = map_base / map_scene
         count = _sampled_count(map_path)
         rows.append(

@@ -880,6 +880,9 @@ def _prepare_stdloc() -> Any:
         sys.path.insert(0, stdloc_path)
     import stdloc as stdloc_module
 
+    from loc_gs.dense_support.stdloc_render_compat import render_from_pose_gsplat_compat
+
+    stdloc_module.render_from_pose_gsplat = render_from_pose_gsplat_compat
     return stdloc_module
 
 

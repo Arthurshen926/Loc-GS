@@ -15,6 +15,7 @@ from loc_gs.sparse.pose_map_frame_audit import audit_pose_map_frame
 from loc_gs.sparse.real_inputs import CachedSparseInputConfig, sparse_input_from_cached_batch
 from loc_gs.students.descriptor_fusion import descriptor_fusion_score_rows, load_descriptor_fusion
 from loc_gs.students.detector_student import detector_score_rows, load_detector_student
+from loc_gs.students.landmark_activation import landmark_activation_score_rows, load_landmark_activation
 from loc_gs.students.landmark_selector import (
     landmark_selector_score_rows,
     load_conflict_graph,
@@ -38,6 +39,8 @@ class CachedSparseEvalConfig:
     conflict_graph: str | Path | None = None
     descriptor_fusion: str | Path | None = None
     descriptor_fusion_weight: float = 1.0
+    landmark_activation: str | Path | None = None
+    landmark_activation_weight: float = 1.0
     detector_student: str | Path | None = None
     detector_student_weight: float = 1.0
     set_conflict_penalty: float = 0.0
@@ -120,6 +123,7 @@ def run_cached_sparse_eval(
     selector = load_landmark_selector(cfg.landmark_selector) if cfg.landmark_selector is not None else None
     conflict_graph = load_conflict_graph(cfg.conflict_graph) if cfg.conflict_graph is not None else None
     descriptor_fusion = load_descriptor_fusion(cfg.descriptor_fusion) if cfg.descriptor_fusion is not None else None
+    landmark_activation = load_landmark_activation(cfg.landmark_activation) if cfg.landmark_activation is not None else None
     detector_student = load_detector_student(cfg.detector_student) if cfg.detector_student is not None else None
     raw_conflict_edges = None
     if conflict_graph is not None:
@@ -214,6 +218,13 @@ def run_cached_sparse_eval(
                 solver_score_rows,
                 descriptor_rows,
                 selector_weight=float(cfg.descriptor_fusion_weight),
+            )
+        if landmark_activation is not None:
+            activation_rows = landmark_activation_score_rows(batch, landmark_activation)
+            solver_score_rows = _combine_score_rows(
+                solver_score_rows,
+                activation_rows,
+                selector_weight=float(cfg.landmark_activation_weight),
             )
         if detector_student is not None:
             detector_rows = detector_score_rows(batch, detector_student)
@@ -327,6 +338,7 @@ def run_cached_sparse_eval(
         "landmark_selector_enabled": bool(selector is not None),
         "conflict_graph_enabled": bool(conflict_graph is not None),
         "descriptor_fusion_enabled": bool(descriptor_fusion is not None),
+        "landmark_activation_enabled": bool(landmark_activation is not None),
         "detector_student_enabled": bool(detector_student is not None),
         "rerank_diagnostic_enabled": bool(rerank_diagnostic_query_count > 0),
         "rerank_diagnostic_query_count": int(rerank_diagnostic_query_count),

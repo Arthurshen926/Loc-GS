@@ -55,6 +55,17 @@ def test_solver_feedback_labels_accept_legacy_dense_result_field_names():
     assert labels[1].dense_helped is False
 
 
+def test_solver_feedback_labels_reject_sparse_only_dense_rows():
+    with pytest.raises(ValueError, match="dense result row"):
+        build_solver_feedback_labels(
+            scene="GreatCourt",
+            split_name="train_dev",
+            sparse_rows=[{"image_name": "q1.png", "sparse_te_cm": 20.0, "sparse_re_deg": 1.0}],
+            dense_rows=[{"image_name": "q1.png", "sparse_te_cm": 10.0, "sparse_re_deg": 0.5}],
+            cfg=SolverFeedbackConfig(min_dense_improvement_cm=2.0, weight_clip_cm=20.0),
+        )
+
+
 def test_solver_feedback_labels_reject_test_split():
     with pytest.raises(ValueError, match="test split"):
         build_solver_feedback_labels(

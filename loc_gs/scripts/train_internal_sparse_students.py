@@ -26,6 +26,10 @@ from loc_gs.students.candidate_mlp_scorer import (
 from loc_gs.students.descriptor_fusion import DescriptorFusionConfig, train_descriptor_fusion_from_payload
 from loc_gs.students.detector_student import DetectorStudentConfig, train_detector_student
 from loc_gs.students.landmark_selector import LandmarkSelectorConfig, train_landmark_selector
+from loc_gs.students.landmark_activation_training import (
+    LandmarkActivationTrainingConfig,
+    train_landmark_activation_v2_from_artifact,
+)
 from loc_gs.teacher.distillation_artifact import (
     DistillationArtifactConfig,
     build_distillation_payload,
@@ -37,8 +41,11 @@ from loc_gs.teacher.inlier_precision_feedback import (
 )
 from loc_gs.teacher.online_episode import (
     OnlineEpisodeConfig,
+    build_online_candidate_payload_from_observations,
     build_online_candidate_payload,
+    build_online_episodes_from_observations,
     build_online_sparse_dense_episodes,
+    load_online_teacher_observation_rows,
     summarize_online_sparse_dense_episodes,
 )
 from loc_gs.training.sparse_candidate_scorer import CandidateScorerConfig, train_candidate_scorer
@@ -64,15 +71,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train internal sparse student modules from online sparse-dense episodes.")
     parser.add_argument("--scene", required=True)
     parser.add_argument("--split_name", required=True)
-    parser.add_argument("--cameras_json", type=Path, required=True)
-    parser.add_argument("--candidate_artifact", type=Path, required=True)
-    parser.add_argument("--solver_feedback_labels", type=Path, required=True)
+    parser.add_argument("--cameras_json", type=Path, default=None)
+    parser.add_argument("--candidate_artifact", type=Path, default=None)
+    parser.add_argument("--solver_feedback_labels", type=Path, default=None)
+    parser.add_argument("--online_teacher_observations", type=Path, default=None)
     parser.add_argument("--inlier_precision_feedback", type=Path, default=None)
     parser.add_argument("--inlier_precision_feedback_weight", type=float, default=1.0)
     parser.add_argument("--render_manifest", type=Path, default=None)
     parser.add_argument("--require_rendered_rgb", action="store_true")
     parser.add_argument("--output_dir", type=Path, required=True)
-    parser.add_argument("--sample_count", type=int, required=True)
+    parser.add_argument("--sample_count", type=int, default=0)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--translation_std_m", type=float, default=0.25)
     parser.add_argument("--yaw_std_deg", type=float, default=5.0)
@@ -99,6 +107,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--landmark_conflict_penalty", type=float, default=0.1)
     parser.add_argument("--descriptor_trust_region", type=float, default=0.25)
     parser.add_argument("--detector_grid_size", type=int, default=8)
+    parser.add_argument("--landmark_activation_epochs", type=int, default=0)
+    parser.add_argument("--landmark_activation_learning_rate", type=float, default=1.0e-3)
+    parser.add_argument("--landmark_activation_hidden_dim", type=int, default=64)
+    parser.add_argument("--landmark_activation_attention_top_k", type=int, default=32)
+    parser.add_argument("--landmark_activation_top_n", type=int, default=0)
     return parser
 
 
@@ -108,61 +121,95 @@ def main(argv: list[str] | None = None) -> int:
     if bool(args.candidate_mlp_cache_features) and bool(args.candidate_mlp_stream_features):
         parser.error("--candidate_mlp_cache_features and --candidate_mlp_stream_features are mutually exclusive")
     split = reject_test_split(str(args.split_name), purpose="online sparse student training")
-    sim_cfg = SimulationSamplerConfig(
-        sample_count=int(args.sample_count),
-        seed=int(args.seed),
-        translation_std_m=float(args.translation_std_m),
-        yaw_std_deg=float(args.yaw_std_deg),
-        pitch_std_deg=float(args.pitch_std_deg),
-        roll_std_deg=float(args.roll_std_deg),
-    )
-    feedback_rows = load_solver_feedback_label_rows(args.solver_feedback_labels)
-    inlier_precision_feedback_summary = None
-    if args.inlier_precision_feedback is not None:
-        inlier_precision_rows = load_inlier_precision_feedback_rows(args.inlier_precision_feedback)
-        feedback_rows, inlier_precision_feedback_summary = apply_inlier_precision_feedback_to_solver_rows(
-            feedback_rows,
-            inlier_precision_rows,
-            weight_scale=float(args.inlier_precision_feedback_weight),
-            max_distill_weight=float(args.max_solver_weight),
+    use_direct_observations = args.online_teacher_observations is not None
+    if use_direct_observations:
+        if args.candidate_artifact is not None or args.solver_feedback_labels is not None or args.cameras_json is not None:
+            parser.error(
+                "--online_teacher_observations is mutually exclusive with --candidate_artifact, "
+                "--solver_feedback_labels, and --cameras_json"
+            )
+    elif args.candidate_artifact is None or args.solver_feedback_labels is None or args.cameras_json is None:
+        parser.error(
+            "--candidate_artifact, --solver_feedback_labels, and --cameras_json are required "
+            "unless --online_teacher_observations is provided"
         )
-    render_records = load_simulation_plan_rows(args.render_manifest) if args.render_manifest is not None else None
-    artifact = load_listwise_candidate_artifact(args.candidate_artifact)
-    camera_records = load_camera_records(args.cameras_json)
-    candidate_source_ids = {batch.query_id for batch in artifact.batches}
-    camera_records = {image_id: record for image_id, record in camera_records.items() if image_id in candidate_source_ids}
-    if not camera_records:
-        raise ValueError("no cameras overlap candidate artifact source images")
-    specs = sample_simulated_queries(camera_records, scene=str(args.scene), split_name=split, cfg=sim_cfg)
-    episodes = build_online_sparse_dense_episodes(
-        specs,
-        artifact,
-        feedback_rows,
-        cfg=OnlineEpisodeConfig(
-            max_keypoints_per_episode=None
-            if args.max_keypoints_per_episode is None
-            else int(args.max_keypoints_per_episode),
-            require_rendered_rgb=bool(args.require_rendered_rgb),
-        ),
-        render_records=render_records,
-    )
+    inlier_precision_feedback_summary = None
+    online_observation_summary: dict[str, object] | None = None
+    if use_direct_observations:
+        if args.inlier_precision_feedback is not None:
+            parser.error("--inlier_precision_feedback can only be used with cached candidate artifacts")
+        observations = load_online_teacher_observation_rows(args.online_teacher_observations)
+        online_payload, online_observation_summary = build_online_candidate_payload_from_observations(
+            observations,
+            scene=str(args.scene),
+            split_name=split,
+        )
+        episodes = build_online_episodes_from_observations(observations, scene=str(args.scene), split_name=split)
+        distillation_summary = {
+            "schema_version": "internal_distillation_payload_summary_v1",
+            "distillation_source": "direct_online_teacher_observations",
+            "dense_teacher_enabled": True,
+            "source_candidate_reuse_enabled": False,
+            "candidate_binding_mode": "direct_online_teacher_observations",
+            "candidate_keypoint_count": int(len(observations)),
+        }
+    else:
+        sim_cfg = SimulationSamplerConfig(
+            sample_count=int(args.sample_count),
+            seed=int(args.seed),
+            translation_std_m=float(args.translation_std_m),
+            yaw_std_deg=float(args.yaw_std_deg),
+            pitch_std_deg=float(args.pitch_std_deg),
+            roll_std_deg=float(args.roll_std_deg),
+        )
+        feedback_rows = load_solver_feedback_label_rows(args.solver_feedback_labels)
+        if args.inlier_precision_feedback is not None:
+            inlier_precision_rows = load_inlier_precision_feedback_rows(args.inlier_precision_feedback)
+            feedback_rows, inlier_precision_feedback_summary = apply_inlier_precision_feedback_to_solver_rows(
+                feedback_rows,
+                inlier_precision_rows,
+                weight_scale=float(args.inlier_precision_feedback_weight),
+                max_distill_weight=float(args.max_solver_weight),
+            )
+        render_records = load_simulation_plan_rows(args.render_manifest) if args.render_manifest is not None else None
+        artifact = load_listwise_candidate_artifact(args.candidate_artifact)
+        camera_records = load_camera_records(args.cameras_json)
+        candidate_source_ids = {batch.query_id for batch in artifact.batches}
+        camera_records = {
+            image_id: record for image_id, record in camera_records.items() if image_id in candidate_source_ids
+        }
+        if not camera_records:
+            raise ValueError("no cameras overlap candidate artifact source images")
+        specs = sample_simulated_queries(camera_records, scene=str(args.scene), split_name=split, cfg=sim_cfg)
+        episodes = build_online_sparse_dense_episodes(
+            specs,
+            artifact,
+            feedback_rows,
+            cfg=OnlineEpisodeConfig(
+                max_keypoints_per_episode=None
+                if args.max_keypoints_per_episode is None
+                else int(args.max_keypoints_per_episode),
+                require_rendered_rgb=bool(args.require_rendered_rgb),
+            ),
+            render_records=render_records,
+        )
 
-    payload = torch.load(args.candidate_artifact, map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError(f"candidate artifact must contain a dict payload: {args.candidate_artifact}")
-    distilled_payload, distillation_summary = build_distillation_payload(
-        payload,
-        feedback_rows,
-        scene=str(args.scene),
-        split_name=artifact.split_name,
-        cfg=DistillationArtifactConfig(
-            dense_consistency_reprojection_px=float(args.dense_consistency_reprojection_px),
-            sparse_inlier_reprojection_px=float(args.sparse_inlier_reprojection_px),
-            hard_negative_reprojection_px=float(args.hard_negative_reprojection_px),
-            max_solver_weight=float(args.max_solver_weight),
-        ),
-    )
-    online_payload = build_online_candidate_payload(distilled_payload, episodes)
+        payload = torch.load(args.candidate_artifact, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise ValueError(f"candidate artifact must contain a dict payload: {args.candidate_artifact}")
+        distilled_payload, distillation_summary = build_distillation_payload(
+            payload,
+            feedback_rows,
+            scene=str(args.scene),
+            split_name=artifact.split_name,
+            cfg=DistillationArtifactConfig(
+                dense_consistency_reprojection_px=float(args.dense_consistency_reprojection_px),
+                sparse_inlier_reprojection_px=float(args.sparse_inlier_reprojection_px),
+                hard_negative_reprojection_px=float(args.hard_negative_reprojection_px),
+                max_solver_weight=float(args.max_solver_weight),
+            ),
+        )
+        online_payload = build_online_candidate_payload(distilled_payload, episodes)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     online_artifact_path = args.output_dir / "online_distilled_candidates.pt"
     torch.save(online_payload, online_artifact_path)
@@ -210,8 +257,25 @@ def main(argv: list[str] | None = None) -> int:
         online_artifact.batches,
         DetectorStudentConfig(grid_size=int(args.detector_grid_size)),
     )
+    landmark_activation_path: Path | None = None
+    landmark_activation_summary: dict[str, object] | None = None
+    if int(args.landmark_activation_epochs) > 0:
+        landmark_activation_path, landmark_activation_summary = train_landmark_activation_v2_from_artifact(
+            online_artifact,
+            output_path=args.output_dir / "landmark_activation_v2.pth",
+            cfg=LandmarkActivationTrainingConfig(
+                epochs=int(args.landmark_activation_epochs),
+                learning_rate=float(args.landmark_activation_learning_rate),
+                hidden_dim=int(args.landmark_activation_hidden_dim),
+                attention_top_k=int(args.landmark_activation_attention_top_k),
+                seed=int(args.seed),
+                top_n=int(args.landmark_activation_top_n),
+            ),
+        )
 
     episode_summary = summarize_online_sparse_dense_episodes(episodes)
+    episode_summary_fields = dict(episode_summary)
+    episode_summary_fields.pop("schema_version", None)
     student_modules = [
         "correspondence_scorer",
         "candidate_mlp_scorer",
@@ -220,12 +284,17 @@ def main(argv: list[str] | None = None) -> int:
         "descriptor_fusion",
         "detector_student",
     ]
+    if landmark_activation_summary is not None:
+        student_modules.append("landmark_activation_v2")
+    observation_summary_fields = dict(online_observation_summary or {})
+    observation_summary_fields.pop("schema_version", None)
     summary = {
         "schema_version": "internal_online_sparse_student_training_summary_v1",
         "scene": str(args.scene),
         "split_name": split,
         "student_modules": student_modules,
-        **episode_summary,
+        **episode_summary_fields,
+        **observation_summary_fields,
         "distillation": distillation_summary,
         "candidate_scorer": scorer_summary,
         "candidate_mlp_scorer": candidate_mlp_summary,
@@ -234,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         "landmark_selector": selector_summary,
         "descriptor_fusion": descriptor_summary,
         "detector_student": detector_summary,
+        "landmark_activation_v2": landmark_activation_summary,
     }
     manifest = {
         "schema_version": "internal_online_sparse_student_training_manifest_v1",
@@ -247,9 +317,12 @@ def main(argv: list[str] | None = None) -> int:
         "dense_teacher_enabled": True,
         "dense_inference_enabled": False,
         "external_runtime_dependency": "forbidden",
-        "cameras_json": str(args.cameras_json),
-        "candidate_artifact": str(args.candidate_artifact),
-        "solver_feedback_labels": str(args.solver_feedback_labels),
+        "cameras_json": None if args.cameras_json is None else str(args.cameras_json),
+        "candidate_artifact": None if args.candidate_artifact is None else str(args.candidate_artifact),
+        "solver_feedback_labels": None if args.solver_feedback_labels is None else str(args.solver_feedback_labels),
+        "online_teacher_observations": None
+        if args.online_teacher_observations is None
+        else str(args.online_teacher_observations),
         "inlier_precision_feedback": None
         if args.inlier_precision_feedback is None
         else str(args.inlier_precision_feedback),
@@ -259,6 +332,7 @@ def main(argv: list[str] | None = None) -> int:
         "candidate_mlp_feature_cache": None
         if candidate_mlp_feature_cache_path is None
         else str(candidate_mlp_feature_cache_path),
+        "landmark_activation": None if landmark_activation_path is None else str(landmark_activation_path),
         "hyperparameters": {
             "sample_count": int(args.sample_count),
             "seed": int(args.seed),
@@ -285,13 +359,27 @@ def main(argv: list[str] | None = None) -> int:
             "landmark_conflict_penalty": float(args.landmark_conflict_penalty),
             "descriptor_trust_region": float(args.descriptor_trust_region),
             "detector_grid_size": int(args.detector_grid_size),
+            "landmark_activation_epochs": int(args.landmark_activation_epochs),
+            "landmark_activation_learning_rate": float(args.landmark_activation_learning_rate),
+            "landmark_activation_hidden_dim": int(args.landmark_activation_hidden_dim),
+            "landmark_activation_attention_top_k": int(args.landmark_activation_attention_top_k),
+            "landmark_activation_top_n": int(args.landmark_activation_top_n),
             "feature_names": list(scorer_cfg.feature_names),
-            "camera_sampling_source": "candidate_artifact_sources",
-            "candidate_source_image_count": int(len(candidate_source_ids)),
-            "sampled_camera_count": int(len(camera_records)),
+            "camera_sampling_source": "direct_online_teacher_observations"
+            if use_direct_observations
+            else "candidate_artifact_sources",
+            "candidate_binding_mode": "direct_online_teacher_observations"
+            if use_direct_observations
+            else "cached_source_candidate_reuse",
+            "source_candidate_reuse_enabled": not bool(use_direct_observations),
+            "candidate_source_image_count": 0 if use_direct_observations else int(len(candidate_source_ids)),
+            "sampled_camera_count": 0 if use_direct_observations else int(len(camera_records)),
         },
     }
-    split_audit = artifact.metadata.get("split_audit")
+    metadata = online_payload.get("metadata", {}) if isinstance(online_payload, dict) else {}
+    split_audit = metadata.get("split_audit") if isinstance(metadata, dict) else None
+    if not isinstance(split_audit, dict) and not use_direct_observations:
+        split_audit = artifact.metadata.get("split_audit")
     if not isinstance(split_audit, dict):
         split_audit = {"audit_status": "unknown", "reason": "candidate artifact did not include split_audit"}
 

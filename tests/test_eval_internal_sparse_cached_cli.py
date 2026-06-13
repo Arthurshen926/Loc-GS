@@ -18,6 +18,7 @@ from loc_gs.students.descriptor_fusion import DescriptorFusionModel
 from loc_gs.students.detector_student import DetectorStudentModel
 from loc_gs.students.landmark_selector import LandmarkSelectorModel
 from loc_gs.sparse.artifact_adapter import load_listwise_candidate_artifact
+from loc_gs.training.query_landmark_activation_v2 import QueryLandmarkActivationV2
 
 
 def _write_ply(path: Path) -> Path:
@@ -541,6 +542,67 @@ def test_eval_internal_sparse_cached_cli_accepts_mlp_candidate_scorer(tmp_path: 
     assert rows[0]["inlier_set_diagnostics"]["inlier_geometric_correct_ratio"] == 1.0
     assert rows[0]["success"] is True
     assert rows[0]["te_cm"] < 1.0
+
+
+def test_eval_internal_sparse_cached_cli_accepts_landmark_activation_v2_student(tmp_path: Path):
+    cameras = _write_cameras(tmp_path / "cameras.json")
+    activation_path = tmp_path / "landmark_activation_v2.pth"
+    model = QueryLandmarkActivationV2(
+        query_token_dim=2,
+        landmark_token_dim=6,
+        hidden_dim=8,
+        attention_top_k=2,
+    )
+    torch.save(
+        {
+            "activation_model_type": "v2_tokens",
+            "query_feature_mode": "token_cross_attention",
+            "state_dict": model.state_dict(),
+            "query_token_dim": 2,
+            "landmark_token_dim": 6,
+            "hidden_dim": 8,
+            "attention_top_k": 2,
+            "top_n": 0,
+            "landmark_ids": torch.arange(12, dtype=torch.long),
+            "split_name": "train_dev",
+            "split_audit": {"audit_status": "passed", "split_name": "train_dev", "test_split_used": False},
+        },
+        activation_path,
+    )
+    out = tmp_path / "eval_activation"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train_dev",
+            "--candidate_artifact",
+            str(_write_pair_cache(tmp_path / "pairs.pt", cameras, buried_correct=True, descriptor_signals=True)),
+            "--point_cloud",
+            str(_write_ply(tmp_path / "point_cloud.ply")),
+            "--cameras_json",
+            str(cameras),
+            "--image_width",
+            "120",
+            "--image_height",
+            "90",
+            "--landmark_activation",
+            str(activation_path),
+            "--landmark_activation_weight",
+            "0.5",
+            "--output_dir",
+            str(out),
+        ]
+    )
+
+    assert rc == 0
+    metrics = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert metrics["landmark_activation_enabled"] is True
+    assert manifest["landmark_activation"] == str(activation_path)
+    assert manifest["hyperparameters"]["landmark_activation_weight"] == 0.5
+    assert manifest["dense_inference_enabled"] is False
 
 
 def test_eval_internal_sparse_cached_cli_reports_post_pnp_rescore_label_flow(tmp_path: Path):

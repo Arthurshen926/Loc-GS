@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from loc_gs.feedback.query_view_validation_pruning import (
-    prune_active_fusion_plan_from_sparse_validation,
+    attach_trace_attributions_to_eval_rows,
     load_eval_rows,
+    load_sparse_trace_payload,
+    prune_active_fusion_plan_from_sparse_validation,
 )
 
 
@@ -44,6 +46,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--active_fusion_plan", required=True, type=Path)
     parser.add_argument("--baseline_run_dir", required=True, type=Path)
     parser.add_argument("--candidate_run_dir", required=True, type=Path)
+    parser.add_argument("--candidate_trace_payload", default=None, type=Path)
+    parser.add_argument("--max_trace_records_per_query", default=0, type=int)
     parser.add_argument("--scene", required=True)
     parser.add_argument("--split_name", required=True)
     parser.add_argument("--output_dir", required=True, type=Path)
@@ -67,10 +71,17 @@ def main(argv: list[str] | None = None) -> int:
     active_plan = json.loads(Path(args.active_fusion_plan).read_text(encoding="utf-8"))
     if not isinstance(active_plan, Mapping):
         raise ValueError("active_fusion_plan must contain a JSON object")
+    candidate_rows = load_eval_rows(args.candidate_run_dir)
+    if args.candidate_trace_payload is not None:
+        candidate_rows = attach_trace_attributions_to_eval_rows(
+            candidate_rows,
+            load_sparse_trace_payload(args.candidate_trace_payload),
+            max_records_per_query=int(args.max_trace_records_per_query),
+        )
     result = prune_active_fusion_plan_from_sparse_validation(
         active_plan=active_plan,
         baseline_rows=load_eval_rows(args.baseline_run_dir),
-        candidate_rows=load_eval_rows(args.candidate_run_dir),
+        candidate_rows=candidate_rows,
         protected_te_cm=float(args.protected_te_cm),
         hard_te_cm=float(args.hard_te_cm),
         regression_margin_cm=float(args.regression_margin_cm),
@@ -86,6 +97,8 @@ def main(argv: list[str] | None = None) -> int:
         "active_fusion_plan": str(Path(args.active_fusion_plan)),
         "baseline_run_dir": str(Path(args.baseline_run_dir)),
         "candidate_run_dir": str(Path(args.candidate_run_dir)),
+        "candidate_trace_payload": None if args.candidate_trace_payload is None else str(Path(args.candidate_trace_payload)),
+        "max_trace_records_per_query": int(args.max_trace_records_per_query),
     }
     split_audit = {
         "schema_version": "query_view_validation_pruning_split_audit_v1",
@@ -104,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         "active_fusion_plan": str(Path(args.active_fusion_plan)),
         "baseline_run_dir": str(Path(args.baseline_run_dir)),
         "candidate_run_dir": str(Path(args.candidate_run_dir)),
+        "candidate_trace_payload": None if args.candidate_trace_payload is None else str(Path(args.candidate_trace_payload)),
         "metrics": metrics,
         "split_audit": split_audit,
         "branch_selection": False,

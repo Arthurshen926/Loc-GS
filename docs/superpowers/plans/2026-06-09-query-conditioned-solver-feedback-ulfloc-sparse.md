@@ -1,4 +1,23 @@
-# Query-Conditioned Solver Feedback ULF Sparse Implementation Plan
+# DEPRECATED: Query-Conditioned Solver Feedback ULF Sparse Implementation Plan
+
+This plan is retained only as historical context. It is not the current sparse
+mainline.
+
+Current sparse mainline is:
+
+```text
+fixed high-quality ULF sampled landmarks
++ native ULF landmark descriptors
++ STDLoc-style sampled-landmark projection detector initialization
++ Feedback v4 solver residuals
++ GreatCourt disjoint train-dev sparse-only gate
+```
+
+The current mainline must not call offline descriptor fusion / feature-log
+rewriting scripts, and must not use SuperPoint-teacher distillation unless an
+experiment is explicitly labeled diagnostic. Use
+`docs/superpowers/specs/2026-06-09-sparse-solver-feedback-reset-design.md` and
+`docs/superpowers/plans/2026-06-09-sparse-solver-feedback-reset.md` instead.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

@@ -137,6 +137,38 @@ def _write_render_manifest(path: Path) -> Path:
     return path
 
 
+def _write_online_teacher_observations(path: Path) -> Path:
+    rows = [
+        {
+            "schema_version": "internal_online_teacher_observation_v1",
+            "scene": "GreatCourt",
+            "split_name": "train",
+            "synthetic_query_id": f"sim/GreatCourt/train/{idx:06d}",
+            "source_image_id": f"source_{idx}.png",
+            "keypoint_id": "kp0",
+            "query_yx": [float(10 + idx), float(20 + idx)],
+            "query_desc": [1.0, 0.0] if idx < 2 else [0.0, 1.0],
+            "landmark_ids": [idx * 10 + 1, idx * 10 + 2],
+            "landmark_desc": [[0.0, 1.0], [1.0, 0.0]] if idx < 2 else [[1.0, 0.0], [0.0, 1.0]],
+            "candidate_scores": [0.95, 0.10] if idx < 2 else [0.85, 0.30],
+            "candidate_mask": [True, True],
+            "geometric_correct": [False, True],
+            "dense_consistent": [False, True],
+            "sparse_inlier": [False, True],
+            "reprojection_error_px": [18.0 + idx, 1.0],
+            "solver_weight": [0.25, 3.0],
+            "label_roles": ["hard_negative", "protected_support"],
+            "dense_helped": True,
+            "distill_weight": 0.75,
+            "render_rgb_path": f"/renders/{idx:06d}.png",
+            "render_ready": True,
+        }
+        for idx in range(4)
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    return path
+
+
 def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_path: Path):
     out = tmp_path / "train"
 
@@ -226,3 +258,58 @@ def test_train_internal_sparse_students_cli_writes_online_training_bundle(tmp_pa
     assert detector["schema_version"] == "internal_detector_student_v1"
     assert episodes[0]["schema_version"] == "internal_online_sparse_dense_episode_v1"
     assert artifact.keypoint_count <= 4
+
+
+def test_train_internal_sparse_students_cli_trains_from_direct_online_teacher_observations(tmp_path: Path):
+    out = tmp_path / "train_observations"
+
+    rc = main(
+        [
+            "--scene",
+            "GreatCourt",
+            "--split_name",
+            "train",
+            "--online_teacher_observations",
+            str(_write_online_teacher_observations(tmp_path / "online_observations.jsonl")),
+            "--output_dir",
+            str(out),
+            "--epochs",
+            "20",
+            "--candidate_mlp_batch_size",
+            "2",
+            "--candidate_mlp_cache_features",
+            "--landmark_activation_epochs",
+            "2",
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((out / "metrics_summary.json").read_text(encoding="utf-8"))
+    episodes = [json.loads(line) for line in (out / "online_episodes.jsonl").read_text(encoding="utf-8").splitlines()]
+    artifact = load_listwise_candidate_artifact(out / "online_distilled_candidates.pt")
+
+    assert manifest["online_teacher_observations"] == str(tmp_path / "online_observations.jsonl")
+    assert manifest["candidate_artifact"] is None
+    assert manifest["solver_feedback_labels"] is None
+    assert manifest["hyperparameters"]["candidate_binding_mode"] == "direct_online_teacher_observations"
+    assert manifest["hyperparameters"]["source_candidate_reuse_enabled"] is False
+    assert summary["online_observation_count"] == 4
+    assert summary["candidate_binding_mode"] == "direct_online_teacher_observations"
+    assert summary["source_candidate_reuse_enabled"] is False
+    assert summary["online_episode_count"] == 4
+    assert episodes[0]["synthetic_query_id"] == "sim/GreatCourt/train/000000"
+    assert artifact.batches[0].query_id == "sim/GreatCourt/train/000000"
+    assert artifact.metadata["training_source"] == "online_3dgs_student_teacher_observation_stream"
+    activation = torch.load(out / "landmark_activation_v2.pth", map_location="cpu")
+    assert activation["activation_model_type"] == "v2_tokens"
+    assert summary["landmark_activation_v2"]["trained_example_count"] == 4
+    assert summary["student_modules"] == [
+        "correspondence_scorer",
+        "candidate_mlp_scorer",
+        "landmark_selector",
+        "conflict_graph",
+        "descriptor_fusion",
+        "detector_student",
+        "landmark_activation_v2",
+    ]

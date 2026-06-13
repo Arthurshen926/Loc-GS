@@ -87,11 +87,11 @@ def build_solver_feedback_labels(
             "sparse_conditioned_dense_te_cm",
             "base_dense_te_cm",
             "dense_te",
-            "te_cm",
-            "sparse_te_cm",
-            "sparse_te",
-            "median_te_cm",
         )
+        if dense_te is None:
+            raise ValueError(
+                f"dense result row for query {qid!r} has no explicit dense translation error field"
+            )
         if sparse_te is None or dense_te is None:
             continue
         sparse_re = _float_field(sparse, "sparse_re_deg", "sparse_ae", "re_deg", "median_re_deg")
@@ -101,10 +101,6 @@ def build_solver_feedback_labels(
             "sparse_conditioned_dense_re_deg",
             "base_dense_re_deg",
             "dense_ae",
-            "re_deg",
-            "sparse_re_deg",
-            "sparse_ae",
-            "median_re_deg",
         )
         improvement = float(sparse_te - dense_te)
         rotation_improvement = None if sparse_re is None or dense_re is None else float(sparse_re - dense_re)
